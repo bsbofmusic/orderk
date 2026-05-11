@@ -1,0 +1,70 @@
+
+import { App, Plugin, PluginSettingTab, Setting, Notice } from "obsidian";
+import { OrderkClient, OrderkSettings, DEFAULT_SETTINGS } from "./orderkClient";
+import { OrderkSearchModal } from "./searchModal";
+
+export default class OrderkPlugin extends Plugin {
+  settings: OrderkSettings = DEFAULT_SETTINGS;
+  client!: OrderkClient;
+
+  async onload() {
+    await this.loadSettings();
+    this.client = new OrderkClient(this.app, this.settings);
+    this.addSettingTab(new OrderkSettingTab(this.app, this));
+    this.addCommand({
+      id: "orderk-rebuild-index",
+      name: "Orderk: Rebuild Index",
+      callback: async () => {
+        await this.client.rebuildIndex();
+        new Notice("orderk index rebuilt");
+      },
+    });
+    this.addCommand({
+      id: "orderk-search",
+      name: "Orderk: Search",
+      callback: () => new OrderkSearchModal(this.app, this.client).open(),
+    });
+  }
+
+  onunload() {}
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
+}
+
+class OrderkSettingTab extends PluginSettingTab {
+  plugin: OrderkPlugin;
+  constructor(app: App, plugin: OrderkPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl("h2", { text: "orderk settings" });
+    new Setting(containerEl)
+      .setName("Vault path")
+      .setDesc("Path to your Obsidian vault")
+      .addText((text) => text.setValue(this.plugin.settings.vaultPath ?? "").onChange(async (value) => {
+        this.plugin.settings.vaultPath = value;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
+      .setName("CLI binary path")
+      .addText((text) => text.setValue(this.plugin.settings.binaryPath ?? "").onChange(async (value) => {
+        this.plugin.settings.binaryPath = value;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
+      .setName("Search limit")
+      .addText((text) => text.setValue(String(this.plugin.settings.searchLimit)).onChange(async (value) => {
+        this.plugin.settings.searchLimit = Number(value) || 10;
+        await this.plugin.saveSettings();
+      }));
+  }
+}

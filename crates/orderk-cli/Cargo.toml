@@ -1,0 +1,16 @@
+
+[package]
+name = "orderk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orderk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+orderk-core = { path = "../orderk-core" }
+serde.workspace = true
+serde_json.workspace = true

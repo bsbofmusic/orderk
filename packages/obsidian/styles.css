@@ -1,0 +1,20 @@
+.orderk-search-result {
+  padding: 0.5rem;
+  border-bottom: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+}
+
+.orderk-search-result:hover {
+  background: var(--background-modifier-hover);
+}
+
+.orderk-search-title {
+  font-weight: 600;
+}
+
+.orderk-search-path,
+.orderk-search-snippet {
+  display: block;
+  opacity: 0.8;
+  font-size: 0.85em;
+}

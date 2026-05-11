@@ -1,0 +1,10 @@
+
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "types": ["node", "obsidian"],
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"]
+}

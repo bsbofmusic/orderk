@@ -1,0 +1,53 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - run: cargo build --workspace --all-features --release
+      - run: npm install
+      - run: npm run build --workspaces --if-present
+      - run: npm test --workspaces --if-present
+      - run: npm pack --workspaces --dry-run
+
+      - name: Package Linux binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tag="${GITHUB_REF_NAME}"
+          cp target/release/orderk "dist/orderk-${tag}-linux-x64"
+          chmod 0755 "dist/orderk-${tag}-linux-x64"
+
+      - name: Publish npm packages
+        if: ${{ secrets.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --workspace @orderk/cli --access public
+          npm publish --workspace @orderk/obsidian --access public
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/orderk-${{ github.ref_name }}-linux-x64
+          generate_release_notes: true

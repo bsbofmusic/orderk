@@ -1,0 +1,37 @@
+
+{
+  "name": "@orderk/obsidian",
+  "version": "0.1.0",
+  "description": "Thin Obsidian wrapper for orderk",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bsbofmusic/orderk.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "main.js",
+  "files": [
+    "main.js",
+    "manifest.json",
+    "styles.css",
+    "versions.json"
+  ],
+  "scripts": {
+    "dev": "node esbuild.config.mjs --watch",
+    "build": "tsc -p tsconfig.json --noEmit && node esbuild.config.mjs production",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dist": "npm run build && node scripts/package-plugin.mjs",
+    "test": "npm run typecheck"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.24.0",
+    "obsidian": "^1.5.0",
+    "typescript": "^5.0.0"
+  }
+}

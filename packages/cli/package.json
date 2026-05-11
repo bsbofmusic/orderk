@@ -1,0 +1,39 @@
+
+{
+  "name": "@orderk/cli",
+  "version": "0.1.0",
+  "description": "Node wrapper for the orderk native CLI",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bsbofmusic/orderk.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "orderk": "bin/orderk.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./resolve": "./dist/resolveBinary.js"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "scripts/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/verify-binary.cjs",
+    "postinstall": "node scripts/postinstall.cjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}

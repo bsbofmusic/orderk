@@ -1,0 +1,12 @@
+
+/target/
+/node_modules/
+/dist/
+**/dist/
+**/main.js
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+.env
+.DS_Store
+*.log
