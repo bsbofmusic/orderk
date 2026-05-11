@@ -46,7 +46,7 @@ Agent
 | Module | Responsibility |
 |---|---|
 | `crates/orderk-core` | scan, parse, chunk, embed, store, rank, return JSON |
-| `crates/orderk-cli` | native CLI entrypoint for index/search/status/feedback |
+| `crates/orderk-cli` | native CLI entrypoint for index/search/status/health/doctor/eval/maintain/feedback |
 | `packages/cli` | npm wrapper that finds or downloads the native binary |
 | `packages/obsidian` | thin Obsidian desktop plugin wrapper |
 
@@ -150,7 +150,25 @@ orderk doctor \
 
 Optional `--smoke-query` turns `doctor` into a retrieval smoke probe; without it, `doctor` behaves like `health`.
 
-### 7) Run eval
+### 7) Run maintain
+
+```bash
+orderk maintain \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --vault /path/to/vault \
+  --queries /path/to/eval-queries.json \
+  --smoke-query "known phrase in your vault" \
+  --limit 10 \
+  --report-dir /tmp/orderk-reports \
+  --embedding-provider siliconflow \
+  --embedding-model BAAI/bge-m3 \
+  --embedding-dim 1024 \
+  --vector-backend sqlite_vec
+```
+
+`maintain` emits `orderk.maintain.v1` JSON: nested health evidence, optional eval evidence, typed error codes, and a persisted report path when `--report-dir` is provided.
+
+### 8) Run eval
 
 ```bash
 python3 scripts/eval.py
@@ -170,6 +188,7 @@ This is the shortest path for an agent or automation:
 4. Set `BAAI/bge-m3` + `1024` unless you have a strong reason to change them.
 5. Use `sqlite_vec` as the vector backend.
 6. Consume the JSON output directly. Search responses include `route`, `routing`, per-result `score_breakdown`, `evidence`, and `tags`.
+7. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
 
 ### Obsidian plugin settings
 
@@ -189,9 +208,11 @@ Required settings:
 ```bash
 cargo test --workspace --all-features
 cargo build --workspace --all-features --release
+python3 scripts/contract.py
 python3 scripts/smoke.py
 python3 scripts/stress.py
 python3 scripts/eval.py
+python3 scripts/release_gate.py
 npm install
 npm run build --workspaces --if-present
 npm test --workspaces --if-present
@@ -201,6 +222,8 @@ npm pack --workspaces --dry-run
 If `rustfmt` and `clippy` are installed in your environment, run them too. They are part of the CI contract.
 
 ## Troubleshooting
+
+For the full maintenance contract, see [`docs/MAINTAIN.md`](docs/MAINTAIN.md). For failure triage, see [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
 
 | Symptom | Likely fix |
 |---|---|

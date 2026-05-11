@@ -3,13 +3,22 @@
 ## Local verification
 
 ```bash
+python3 scripts/release_gate.py
+```
+
+Equivalent expanded gate:
+
+```bash
 cargo test --workspace --all-features
 cargo build --workspace --all-features --release
+python3 scripts/contract.py
+python3 scripts/smoke.py
+python3 scripts/stress.py
+python3 scripts/eval.py
 npm install
 npm run build --workspaces --if-present
 npm test --workspaces --if-present
 npm pack --workspaces --dry-run
-python3 scripts/smoke.py
 ```
 
 ## npm packages
@@ -18,7 +27,7 @@ python3 scripts/smoke.py
 - `orderk-obsidian`: Obsidian desktop plugin package.
 
 Platform binary packages are intentionally left as a release-pipeline step; local development resolves `target/release/orderk` or `ORDERK_BIN`.
-The v0.1.3 npm one-click path targets Linux x64 first; other platforms can build from source or point `ORDERK_BIN` at a local binary.
+The v0.1.4 npm one-click path targets Linux x64 first; other platforms can build from source or point `ORDERK_BIN` at a local binary.
 
 ## Obsidian artifact
 

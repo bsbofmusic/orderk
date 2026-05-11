@@ -48,6 +48,23 @@ orderk doctor \
 
 `status`, `health`, and `doctor` return `health_state` / `state`, `error_codes`, and structured `checks`. `doctor --smoke-query "..."` additionally runs a retrieval smoke probe; no arbitrary smoke query is injected by default.
 
+### Maintain
+
+```bash
+orderk maintain \
+  --db /path/to/orderk.sqlite \
+  --vault /path/to/vault \
+  --queries /path/to/eval-queries.json \
+  --smoke-query "known phrase in your vault" \
+  --limit 10 \
+  --report-dir /tmp/orderk-reports \
+  --embedding-provider siliconflow \
+  --embedding-dim 1024 \
+  --embedding-model BAAI/bge-m3
+```
+
+Maintain prints `orderk.maintain.v1` JSON. It nests `health` and optional `eval` evidence, writes a JSON report when `--report-dir` is set, and returns `state` plus typed `error_codes` for agent gating.
+
 ### Eval
 
 ```bash

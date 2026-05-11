@@ -1,6 +1,6 @@
 {
   "name": "orderk-cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Node wrapper for the orderk native CLI",
   "license": "MIT",
   "type": "module",

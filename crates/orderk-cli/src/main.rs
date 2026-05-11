@@ -8,7 +8,8 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     if let Err(err) = run() {
@@ -85,6 +86,10 @@ fn run() -> Result<()> {
         }
         "eval" => {
             let resp = eval_command(&mut args)?;
+            print_json(&resp)?;
+        }
+        "maintain" => {
+            let resp = maintain_command(&mut args)?;
             print_json(&resp)?;
         }
         "feedback" => {
@@ -261,6 +266,168 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     Ok(serde_json::to_value(response)?)
 }
 
+fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    let started = Instant::now();
+    let db = take_path(args, "--db")?;
+    let vault = take_optional_string(args, "--vault")?.map(PathBuf::from);
+    let queries = take_optional_string(args, "--queries")?.map(PathBuf::from);
+    let report_dir = take_optional_string(args, "--report-dir")?.map(PathBuf::from);
+    let smoke_query = take_optional_string(args, "--smoke-query")?;
+    let limit = take_usize(args, "--limit", 10)?;
+    let embedding_provider = take_string(args, "--embedding-provider", "siliconflow".to_string())?;
+    let embedding_dim = take_usize(args, "--embedding-dim", 1024)?;
+    let embedding_model = take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?;
+    let vector_backend = parse_backend(&take_string(args, "--vector-backend", "sqlite_vec".to_string())?)?;
+    let (provider, provider_error) = resolve_provider(&embedding_provider, embedding_dim, Some(embedding_model.clone()));
+
+    let health = health_report(
+        &db,
+        vault.as_deref(),
+        provider.as_deref(),
+        provider_error,
+        &embedding_provider,
+        embedding_dim,
+        &embedding_model,
+        &vector_backend,
+        smoke_query.as_deref(),
+    );
+
+    let mut checks: Vec<orderk_core::HealthCheck> = Vec::new();
+    let eval = if let Some(queries_path) = queries.as_ref() {
+        if health.ok {
+            match run_eval_report(
+                &db,
+                queries_path,
+                limit,
+                &embedding_provider,
+                embedding_dim,
+                &embedding_model,
+                vector_backend.clone(),
+            ) {
+                Ok(value) => {
+                    let zero_hit = value.get("zero_hit").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let queries_count = value.get("queries").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if zero_hit == 0 {
+                        checks.push(orderk_core::HealthCheck::ok(
+                            "eval",
+                            "eval gate passed",
+                            json!({"queries": queries_count, "zero_hit": zero_hit}),
+                        ));
+                    } else {
+                        checks.push(orderk_core::HealthCheck::fail(
+                            "eval",
+                            orderk_core::ErrorCode::ESmokeQueryFailed,
+                            "eval gate found zero-hit cases",
+                            Some("inspect expected_paths, indexing freshness, and ranking before release".to_string()),
+                            json!({"queries": queries_count, "zero_hit": zero_hit}),
+                        ));
+                    }
+                    Some(value)
+                }
+                Err(err) => {
+                    checks.push(orderk_core::HealthCheck::fail(
+                        "eval",
+                        classify_error_message(&err.to_string()),
+                        format!("eval gate failed: {err}"),
+                        Some("run `orderk eval` with the same arguments and inspect the JSON error".to_string()),
+                        json!({"queries": queries_path.to_string_lossy()}),
+                    ));
+                    None
+                }
+            }
+        } else {
+            checks.push(orderk_core::HealthCheck::fail(
+                "eval",
+                orderk_core::ErrorCode::ESmokeQueryFailed,
+                "eval gate skipped because health is not ready",
+                Some("fix health/doctor failures before running eval".to_string()),
+                json!({"queries": queries_path.to_string_lossy(), "health_state": health.state}),
+            ));
+            None
+        }
+    } else {
+        checks.push(orderk_core::HealthCheck::ok(
+            "eval",
+            "no eval query file provided; eval gate skipped",
+            json!({"queries": null}),
+        ));
+        None
+    };
+
+    let mut error_codes = health.error_codes.clone();
+    for check in &checks {
+        if let Some(code) = check.error_code.clone() {
+            if !error_codes.contains(&code) {
+                error_codes.push(code);
+            }
+        }
+    }
+    let state = orderk_core::HealthState::from_error_codes(&error_codes);
+    let ok = state == orderk_core::HealthState::Ready;
+    let mut report = json!({
+        "schema_version": "orderk.maintain.v1",
+        "ok": ok,
+        "state": state,
+        "db": db.to_string_lossy(),
+        "vault": vault.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "embedding_provider": embedding_provider,
+        "embedding_model": embedding_model,
+        "embedding_dim": embedding_dim,
+        "limit": limit,
+        "vector_backend": vector_backend.as_str(),
+        "error_codes": error_codes,
+        "checks": checks,
+        "health": health,
+        "eval": eval,
+        "report_path": null,
+        "took_ms": started.elapsed().as_millis(),
+    });
+
+    if let Some(dir) = report_dir {
+        let report_path = write_report(&dir, "orderk-maintain", &report)?;
+        report["report_path"] = json!(report_path.to_string_lossy().to_string());
+        fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    }
+
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_eval_report(
+    db: &Path,
+    queries_path: &Path,
+    limit: usize,
+    embedding_provider: &str,
+    embedding_dim: usize,
+    embedding_model: &str,
+    vector_backend: VectorBackend,
+) -> Result<serde_json::Value> {
+    let mut args = vec![
+        "--db".to_string(),
+        db.to_string_lossy().to_string(),
+        "--queries".to_string(),
+        queries_path.to_string_lossy().to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+        "--embedding-provider".to_string(),
+        embedding_provider.to_string(),
+        "--embedding-dim".to_string(),
+        embedding_dim.to_string(),
+        "--embedding-model".to_string(),
+        embedding_model.to_string(),
+        "--vector-backend".to_string(),
+        vector_backend.as_str().to_string(),
+    ];
+    eval_command(&mut args)
+}
+
+fn write_report(dir: &Path, stem: &str, value: &serde_json::Value) -> Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let path = dir.join(format!("{stem}-{ts}-{}.json", std::process::id()));
+    fs::write(&path, serde_json::to_vec_pretty(value)?)?;
+    Ok(path)
+}
 
 fn resolve_provider(
     name: &str,
@@ -325,7 +492,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 }
 
 fn print_usage() {
-    eprintln!("orderk <init|index|search|status|health|doctor|eval|feedback> [--flags]");
+    eprintln!("orderk <init|index|search|status|health|doctor|eval|maintain|feedback> [--flags]");
 }
 
 #[derive(Debug, Deserialize)]

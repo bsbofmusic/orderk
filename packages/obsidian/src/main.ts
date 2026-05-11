@@ -11,6 +11,16 @@ export default class OrderkPlugin extends Plugin {
     await this.loadSettings();
     this.client = new OrderkClient(this.app, this.settings);
     this.addSettingTab(new OrderkSettingTab(this.app, this));
+    if (this.settings.indexOnStartup) {
+      this.app.workspace.onLayoutReady(() => {
+        void this.client.rebuildIndex()
+          .then(() => new Notice("orderk startup index completed"))
+          .catch((error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            new Notice(`orderk startup index failed: ${message}`);
+          });
+      });
+    }
     this.addCommand({
       id: "orderk-rebuild-index",
       name: "Orderk: Rebuild Index",
@@ -95,6 +105,13 @@ class OrderkSettingTab extends PluginSettingTab {
       .setDesc("BAAI/bge-m3 uses 1024 dimensions in the default orderk profile.")
       .addText((text) => text.setValue(String(this.plugin.settings.embeddingDim ?? 1024)).onChange(async (value) => {
         this.plugin.settings.embeddingDim = Number(value) || 1024;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
+      .setName("Index on startup")
+      .setDesc("Run one incremental index pass when Obsidian finishes loading. No background watcher or polling is started.")
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.indexOnStartup).onChange(async (value) => {
+        this.plugin.settings.indexOnStartup = value;
         await this.plugin.saveSettings();
       }));
     new Setting(containerEl)

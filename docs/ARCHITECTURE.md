@@ -10,6 +10,7 @@ It now also exposes explicit health and evaluation contracts:
 - `health` for operational probe
 - `doctor` for deeper probe + smoke query
 - `eval` for black-box retrieval regression checks
+- `maintain` for the cdper-style readiness/failure-ticket gate that nests health plus optional eval evidence and can persist a JSON report
 
 ## Runtime flow
 
