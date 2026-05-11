@@ -43,8 +43,8 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm publish --workspace @orderk/cli --access public
-          npm publish --workspace @orderk/obsidian --access public
+          npm publish --workspace orderk-cli --access public
+          npm publish --workspace orderk-obsidian --access public
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

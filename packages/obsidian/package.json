@@ -1,13 +1,13 @@
 
 {
-  "name": "@orderk/obsidian",
+  "name": "orderk-obsidian",
   "version": "0.1.0",
   "description": "Thin Obsidian wrapper for orderk",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bsbofmusic/orderk.git"
+    "url": "git+https://github.com/bsbofmusic/orderk.git"
   },
   "publishConfig": {
     "access": "public"

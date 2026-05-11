@@ -22,11 +22,11 @@ Markdown vault -> chunks -> embeddings -> SQLite/FTS5/sqlite-vec -> hybrid JSON 
 # Native CLI, global/system install
 cargo install --path crates/orderk-cli --locked
 
-# npm wrapper for users who want a JS entrypoint; on Linux x64 it can fetch the matching GitHub release binary during install
-npm install -g @orderk/cli
+# npm wrapper for users who want a JS entrypoint; the one-click path today is Linux x64 via GitHub release binary download
+npm install -g orderk-cli
 
 # Obsidian plugin build artifact
-npm run dist --workspace @orderk/obsidian
+npm run dist --workspace orderk-obsidian
 ```
 
 For cloud embeddings, set `HERMES_SILICONFLOW_API_KEY` or `SILICONFLOW_API_KEY` before indexing or searching.
