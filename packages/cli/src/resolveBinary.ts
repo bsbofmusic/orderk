@@ -17,9 +17,10 @@ export function resolveOrderkBinary(explicitPath?: string): string {
 }
 
 function resolvePackageLocalBinary(): string | undefined {
-  const cwd = process.cwd();
-  const packageVendor = path.join(cwd, "vendor", process.platform === "win32" ? "orderk.exe" : "orderk");
-  const repoRoot = path.resolve(cwd, "..", "..");
+  const entrypoint = process.argv[1] ? path.resolve(process.argv[1]) : process.cwd();
+  const packageRoot = path.resolve(path.dirname(entrypoint), "..");
+  const packageVendor = path.join(packageRoot, "vendor", process.platform === "win32" ? "orderk.exe" : "orderk");
+  const repoRoot = path.resolve(packageRoot, "..", "..");
   const releaseBinary = path.join(repoRoot, "target", "release", process.platform === "win32" ? "orderk.exe" : "orderk");
   const debugBinary = path.join(repoRoot, "target", "debug", process.platform === "win32" ? "orderk.exe" : "orderk");
   return [packageVendor, releaseBinary, debugBinary].find((p) => fs.existsSync(p));

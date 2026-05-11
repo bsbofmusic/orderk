@@ -2,7 +2,7 @@
 {
   "private": true,
   "name": "orderk-workspace",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "workspaces": [
     "packages/*",
     "packages/cli-platform/*"

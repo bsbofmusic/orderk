@@ -112,11 +112,12 @@ function resolveOrderkBinary(explicitPath?: string): string {
 }
 
 function localBinary(): string | undefined {
-  const repoRoot = path.resolve(process.cwd(), "..", "..");
+  const packageRoot = path.resolve(__dirname);
+  const repoRoot = path.resolve(packageRoot, "..", "..");
   const candidates = [
     path.join(repoRoot, "target", "release", process.platform === "win32" ? "orderk.exe" : "orderk"),
     path.join(repoRoot, "target", "debug", process.platform === "win32" ? "orderk.exe" : "orderk"),
-    path.join(process.cwd(), "vendor", process.platform === "win32" ? "orderk.exe" : "orderk"),
+    path.join(packageRoot, "vendor", process.platform === "win32" ? "orderk.exe" : "orderk"),
   ];
   return candidates.find((candidate) => fs.existsSync(candidate));
 }

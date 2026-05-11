@@ -18,7 +18,7 @@ python3 scripts/smoke.py
 - `orderk-obsidian`: Obsidian desktop plugin package.
 
 Platform binary packages are intentionally left as a release-pipeline step; local development resolves `target/release/orderk` or `ORDERK_BIN`.
-The v0.1.0 npm one-click path targets Linux x64 first; other platforms can build from source or point `ORDERK_BIN` at a local binary.
+The v0.1.1 npm one-click path targets Linux x64 first; other platforms can build from source or point `ORDERK_BIN` at a local binary.
 
 ## Obsidian artifact
 

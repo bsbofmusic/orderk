@@ -38,14 +38,6 @@ jobs:
           cp target/release/orderk "dist/orderk-${tag}-linux-x64"
           chmod 0755 "dist/orderk-${tag}-linux-x64"
 
-      - name: Publish npm packages
-        if: ${{ secrets.NPM_TOKEN != '' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          npm publish --workspace orderk-cli --access public
-          npm publish --workspace orderk-obsidian --access public
-
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
