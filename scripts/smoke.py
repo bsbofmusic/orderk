@@ -34,6 +34,8 @@ def main():
 
     alpha = json.loads(run(BASE + ["search", "--db", str(db), "--query", "sqlite-vec semantic search", "--limit", "3", "--embedding-provider", "mock", "--embedding-dim", "16", "--embedding-model", "mock-16", "--json"]))
     assert alpha["results"] and alpha["results"][0]["path"] == "projects/alpha.md", alpha
+    assert alpha["routing"]["strategy"] in {"hybrid", "exact"}, alpha
+    assert alpha["results"][0]["evidence"]["sources"], alpha
 
     (vault / "archive" / "old.md").unlink()
     deleted = json.loads(run(BASE + ["index", "--vault", str(vault), "--db", str(db), "--embedding-provider", "mock", "--embedding-dim", "16", "--embedding-model", "mock-16", "--json"]))

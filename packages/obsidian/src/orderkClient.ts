@@ -2,7 +2,14 @@ import { App } from "obsidian";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { OrderkFeedbackEvent, OrderkSearchResult } from "./types";
+import {
+  OrderkEvalResponse,
+  OrderkFeedbackEvent,
+  OrderkHealthReport,
+  OrderkSearchResult,
+  OrderkSearchResponse,
+  OrderkStatusResponse,
+} from "./types";
 
 export type OrderkSettings = {
   binaryPath?: string;
@@ -46,25 +53,100 @@ export class OrderkClient {
     ]);
   }
 
+  async searchResponse(query: string): Promise<OrderkSearchResponse> {
+    return this.parseJson(
+      await this.run([
+        "search",
+        "--db",
+        this.dbPath(),
+        "--query",
+        query,
+        "--limit",
+        String(this.settings.searchLimit),
+        "--embedding-provider",
+        this.settings.embeddingProvider,
+        "--embedding-dim",
+        String(this.settings.embeddingDim),
+        "--embedding-model",
+        this.settings.embeddingModel,
+        "--json",
+      ]),
+    );
+  }
+
   async search(query: string): Promise<OrderkSearchResult[]> {
-    const raw = await this.run([
-      "search",
-      "--db",
-      this.dbPath(),
-      "--query",
-      query,
-      "--limit",
-      String(this.settings.searchLimit),
-      "--embedding-provider",
-      this.settings.embeddingProvider,
-      "--embedding-dim",
-      String(this.settings.embeddingDim),
-      "--embedding-model",
-      this.settings.embeddingModel,
-      "--json",
-    ]);
-    const parsed = JSON.parse(raw);
-    return parsed.results ?? [];
+    const response = await this.searchResponse(query);
+    return response.results ?? [];
+  }
+
+  async status(): Promise<OrderkStatusResponse> {
+    return this.parseJson(
+      await this.run([
+        "status",
+        "--db",
+        this.dbPath(),
+        "--json",
+      ]),
+    );
+  }
+
+  async health(): Promise<OrderkHealthReport> {
+    return this.parseJson(
+      await this.run([
+        "health",
+        "--db",
+        this.dbPath(),
+        "--vault",
+        this.vaultPath(),
+        "--embedding-provider",
+        this.settings.embeddingProvider,
+        "--embedding-dim",
+        String(this.settings.embeddingDim),
+        "--embedding-model",
+        this.settings.embeddingModel,
+        "--json",
+      ]),
+    );
+  }
+
+  async doctor(): Promise<OrderkHealthReport> {
+    return this.parseJson(
+      await this.run([
+        "doctor",
+        "--db",
+        this.dbPath(),
+        "--vault",
+        this.vaultPath(),
+        "--embedding-provider",
+        this.settings.embeddingProvider,
+        "--embedding-dim",
+        String(this.settings.embeddingDim),
+        "--embedding-model",
+        this.settings.embeddingModel,
+        "--json",
+      ]),
+    );
+  }
+
+  async eval(queriesPath: string): Promise<OrderkEvalResponse> {
+    return this.parseJson(
+      await this.run([
+        "eval",
+        "--db",
+        this.dbPath(),
+        "--queries",
+        queriesPath,
+        "--limit",
+        String(this.settings.searchLimit),
+        "--embedding-provider",
+        this.settings.embeddingProvider,
+        "--embedding-dim",
+        String(this.settings.embeddingDim),
+        "--embedding-model",
+        this.settings.embeddingModel,
+        "--json",
+      ]),
+    );
   }
 
   async sendFeedback(event: OrderkFeedbackEvent): Promise<void> {
@@ -96,9 +178,20 @@ export class OrderkClient {
       child.on("error", reject);
       child.on("close", (code) => {
         if (code === 0) return resolve(stdout.trim());
-        reject(new Error(stderr.trim() || `orderk exited ${code}`));
+        const message = stderr.trim();
+        try {
+          const parsed = JSON.parse(message) as { message?: string };
+          reject(new Error(parsed.message ?? (message || `orderk exited ${code}`)));
+          return;
+        } catch {
+          reject(new Error(message || `orderk exited ${code}`));
+        }
       });
     });
+  }
+
+  private parseJson<T>(raw: string): T {
+    return JSON.parse(raw) as T;
   }
 }
 

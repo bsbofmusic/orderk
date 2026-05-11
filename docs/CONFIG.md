@@ -2,6 +2,8 @@
 
 ## CLI options
 
+All CLI commands print JSON by default. The `--json` flag is accepted for explicit contract compatibility.
+
 ### Index
 
 ```bash
@@ -23,6 +25,56 @@ orderk search \
   --embedding-provider siliconflow \
   --embedding-dim 1024 \
   --embedding-model BAAI/bge-m3
+```
+
+### Health / Doctor
+
+```bash
+orderk health \
+  --db /path/to/orderk.sqlite \
+  --vault /path/to/vault \
+  --embedding-provider siliconflow \
+  --embedding-dim 1024 \
+  --embedding-model BAAI/bge-m3
+
+orderk doctor \
+  --db /path/to/orderk.sqlite \
+  --vault /path/to/vault \
+  --smoke-query "known phrase in your vault" \
+  --embedding-provider siliconflow \
+  --embedding-dim 1024 \
+  --embedding-model BAAI/bge-m3
+```
+
+`status`, `health`, and `doctor` return `health_state` / `state`, `error_codes`, and structured `checks`. `doctor --smoke-query "..."` additionally runs a retrieval smoke probe; no arbitrary smoke query is injected by default.
+
+### Eval
+
+```bash
+orderk eval \
+  --db /path/to/orderk.sqlite \
+  --queries /path/to/eval-queries.json \
+  --limit 10 \
+  --embedding-provider siliconflow \
+  --embedding-dim 1024 \
+  --embedding-model BAAI/bge-m3
+```
+
+Eval prints a JSON report with `hits_at_k`, `top1_hits`, `zero_hit`, `recall_at_k`, `ndcg_at_k`, `mrr`, and mean latency, plus per-query matched ranks and result metadata.
+
+Eval query file schema:
+
+```json
+{
+  "schema_version": "orderk.eval_queries.v1",
+  "queries": [
+    {
+      "id": "example",
+      "query": "known search phrase",
+      "expected_paths": ["folder/note.md"]
+    }
+  ]
+}
 ```
 
 ## Providers

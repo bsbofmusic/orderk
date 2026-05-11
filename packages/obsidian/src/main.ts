@@ -24,6 +24,22 @@ export default class OrderkPlugin extends Plugin {
       name: "Orderk: Search",
       callback: () => new OrderkSearchModal(this.app, this.client).open(),
     });
+    this.addCommand({
+      id: "orderk-health",
+      name: "Orderk: Health Check",
+      callback: async () => {
+        const report = await this.client.health();
+        new Notice(`orderk health: ${report.state}`);
+      },
+    });
+    this.addCommand({
+      id: "orderk-doctor",
+      name: "Orderk: Doctor",
+      callback: async () => {
+        const report = await this.client.doctor();
+        new Notice(`orderk doctor: ${report.state}`);
+      },
+    });
   }
 
   onunload() {}

@@ -71,16 +71,140 @@ pub struct IndexSummary {
     pub files: usize,
     pub chunks: usize,
     pub embedded: usize,
+    pub reused: usize,
     pub embedding_provider: String,
     pub embedding_model: String,
     pub vector_backend: String,
     pub took_ms: u128,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthState {
+    Ready,
+    NeedsIndex,
+    Degraded,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    EDbOpenFailed,
+    EDbCorrupt,
+    ESchemaMissing,
+    ENoEmbeddings,
+    EProfileMismatch,
+    EProviderDown,
+    EVectorBackendMissing,
+    EVaultUnreadable,
+    ESmokeQueryFailed,
+    EInvalidArgument,
+    EUnknownProvider,
+    EEmbeddingDimensionMismatch,
+    EEmbeddingCountMismatch,
+    EEmbeddingRequestFailed,
+    EInternal,
+}
+
+impl ErrorCode {
+    pub fn is_hard_failure(&self) -> bool {
+        matches!(
+            self,
+            ErrorCode::EDbOpenFailed
+                | ErrorCode::EDbCorrupt
+                | ErrorCode::ESchemaMissing
+                | ErrorCode::EProfileMismatch
+                | ErrorCode::EProviderDown
+                | ErrorCode::EVectorBackendMissing
+                | ErrorCode::EVaultUnreadable
+                | ErrorCode::ESmokeQueryFailed
+                | ErrorCode::EInvalidArgument
+                | ErrorCode::EUnknownProvider
+                | ErrorCode::EEmbeddingDimensionMismatch
+                | ErrorCode::EEmbeddingCountMismatch
+                | ErrorCode::EEmbeddingRequestFailed
+                | ErrorCode::EInternal
+        )
+    }
+}
+
+impl HealthState {
+    pub fn from_error_codes(codes: &[ErrorCode]) -> Self {
+        if codes.is_empty() {
+            return HealthState::Ready;
+        }
+        if codes.len() == 1 && codes[0] == ErrorCode::ENoEmbeddings {
+            return HealthState::NeedsIndex;
+        }
+        if codes.iter().any(ErrorCode::is_hard_failure) {
+            HealthState::Unhealthy
+        } else {
+            HealthState::Degraded
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheck {
+    pub component: String,
+    pub ok: bool,
+    pub error_code: Option<ErrorCode>,
+    pub message: String,
+    pub remediation: Option<String>,
+    pub details: serde_json::Value,
+}
+
+impl HealthCheck {
+    pub fn ok(component: impl Into<String>, message: impl Into<String>, details: serde_json::Value) -> Self {
+        Self {
+            component: component.into(),
+            ok: true,
+            error_code: None,
+            message: message.into(),
+            remediation: None,
+            details,
+        }
+    }
+
+    pub fn fail(
+        component: impl Into<String>,
+        error_code: ErrorCode,
+        message: impl Into<String>,
+        remediation: impl Into<Option<String>>,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            component: component.into(),
+            ok: false,
+            error_code: Some(error_code),
+            message: message.into(),
+            remediation: remediation.into(),
+            details,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthReport {
+    pub schema_version: String,
+    pub ok: bool,
+    pub state: HealthState,
+    pub db: String,
+    pub vault: Option<String>,
+    pub checks: Vec<HealthCheck>,
+    pub error_codes: Vec<ErrorCode>,
+    pub status: Option<StatusResponse>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub ok: bool,
+    pub schema_version: String,
     pub db: String,
+    pub health_state: HealthState,
+    pub error_codes: Vec<ErrorCode>,
+    pub checks: Vec<HealthCheck>,
     pub notes: usize,
     pub chunks: usize,
     pub embeddings: usize,
@@ -100,7 +224,29 @@ pub struct ScoreBreakdown {
     pub fusion: f32,
     pub path_boost: f32,
     pub tag_boost: f32,
+    pub route_boost: f32,
     pub recency_boost: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchResultEvidence {
+    pub sources: Vec<String>,
+    pub keyword_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+    pub route: Option<String>,
+    pub route_score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueryRoutingEvidence {
+    pub strategy: String,
+    pub route: String,
+    pub routes_attempted: Vec<String>,
+    pub keyword_candidates: usize,
+    pub vector_candidates: usize,
+    pub route_candidates: usize,
+    pub merged_candidates: usize,
+    pub returned: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +261,7 @@ pub struct SearchResult {
     pub snippet: String,
     pub score: f32,
     pub score_breakdown: ScoreBreakdown,
+    pub evidence: SearchResultEvidence,
     pub tags: Vec<String>,
     pub mtime: Option<DateTime<Utc>>,
 }
@@ -125,6 +272,8 @@ pub struct QueryResponse {
     pub query_id: String,
     pub took_ms: u128,
     pub mode: String,
+    pub route: String,
+    pub routing: QueryRoutingEvidence,
     pub vector_backend: String,
     pub results: Vec<SearchResult>,
 }

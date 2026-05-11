@@ -16,6 +16,104 @@ use std::time::Instant;
 
 static SQLITE_VEC_REGISTER: Once = Once::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryRoute {
+    Semantic,
+    Short,
+    Path,
+    Tag,
+}
+
+impl QueryRoute {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Short => "short",
+            Self::Path => "path",
+            Self::Tag => "tag",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QueryPlan {
+    route: QueryRoute,
+    normalized: String,
+    terms: Vec<String>,
+    patterns: Vec<String>,
+}
+
+impl QueryPlan {
+    fn analyze(query: &str) -> Self {
+        let raw = query.trim().to_lowercase();
+        let normalized = normalize_query(query);
+        let terms = normalized
+            .split_whitespace()
+            .filter(|term| !term.is_empty())
+            .map(|term| term.to_string())
+            .collect::<Vec<_>>();
+        let mut patterns = vec![raw.clone(), normalized.clone()];
+        patterns.retain(|s| !s.trim().is_empty());
+        patterns.sort();
+        patterns.dedup();
+        let route = if raw.contains('/') || raw.contains(".md") || raw.starts_with("path:") {
+            QueryRoute::Path
+        } else if raw.contains('#') || raw.starts_with("tag:") {
+            QueryRoute::Tag
+        } else if terms.len() <= 1 || query.chars().count() <= 12 {
+            QueryRoute::Short
+        } else {
+            QueryRoute::Semantic
+        };
+        Self { route, normalized, terms, patterns }
+    }
+
+    fn keyword_query(&self) -> Option<String> {
+        if self.terms.is_empty() {
+            return None;
+        }
+        if matches!(self.route, QueryRoute::Short) && self.terms.len() == 1 {
+            return Some(format!("{}*", self.terms[0]));
+        }
+        Some(self.terms.join(" "))
+    }
+
+    fn routes_attempted(&self) -> Vec<String> {
+        let mut routes = vec!["keyword".to_string(), "vector".to_string()];
+        if matches!(self.route, QueryRoute::Path) {
+            routes.insert(0, "path".to_string());
+        }
+        if matches!(self.route, QueryRoute::Tag) {
+            routes.insert(0, "tag".to_string());
+        }
+        if matches!(self.route, QueryRoute::Short) {
+            routes.push("path".to_string());
+        }
+        routes.sort();
+        routes.dedup();
+        routes
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RouteHit {
+    score: f32,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddingRecord {
+    blob: Vec<u8>,
+    vector_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReindexFileSummary {
+    chunks: usize,
+    embedded: usize,
+    reused: usize,
+}
+
 pub(crate) fn register_sqlite_vec() {
     SQLITE_VEC_REGISTER.call_once(|| unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
@@ -227,15 +325,46 @@ impl IndexStore {
             |r| r.get(0),
         ).unwrap_or(0);
         let embedding_dim = settings.get("embedding_dim").and_then(|v| v.parse().ok()).unwrap_or_default();
+        let vector_backend = settings.get("vector_backend").cloned().unwrap_or_else(|| "unknown".to_string());
+        let vector_enabled = vec_version.is_some() && vec_tables == 1;
+        let mut checks = vec![HealthCheck::ok(
+            "db",
+            "SQLite schema is reachable",
+            serde_json::json!({"settings": settings.len(), "tables": {"vec_chunks": vec_tables}}),
+        )];
+        if embeddings == 0 {
+            checks.push(HealthCheck::fail(
+                "embeddings",
+                ErrorCode::ENoEmbeddings,
+                "database has no embeddings yet",
+                Some("run `orderk index` with the same provider/model/dim/backend profile".to_string()),
+                serde_json::json!({"chunks": chunks, "embeddings": embeddings}),
+            ));
+        }
+        if vector_backend == VectorBackend::SqliteVec.as_str() && !vector_enabled {
+            checks.push(HealthCheck::fail(
+                "vector_backend",
+                ErrorCode::EVectorBackendMissing,
+                "sqlite-vec backend is configured but not available",
+                Some("re-run `orderk init`/`orderk index` in an environment with sqlite-vec available".to_string()),
+                serde_json::json!({"vec_version": vec_version, "vec_tables": vec_tables}),
+            ));
+        }
+        let error_codes: Vec<ErrorCode> = checks.iter().filter_map(|c| c.error_code.clone()).collect();
+        let health_state = HealthState::from_error_codes(&error_codes);
         Ok(StatusResponse {
-            ok: true,
+            ok: health_state == HealthState::Ready,
+            schema_version: "orderk.status.v1".to_string(),
             db: String::new(),
+            health_state,
+            error_codes,
+            checks,
             notes,
             chunks,
             embeddings,
             fts_enabled: true,
-            vector_enabled: vec_version.is_some() && vec_tables == 1,
-            vector_backend: settings.get("vector_backend").cloned().unwrap_or_else(|| "unknown".to_string()),
+            vector_enabled,
+            vector_backend,
             vec_version,
             embedding_provider: settings.get("embedding_provider").cloned().unwrap_or_else(|| "unknown".to_string()),
             embedding_model: settings.get("embedding_model").cloned().unwrap_or_default(),
@@ -270,6 +399,7 @@ impl IndexStore {
         let mut unchanged = 0usize;
         let mut deleted = 0usize;
         let mut embedded = 0usize;
+        let mut reused = 0usize;
         let mut total_chunks = 0usize;
 
         for file in &scanned {
@@ -296,10 +426,10 @@ impl IndexStore {
             if !needs_reindex {
                 continue;
             }
-            reindex_file(conn, &file, provider, embedding_dim, embedding_model, vector_backend)?;
-            let chunks_for_file: usize = conn.query_row("SELECT COUNT(*) FROM chunks WHERE file_path = ?1", params![file.path], |r| r.get(0))?;
-            total_chunks += chunks_for_file;
-            embedded += chunks_for_file;
+            let file_summary = reindex_file(conn, &file, provider, embedding_dim, embedding_model, vector_backend)?;
+            total_chunks += file_summary.chunks;
+            embedded += file_summary.embedded;
+            reused += file_summary.reused;
         }
 
         upsert_setting(conn, "embedding_provider", provider.provider_id())?;
@@ -318,6 +448,7 @@ impl IndexStore {
             files: scanned.len(),
             chunks: total_chunks,
             embedded,
+            reused,
             embedding_provider: provider.provider_id().to_string(),
             embedding_model: provider.model_id().to_string(),
             vector_backend: vector_backend.as_str().to_string(),
@@ -328,20 +459,23 @@ impl IndexStore {
     pub fn query<P: EmbeddingProvider + ?Sized>(conn: &Connection, query: &str, limit: usize, provider: &P, vector_backend: &VectorBackend) -> Result<QueryResponse> {
         let started = Instant::now();
         let query_id = format!("q_{}_{}", chrono::Utc::now().timestamp_micros(), std::process::id());
-        let normalized = normalize_query(query);
+        let plan = QueryPlan::analyze(query);
         provider.health()?;
         ensure_has_embeddings(conn)?;
         ensure_runtime_profile(conn, provider, provider.dimension(), provider.model_id(), vector_backend)?;
-        let mut results = match vector_backend {
-            VectorBackend::SqliteVec => query_hybrid(conn, query, &normalized, limit, provider)?,
-            VectorBackend::Exact => query_exact(conn, query, &normalized, limit, provider)?,
+        let (mut results, mut routing) = match vector_backend {
+            VectorBackend::SqliteVec => query_hybrid(conn, query, &plan, limit, provider)?,
+            VectorBackend::Exact => query_exact(conn, query, &plan, limit, provider)?,
         };
         results.truncate(limit);
+        routing.returned = results.len();
         Ok(QueryResponse {
             query: query.to_string(),
             query_id,
             took_ms: started.elapsed().as_millis(),
-            mode: "hybrid".to_string(),
+            mode: routing.strategy.clone(),
+            route: plan.route.as_str().to_string(),
+            routing,
             vector_backend: vector_backend.as_str().to_string(),
             results,
         })
@@ -393,15 +527,36 @@ fn delete_file_in_tx(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
     Ok(())
 }
 
-fn reindex_file<P: EmbeddingProvider + ?Sized>(conn: &mut Connection, file: &ScannedFile, provider: &P, embedding_dim: usize, embedding_model: &str, vector_backend: &VectorBackend) -> Result<()> {
+fn reindex_file<P: EmbeddingProvider + ?Sized>(conn: &mut Connection, file: &ScannedFile, provider: &P, embedding_dim: usize, embedding_model: &str, vector_backend: &VectorBackend) -> Result<ReindexFileSummary> {
     let body = fs::read_to_string(&file.abs_path).with_context(|| format!("read {}", file.abs_path.display()))?;
     let parsed = parse_markdown(&file.path, &body)?;
     let chunks = chunk_document(&parsed, 1200);
-    let contents: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let vectors = provider.embed_documents(&contents)?;
-    if vectors.len() != chunks.len() {
-        return Err(anyhow!("embedding count mismatch for file {}", file.path));
+    let mut records: Vec<Option<EmbeddingRecord>> = vec![None; chunks.len()];
+    let mut reused = 0usize;
+    let mut missing_inputs = Vec::new();
+
+    let reusable = load_reusable_embeddings(conn, &file.path, embedding_model, embedding_dim)?;
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if let Some(record) = reusable.get(&chunk.id).cloned() {
+            records[idx] = Some(record);
+            reused += 1;
+        } else {
+            missing_inputs.push((idx, chunk_embedding_input(chunk)));
+        }
     }
+
+    let mut embedded = 0usize;
+    if !missing_inputs.is_empty() {
+        let embeddings = provider.embed_documents(&missing_inputs.iter().map(|(_, text)| text.clone()).collect::<Vec<_>>())?;
+        if embeddings.len() != missing_inputs.len() {
+            return Err(anyhow!("embedding count mismatch for file {}", file.path));
+        }
+        for ((idx, _), vector) in missing_inputs.iter().zip(embeddings.iter()) {
+            records[*idx] = Some(EmbeddingRecord { blob: vector_to_blob(vector), vector_hash: vector_hash(vector) });
+            embedded += 1;
+        }
+    }
+
     let tx = conn.transaction()?;
     delete_file_in_tx(&tx, &file.path)?;
     tx.execute(
@@ -409,7 +564,8 @@ fn reindex_file<P: EmbeddingProvider + ?Sized>(conn: &mut Connection, file: &Sca
          ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size, hash=excluded.hash, indexed_at=excluded.indexed_at",
         params![file.path, file.mtime, file.size as i64, file.hash, Utc::now().to_rfc3339()],
     )?;
-    for (chunk, vector) in chunks.iter().zip(vectors.iter()) {
+    for (chunk, record) in chunks.iter().zip(records.into_iter()) {
+        let record = record.ok_or_else(|| anyhow!("missing embedding record for chunk {}", chunk.id))?;
         let tags = serde_json::to_string(&chunk.tags)?;
         tx.execute(
             "INSERT INTO chunks(chunk_id, file_path, file_hash, title, heading, line_start, line_end, text, tags_json, chunk_hash, mtime)
@@ -421,25 +577,193 @@ fn reindex_file<P: EmbeddingProvider + ?Sized>(conn: &mut Connection, file: &Sca
             "INSERT INTO fts_chunks(rowid, chunk_id, file_path, title, heading, text, tags) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![rowid, chunk.id, chunk.file_path, chunk.title, chunk.heading, chunk.text, serde_json::to_string(&chunk.tags)?],
         )?;
-        let emb = vector_to_blob(vector);
         tx.execute(
             "INSERT INTO chunk_embeddings(chunk_id, model, dim, embedding, vector_hash) VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![chunk.id, embedding_model, embedding_dim as i64, emb, vector_hash(vector)],
+            params![chunk.id, embedding_model, embedding_dim as i64, record.blob.clone(), record.vector_hash],
         )?;
         tx.execute(
             "INSERT INTO vec_chunks(rowid, embedding) VALUES(?1, ?2)",
-            params![rowid, vector_to_blob(vector)],
+            params![rowid, record.blob],
         )?;
     }
     tx.commit()?;
     let _ = vector_backend;
-    Ok(())
+    Ok(ReindexFileSummary { chunks: chunks.len(), embedded, reused })
 }
 
-fn query_hybrid<P: EmbeddingProvider + ?Sized>(conn: &Connection, query: &str, normalized: &str, limit: usize, provider: &P) -> Result<Vec<SearchResult>> {
+fn load_reusable_embeddings(
+    conn: &Connection,
+    file_path: &str,
+    model: &str,
+    dim: usize,
+) -> Result<HashMap<String, EmbeddingRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.chunk_id, e.embedding, e.vector_hash
+         FROM chunks c
+         JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id
+         WHERE c.file_path = ?1 AND e.model = ?2 AND e.dim = ?3",
+    )?;
+    let rows = stmt.query_map(params![file_path, model, dim as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            EmbeddingRecord {
+                blob: row.get::<_, Vec<u8>>(1)?,
+                vector_hash: row.get::<_, String>(2)?,
+            },
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (chunk_id, record) = row?;
+        map.insert(chunk_id, record);
+    }
+    Ok(map)
+}
+
+fn chunk_embedding_input(chunk: &Chunk) -> String {
+    let mut parts = Vec::new();
+    if let Some(title) = &chunk.title {
+        if !title.trim().is_empty() {
+            parts.push(format!("title: {}", title.trim()));
+        }
+    }
+    if let Some(heading) = &chunk.heading {
+        if !heading.trim().is_empty() {
+            parts.push(format!("heading: {}", heading.trim()));
+        }
+    }
+    if !chunk.tags.is_empty() {
+        parts.push(format!("tags: {}", chunk.tags.join(" ")));
+    }
+    parts.push(chunk.text.clone());
+    parts.join("\n")
+}
+
+fn clean_route_term(term: &str) -> String {
+    term
+        .trim()
+        .trim_start_matches("path:")
+        .trim_start_matches("tag:")
+        .trim_start_matches('#')
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '(' || c == ')')
+        .to_lowercase()
+}
+
+fn route_terms(plan: &QueryPlan) -> Vec<String> {
+    let mut out = Vec::new();
+    for pattern in &plan.patterns {
+        let cleaned = clean_route_term(pattern);
+        if !cleaned.is_empty() {
+            out.push(cleaned);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn add_reason(hit: &mut RouteHit, label: &str, score: f32) {
+    if !hit.reasons.iter().any(|reason| reason == label) {
+        hit.score += score;
+        hit.reasons.push(label.to_string());
+    }
+}
+
+fn score_route_hit(plan: &QueryPlan, path: &str, title: Option<&str>, heading: Option<&str>, tags_json: &str) -> Option<RouteHit> {
+    let path_l = path.to_lowercase();
+    let title_l = title.unwrap_or("").to_lowercase();
+    let heading_l = heading.unwrap_or("").to_lowercase();
+    let tags_l = tags_json.to_lowercase();
+    let mut hit = RouteHit { score: 0.0, reasons: Vec::new() };
+
+    for term in route_terms(plan) {
+        if term.is_empty() {
+            continue;
+        }
+        if path_l.contains(&term) {
+            add_reason(&mut hit, "path", if path_l == term { 0.18 } else { 0.12 });
+        }
+        if title_l.contains(&term) {
+            add_reason(&mut hit, "title", 0.08);
+        }
+        if heading_l.contains(&term) {
+            add_reason(&mut hit, "heading", 0.08);
+        }
+        if tags_l.contains(&term) {
+            add_reason(&mut hit, "tag", 0.10);
+        }
+    }
+
+    if matches!(plan.route, QueryRoute::Short) && hit.score == 0.0 {
+        for term in &plan.terms {
+            if path_l.contains(term) {
+                add_reason(&mut hit, "path", 0.08);
+            }
+            if title_l.contains(term) {
+                add_reason(&mut hit, "title", 0.06);
+            }
+            if heading_l.contains(term) {
+                add_reason(&mut hit, "heading", 0.06);
+            }
+            if tags_l.contains(term) {
+                add_reason(&mut hit, "tag", 0.08);
+            }
+        }
+    }
+
+    if hit.score > 0.0 {
+        Some(hit)
+    } else {
+        None
+    }
+}
+
+fn collect_route_hits(conn: &Connection, plan: &QueryPlan, limit: usize) -> Result<HashMap<i64, RouteHit>> {
+    let mut hits: HashMap<i64, RouteHit> = HashMap::new();
+    let limit = (limit * 4).max(16) as i64;
+    for pattern in route_terms(plan) {
+        if pattern.is_empty() {
+            continue;
+        }
+        let like = format!("%{}%", pattern);
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path, title, heading, tags_json
+             FROM chunks
+             WHERE lower(file_path) LIKE ?1
+                OR lower(coalesce(title, '')) LIKE ?1
+                OR lower(coalesce(heading, '')) LIKE ?1
+                OR lower(tags_json) LIKE ?1
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![like, limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (rowid, path, title, heading, tags_json) = row?;
+            if let Some(hit) = score_route_hit(plan, &path, title.as_deref(), heading.as_deref(), &tags_json) {
+                hits.entry(rowid).and_modify(|existing| {
+                    existing.score += hit.score;
+                    for reason in &hit.reasons {
+                        if !existing.reasons.iter().any(|current| current == reason) {
+                            existing.reasons.push(reason.clone());
+                        }
+                    }
+                }).or_insert(hit);
+            }
+        }
+    }
+    Ok(hits)
+}
+
+fn query_hybrid<P: EmbeddingProvider + ?Sized>(conn: &Connection, query: &str, plan: &QueryPlan, limit: usize, provider: &P) -> Result<(Vec<SearchResult>, QueryRoutingEvidence)> {
     let mut keyword_scores: HashMap<i64, (usize, f32)> = HashMap::new();
-    let keyword_query = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if !keyword_query.trim().is_empty() {
+    if let Some(keyword_query) = plan.keyword_query() {
         let mut stmt = conn.prepare(
             "SELECT rowid, bm25(fts_chunks) AS score FROM fts_chunks WHERE fts_chunks MATCH ?1 ORDER BY score ASC LIMIT ?2",
         )?;
@@ -461,19 +785,42 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(conn: &Connection, query: &str, n
         vector_scores.insert(rowid, (rank + 1, distance_to_score(distance)));
     }
 
+    let route_scores = collect_route_hits(conn, plan, limit)?;
     let mut candidate_ids: HashSet<i64> = keyword_scores.keys().copied().collect();
     candidate_ids.extend(vector_scores.keys().copied());
+    candidate_ids.extend(route_scores.keys().copied());
+    let merged_candidates = candidate_ids.len();
+
     let mut results = Vec::new();
     for rowid in candidate_ids {
-        if let Some(result) = load_chunk_result(conn, rowid, keyword_scores.get(&rowid), vector_scores.get(&rowid), query)? {
+        if let Some(result) = load_chunk_result(
+            conn,
+            rowid,
+            keyword_scores.get(&rowid),
+            vector_scores.get(&rowid),
+            route_scores.get(&rowid),
+            plan,
+            query,
+        )? {
             results.push(result);
         }
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(results)
+
+    let routing = QueryRoutingEvidence {
+        strategy: "hybrid".to_string(),
+        route: plan.route.as_str().to_string(),
+        routes_attempted: plan.routes_attempted(),
+        keyword_candidates: keyword_scores.len(),
+        vector_candidates: vector_scores.len(),
+        route_candidates: route_scores.len(),
+        merged_candidates,
+        returned: 0,
+    };
+    Ok((results, routing))
 }
 
-fn query_exact<P: EmbeddingProvider + ?Sized>(conn: &Connection, query: &str, normalized: &str, limit: usize, provider: &P) -> Result<Vec<SearchResult>> {
+fn query_exact<P: EmbeddingProvider + ?Sized>(conn: &Connection, query: &str, plan: &QueryPlan, limit: usize, provider: &P) -> Result<(Vec<SearchResult>, QueryRoutingEvidence)> {
     let qvec = provider.embed_query(query)?;
     let mut stmt = conn.prepare(
         "SELECT c.id, c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, e.embedding, f.mtime, f.hash
@@ -499,17 +846,57 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(conn: &Connection, query: &str, no
         ))
     })?;
     let mut scored = Vec::new();
+    let mut route_matches = 0usize;
     for row in rows {
         let (rowid, chunk_id, path, title, heading, line_start, line_end, text, tags_json, mtime, vec) = row?;
         let distance = l2_distance(&qvec, &vec);
         let vector_score = distance_to_score(distance);
-        let keyword_score = keyword_overlap_score(normalized, &text, &tags_json);
-        let result = build_result(rowid, &chunk_id, &path, title, heading, line_start, line_end, &text, &tags_json, Some(mtime), None, None, keyword_score, vector_score, query)?;
+        let keyword_score = keyword_overlap_score(&plan.normalized, &text, &tags_json);
+        let route_hit = score_route_hit(plan, &path, title.as_deref(), heading.as_deref(), &tags_json);
+        if route_hit.is_some() {
+            route_matches += 1;
+        }
+        let result = build_result(
+            rowid,
+            &chunk_id,
+            &path,
+            title,
+            heading,
+            line_start,
+            line_end,
+            &text,
+            &tags_json,
+            Some(mtime),
+            None,
+            None,
+            keyword_score,
+            vector_score,
+            route_hit.as_ref(),
+            plan,
+            query,
+        )?;
         scored.push(result);
     }
     scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    let total_candidates = scored.len();
+    for (rank, result) in scored.iter_mut().enumerate() {
+        result.evidence.vector_rank = Some(rank + 1);
+        if !result.evidence.sources.iter().any(|source| source == "vector") {
+            result.evidence.sources.push("vector".to_string());
+        }
+    }
     scored.truncate(limit);
-    Ok(scored)
+    let routing = QueryRoutingEvidence {
+        strategy: "exact".to_string(),
+        route: plan.route.as_str().to_string(),
+        routes_attempted: plan.routes_attempted(),
+        keyword_candidates: 0,
+        vector_candidates: total_candidates,
+        route_candidates: route_matches,
+        merged_candidates: total_candidates,
+        returned: 0,
+    };
+    Ok((scored, routing))
 }
 
 fn load_chunk_result(
@@ -517,6 +904,8 @@ fn load_chunk_result(
     rowid: i64,
     keyword: Option<&(usize, f32)>,
     vector: Option<&(usize, f32)>,
+    route_hit: Option<&RouteHit>,
+    plan: &QueryPlan,
     query: &str,
 ) -> Result<Option<SearchResult>> {
     let mut stmt = conn.prepare(
@@ -542,7 +931,25 @@ fn load_chunk_result(
     let Some((chunk_id, path, title, heading, line_start, line_end, text, tags_json, mtime, file_mtime)) = row else {
         return Ok(None);
     };
-    build_result(rowid, &chunk_id, &path, title, heading, line_start, line_end, &text, &tags_json, file_mtime.or(Some(mtime)), keyword.map(|v| v.0), vector.map(|v| v.0), keyword.map(|v| v.1).unwrap_or(0.0), vector.map(|v| v.1).unwrap_or(0.0), query).map(Some)
+    build_result(
+        rowid,
+        &chunk_id,
+        &path,
+        title,
+        heading,
+        line_start,
+        line_end,
+        &text,
+        &tags_json,
+        file_mtime.or(Some(mtime)),
+        keyword.map(|v| v.0),
+        vector.map(|v| v.0),
+        keyword.map(|v| v.1).unwrap_or(0.0),
+        vector.map(|v| v.1).unwrap_or(0.0),
+        route_hit,
+        plan,
+        query,
+    ).map(Some)
 }
 
 fn build_result(
@@ -560,9 +967,12 @@ fn build_result(
     vector_rank: Option<usize>,
     keyword_score: f32,
     vector_score: f32,
+    route_hit: Option<&RouteHit>,
+    plan: &QueryPlan,
     query: &str,
 ) -> Result<SearchResult> {
     let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+    let route_boost = route_hit.map(|hit| hit.score).unwrap_or(0.0);
     let fusion = reciprocal_rank_fusion(keyword_rank, vector_rank);
     let breakdown = ScoreBreakdown {
         keyword: keyword_score,
@@ -570,10 +980,25 @@ fn build_result(
         fusion,
         path_boost: path_boost(path, query),
         tag_boost: tag_boost(&tags, query),
+        route_boost,
         recency_boost: recency_boost(mtime),
     };
-    let score = (keyword_score * 0.35) + (vector_score * 0.35) + fusion + breakdown.path_boost + breakdown.tag_boost + breakdown.recency_boost;
+    let score = (keyword_score * 0.35) + (vector_score * 0.35) + fusion + breakdown.path_boost + breakdown.tag_boost + breakdown.route_boost + breakdown.recency_boost;
     let snippet = snippet(text, query);
+    let mut sources = Vec::new();
+    if keyword_rank.is_some() || keyword_score > 0.0 {
+        sources.push("keyword".to_string());
+    }
+    if vector_rank.is_some() || vector_score > 0.0 {
+        sources.push("vector".to_string());
+    }
+    if let Some(hit) = route_hit {
+        for reason in &hit.reasons {
+            if !sources.iter().any(|current| current == reason) {
+                sources.push(reason.clone());
+            }
+        }
+    }
     Ok(SearchResult {
         chunk_id: chunk_id.to_string(),
         file_path: path.to_string(),
@@ -585,6 +1010,13 @@ fn build_result(
         snippet,
         score,
         score_breakdown: breakdown,
+        evidence: SearchResultEvidence {
+            sources,
+            keyword_rank,
+            vector_rank,
+            route: Some(plan.route.as_str().to_string()),
+            route_score: route_boost,
+        },
         tags,
         mtime: mtime.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
     })
@@ -627,15 +1059,22 @@ fn reciprocal_rank_fusion(keyword_rank: Option<usize>, vector_rank: Option<usize
 
 fn snippet(text: &str, query: &str) -> String {
     let lower = text.to_lowercase();
+    let total_chars = lower.chars().count();
     for term in query.split_whitespace() {
         if term.is_empty() { continue; }
         if let Some(pos) = lower.find(&term.to_lowercase()) {
-            let start = pos.saturating_sub(60);
-            let end = (pos + term.len() + 120).min(text.len());
-            return text[start..end].trim().replace('\n', " ");
+            let char_pos = lower[..pos].chars().count();
+            let start_char = char_pos.saturating_sub(30);
+            let end_char = (char_pos + term.chars().count() + 60).min(total_chars);
+            return lower
+                .chars()
+                .skip(start_char)
+                .take(end_char.saturating_sub(start_char))
+                .collect::<String>()
+                .replace('\n', " ");
         }
     }
-    text.chars().take(180).collect::<String>().replace('\n', " ")
+    lower.chars().take(180).collect::<String>().replace('\n', " ")
 }
 
 fn keyword_overlap_score(query: &str, text: &str, tags_json: &str) -> f32 {
@@ -672,6 +1111,7 @@ mod tests {
     use super::*;
     use crate::embedding::MockEmbeddingProvider;
     use std::fs;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_vault() -> std::path::PathBuf {
@@ -682,6 +1122,55 @@ mod tests {
         fs::write(dir.join("alpha.md"), "---\ntags: [project, alpha]\n---\n# Alpha Project\nThe alpha project uses sqlite-vec local semantic search.\nIt includes chunking and FTS.\n").unwrap();
         fs::write(dir.join("bravo.md"), "# Bravo Project\nObsidian plugin packaging and npm workspace builds.").unwrap();
         dir
+    }
+
+    #[derive(Debug, Clone)]
+    struct CountingMockEmbeddingProvider {
+        inner: MockEmbeddingProvider,
+        calls: Arc<AtomicUsize>,
+        total_inputs: Arc<AtomicUsize>,
+    }
+
+    impl CountingMockEmbeddingProvider {
+        fn new(dim: usize) -> Self {
+            Self {
+                inner: MockEmbeddingProvider::new(dim),
+                calls: Arc::new(AtomicUsize::new(0)),
+                total_inputs: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn total_inputs(&self) -> usize {
+            self.total_inputs.load(Ordering::SeqCst)
+        }
+    }
+
+    impl EmbeddingProvider for CountingMockEmbeddingProvider {
+        fn provider_id(&self) -> &str {
+            self.inner.provider_id()
+        }
+
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn health(&self) -> Result<()> {
+            self.inner.health()
+        }
+
+        fn embed_documents(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.total_inputs.fetch_add(inputs.len(), Ordering::SeqCst);
+            self.inner.embed_documents(inputs)
+        }
     }
 
     #[test]
@@ -697,6 +1186,79 @@ mod tests {
         assert_eq!(res.results[0].path, "alpha.md");
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn query_routes_short_path_and_tag_queries() {
+        let vault = sample_vault();
+        let db_path = std::env::temp_dir().join(format!("orderk-routing-{}-{}.sqlite", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(&db_path, provider.dimension(), provider.model_id(), &VectorBackend::SqliteVec).unwrap();
+        IndexStore::index_vault(&mut conn, &vault, &provider, provider.dimension(), provider.model_id(), &VectorBackend::SqliteVec).unwrap();
+
+        let path_res = IndexStore::query(&conn, "path:alpha.md", 5, &provider, &VectorBackend::SqliteVec).unwrap();
+        assert_eq!(path_res.route, "path");
+        assert!(path_res.routing.routes_attempted.iter().any(|route| route == "path"));
+        assert_eq!(path_res.results[0].path, "alpha.md");
+        assert_eq!(path_res.results[0].evidence.route.as_deref(), Some("path"));
+        assert!(path_res.results[0].evidence.route_score > 0.0);
+        assert!(path_res.results[0].evidence.sources.iter().any(|source| source == "path"));
+
+        let tag_res = IndexStore::query(&conn, "#alpha", 5, &provider, &VectorBackend::SqliteVec).unwrap();
+        assert_eq!(tag_res.route, "tag");
+        assert!(tag_res.routing.routes_attempted.iter().any(|route| route == "tag"));
+        assert_eq!(tag_res.results[0].path, "alpha.md");
+        assert!(tag_res.results[0].evidence.sources.iter().any(|source| source == "tag"));
+        assert!(tag_res.results[0].score_breakdown.route_boost > 0.0);
+
+        let short_res = IndexStore::query(&conn, "alpha", 5, &provider, &VectorBackend::SqliteVec).unwrap();
+        assert_eq!(short_res.route, "short");
+        assert!(short_res.routing.routes_attempted.iter().any(|route| route == "path"));
+        assert_eq!(short_res.results[0].path, "alpha.md");
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn reindex_reuses_unchanged_chunk_embeddings() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!("orderk-reuse-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()));
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("reuse.md"), "# Alpha\nunchanged alpha body\n## Beta\nold beta body\n").unwrap();
+
+        let db_path = std::env::temp_dir().join(format!("orderk-reuse-{}-{}.sqlite", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()));
+        let provider = CountingMockEmbeddingProvider::new(8);
+        let mut conn = open_db(&db_path, provider.dimension(), provider.model_id(), &VectorBackend::SqliteVec).unwrap();
+        let first = IndexStore::index_vault(&mut conn, &vault, &provider, provider.dimension(), provider.model_id(), &VectorBackend::SqliteVec).unwrap();
+        assert_eq!(first.chunks, 2);
+        assert_eq!(first.embedded, 2);
+        assert_eq!(first.reused, 0);
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(provider.total_inputs(), 2);
+
+        fs::write(vault.join("reuse.md"), "# Alpha\nunchanged alpha body\n## Beta\nnew beta body\n").unwrap();
+        let second = IndexStore::index_vault(&mut conn, &vault, &provider, provider.dimension(), provider.model_id(), &VectorBackend::SqliteVec).unwrap();
+        assert_eq!(second.updated, 1);
+        assert_eq!(second.chunks, 2);
+        assert_eq!(second.embedded, 1);
+        assert_eq!(second.reused, 1);
+        assert_eq!(provider.calls(), 2);
+        assert_eq!(provider.total_inputs(), 3);
+
+        let res = IndexStore::query(&conn, "new beta body", 5, &provider, &VectorBackend::SqliteVec).unwrap();
+        assert_eq!(res.results[0].path, "reuse.md");
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn snippet_handles_utf8_boundaries() {
+        let text = "前缀🙂这里有中文和 emoji，search 命中后不该 panic，结尾还有更多文本。";
+        let out = snippet(text, "中文");
+        assert!(out.contains("中文"), "{out}");
+        assert!(!out.is_empty());
     }
 
     #[derive(Debug, Clone)]

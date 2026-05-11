@@ -18,7 +18,7 @@ Obsidian vault -> scan -> parse -> chunk -> embed -> SQLite (FTS5 + sqlite-vec) 
 - **Headless first**: designed for CLI / agent / plugin automation.
 - **Rust core**: small surface area, fast startup, low memory.
 - **Single-file storage**: one SQLite DB for files, chunks, embeddings, FTS, and feedback.
-- **Hybrid retrieval**: keyword + vector + path/tag/recency signals.
+- **Hybrid retrieval**: keyword + vector + query-aware routing + path/tag/recency signals.
 - **Cloud embeddings**: production path uses SiliconFlow + BAAI/bge-m3.
 - **Obsidian-friendly**: keeps the vault workflow intact.
 - **No product bloat**: no chat, no note generation, no second-brain OS.
@@ -128,6 +128,36 @@ orderk search \
 orderk status --db /path/to/vault/.obsidian/orderk/orderk.sqlite
 ```
 
+### 6) Run health / doctor
+
+```bash
+orderk health \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --vault /path/to/vault \
+  --embedding-provider siliconflow \
+  --embedding-model BAAI/bge-m3 \
+  --embedding-dim 1024 \
+  --vector-backend sqlite_vec
+
+orderk doctor \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --vault /path/to/vault \
+  --embedding-provider siliconflow \
+  --embedding-model BAAI/bge-m3 \
+  --embedding-dim 1024 \
+  --vector-backend sqlite_vec
+```
+
+Optional `--smoke-query` turns `doctor` into a retrieval smoke probe; without it, `doctor` behaves like `health`.
+
+### 7) Run eval
+
+```bash
+python3 scripts/eval.py
+```
+
+The eval report includes `recall_at_k`, `ndcg_at_k`, `mrr`, and per-case matched ranks.
+
 The CLI prints JSON by default.
 
 ## Agent setup
@@ -139,7 +169,7 @@ This is the shortest path for an agent or automation:
 3. Use `siliconflow` as the embedding provider.
 4. Set `BAAI/bge-m3` + `1024` unless you have a strong reason to change them.
 5. Use `sqlite_vec` as the vector backend.
-6. Consume the JSON output directly.
+6. Consume the JSON output directly. Search responses include `route`, `routing`, per-result `score_breakdown`, `evidence`, and `tags`.
 
 ### Obsidian plugin settings
 
@@ -161,6 +191,7 @@ cargo test --workspace --all-features
 cargo build --workspace --all-features --release
 python3 scripts/smoke.py
 python3 scripts/stress.py
+python3 scripts/eval.py
 npm install
 npm run build --workspaces --if-present
 npm test --workspaces --if-present

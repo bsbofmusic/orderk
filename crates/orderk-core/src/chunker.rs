@@ -1,45 +1,101 @@
-
 use crate::models::{Chunk, ParsedDocument};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 pub fn chunk_document(doc: &ParsedDocument, max_chars: usize) -> Vec<Chunk> {
     let max_chars = max_chars.max(200);
     let mut chunks = Vec::new();
-    let mut current_heading: Option<String> = None;
+    let mut id_counts: HashMap<String, usize> = HashMap::new();
+    let mut heading_stack: Vec<(usize, String)> = Vec::new();
     let mut current_start = 1usize;
     let mut current_text = String::new();
     let mut current_end = 1usize;
+    let mut fence_marker: Option<char> = None;
 
     for (idx, line) in doc.body.lines().enumerate() {
         let line_no = idx + 1;
-        let is_heading = line.trim_start().starts_with('#');
+        let trimmed = line.trim_start();
+        let is_fence_line = fence_marker_match(trimmed).is_some();
+        let is_heading = fence_marker.is_none() && parse_heading(trimmed).is_some();
+
         if is_heading && !current_text.trim().is_empty() {
-            push_chunk(&mut chunks, doc, current_heading.clone(), current_start, current_end, &current_text);
+            push_chunk(
+                &mut chunks,
+                &mut id_counts,
+                doc,
+                current_heading(&heading_stack),
+                current_start,
+                current_end,
+                &current_text,
+            );
             current_text.clear();
             current_start = line_no;
         }
+
         if is_heading {
-            current_heading = Some(line.trim_start_matches('#').trim().to_string());
+            if let Some((level, heading)) = parse_heading(trimmed) {
+                while heading_stack.last().map(|(existing_level, _)| *existing_level >= level).unwrap_or(false) {
+                    heading_stack.pop();
+                }
+                heading_stack.push((level, heading));
+            }
         }
-        if current_text.len() + line.len() + 1 > max_chars && !current_text.trim().is_empty() {
-            push_chunk(&mut chunks, doc, current_heading.clone(), current_start, current_end, &current_text);
+
+        if current_text.len() + line.len() + 1 > max_chars && !current_text.trim().is_empty() && fence_marker.is_none() {
+            push_chunk(
+                &mut chunks,
+                &mut id_counts,
+                doc,
+                current_heading(&heading_stack),
+                current_start,
+                current_end,
+                &current_text,
+            );
             current_text.clear();
             current_start = line_no;
         }
+
         current_text.push_str(line);
         current_text.push('\n');
         current_end = line_no;
+
+        if is_fence_line {
+            fence_marker = toggle_fence(fence_marker, trimmed);
+        }
     }
+
     if !current_text.trim().is_empty() {
-        push_chunk(&mut chunks, doc, current_heading, current_start, current_end, &current_text);
+        push_chunk(
+            &mut chunks,
+            &mut id_counts,
+            doc,
+            current_heading(&heading_stack),
+            current_start,
+            current_end,
+            &current_text,
+        );
     }
     chunks
 }
 
-fn push_chunk(chunks: &mut Vec<Chunk>, doc: &ParsedDocument, heading: Option<String>, start: usize, end: usize, text: &str) {
+fn push_chunk(
+    chunks: &mut Vec<Chunk>,
+    id_counts: &mut HashMap<String, usize>,
+    doc: &ParsedDocument,
+    heading: Option<String>,
+    start: usize,
+    end: usize,
+    text: &str,
+) {
     let text = text.trim().to_string();
     let hash = hex::encode(Sha256::digest(text.as_bytes()));
-    let id_seed = format!("{}\0{}\0{}", doc.path, start, hash);
+    let heading_seed = heading.as_deref().unwrap_or("");
+    let title_seed = doc.title.as_deref().unwrap_or("");
+    let tags_seed = doc.tags.join("\u{1f}");
+    let id_key = format!("{}\0{}\0{}\0{}\0{}", doc.path, title_seed, tags_seed, heading_seed, hash);
+    let occurrence = *id_counts.entry(id_key.clone()).or_insert(0);
+    id_counts.insert(id_key.clone(), occurrence + 1);
+    let id_seed = format!("{}\0{}\0{}\0{}\0{}\0{}", doc.path, title_seed, tags_seed, heading_seed, hash, occurrence);
     let id = format!("chk_{}", &hex::encode(Sha256::digest(id_seed.as_bytes()))[..24]);
     chunks.push(Chunk {
         id,
@@ -54,6 +110,53 @@ fn push_chunk(chunks: &mut Vec<Chunk>, doc: &ParsedDocument, heading: Option<Str
     });
 }
 
+fn current_heading(stack: &[(usize, String)]) -> Option<String> {
+    if stack.is_empty() {
+        return None;
+    }
+    Some(
+        stack
+            .iter()
+            .map(|(_, heading)| heading.as_str())
+            .collect::<Vec<_>>()
+            .join(" > "),
+    )
+}
+
+fn parse_heading(line: &str) -> Option<(usize, String)> {
+    let level = line.chars().take_while(|c| *c == '#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = line[level..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    Some((level, rest.trim().to_string()))
+}
+
+fn fence_marker_match(line: &str) -> Option<char> {
+    let marker = line.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let count = line.chars().take_while(|c| *c == marker).count();
+    if count >= 3 {
+        Some(marker)
+    } else {
+        None
+    }
+}
+
+fn toggle_fence(current: Option<char>, line: &str) -> Option<char> {
+    let marker = fence_marker_match(line)?;
+    match current {
+        Some(existing) if existing == marker => None,
+        Some(existing) => Some(existing),
+        None => Some(marker),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +169,19 @@ mod tests {
         let b = chunk_document(&doc, 500);
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].id, b[0].id);
-        assert_eq!(a[1].heading.as_deref(), Some("B"));
+        assert_eq!(a[1].heading.as_deref(), Some("A > B"));
+    }
+
+    #[test]
+    fn chunker_preserves_fenced_code_blocks_and_breadcrumbs() {
+        let doc = parse_markdown(
+            "notes/code.md",
+            "# Alpha\nintro\n## Beta\nbefore\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\nafter\n",
+        )
+        .unwrap();
+        let chunks = chunk_document(&doc, 40);
+        assert!(chunks.iter().any(|chunk| chunk.heading.as_deref() == Some("Alpha > Beta") && chunk.text.contains("```rust") && chunk.text.contains("println!")), "{chunks:#?}");
+        assert!(chunks.iter().any(|chunk| chunk.text.contains("after")), "{chunks:#?}");
+        assert!(chunks.iter().all(|chunk| !chunk.text.contains("fn main() {") || chunk.text.contains("```rust")), "code block should stay intact");
     }
 }

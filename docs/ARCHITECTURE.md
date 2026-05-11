@@ -4,6 +4,13 @@
 
 orderk only does retrieval. It does not do chat, agent orchestration, note writing, automatic summaries, or LLM reranking.
 
+It now also exposes explicit health and evaluation contracts:
+
+- `status` for index snapshot + health state
+- `health` for operational probe
+- `doctor` for deeper probe + smoke query
+- `eval` for black-box retrieval regression checks
+
 ## Runtime flow
 
 ```text
@@ -44,12 +51,15 @@ The index stores the active provider/model/dimension/backend in SQLite settings 
 
 ## Ranking
 
-v1 uses lightweight score fusion:
+v1 uses lightweight score fusion and query-aware routing:
 
 - keyword score from FTS5/BM25
 - vector similarity from sqlite-vec
 - reciprocal-rank fusion for keyword/vector candidate overlap
+- query routing for short / path / tag queries
 - path/tag/recency boosts
+
+Each search result also carries structured `score_breakdown`, `evidence`, and tag metadata so agents can inspect why it surfaced.
 
 No LLM reranker is used.
 
