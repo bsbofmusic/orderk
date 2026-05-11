@@ -1,8 +1,8 @@
 # orderk
 
-orderk is a headless retrieval layer for Obsidian Markdown vaults.
+orderk is a headless, ultra-light vector search plugin for Obsidian Markdown vaults.
 
-It is built for agents.
+It is built for agents that need fast local retrieval.
 It is not a chat app, not an agent orchestrator, and not a note-writing system.
 
 ## What it is
