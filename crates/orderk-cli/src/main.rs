@@ -29,7 +29,7 @@ fn main() -> Result<()> {
         "index" => {
             let vault = take_path(&mut args, "--vault")?;
             let db = take_path(&mut args, "--db")?;
-            let embedding_provider = take_string(&mut args, "--embedding-provider", "mock".to_string());
+            let embedding_provider = take_string(&mut args, "--embedding-provider", "siliconflow".to_string());
             let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024);
             let embedding_model = take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string());
             let vector_backend = parse_backend(&take_string(&mut args, "--vector-backend", "sqlite_vec".to_string()));
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
             let query_text = take_string(&mut args, "--query", String::new());
             if query_text.is_empty() { return Err(anyhow!("--query is required")); }
             let limit = take_usize(&mut args, "--limit", 10);
-            let embedding_provider = take_string(&mut args, "--embedding-provider", "mock".to_string());
+            let embedding_provider = take_string(&mut args, "--embedding-provider", "siliconflow".to_string());
             let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024);
             let embedding_model = take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string());
             let vector_backend = parse_backend(&take_string(&mut args, "--vector-backend", "sqlite_vec".to_string()));

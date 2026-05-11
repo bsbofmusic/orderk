@@ -48,12 +48,9 @@ pub fn feedback(db_path: &Path, event: &FeedbackEvent) -> Result<FeedbackRespons
     IndexStore::feedback(&conn, event)
 }
 
-pub fn provider_from_env(dim: usize, model: Option<String>) -> Box<dyn EmbeddingProvider> {
-    if let Ok(key) = std::env::var("HERMES_SILICONFLOW_API_KEY").or_else(|_| std::env::var("SILICONFLOW_API_KEY")) {
-        Box::new(SiliconFlowM3Provider::new(key, model, dim, None))
-    } else {
-        Box::new(MockEmbeddingProvider::new(dim))
-    }
+pub fn provider_from_env(dim: usize, model: Option<String>) -> Result<Box<dyn EmbeddingProvider>> {
+    let key = std::env::var("HERMES_SILICONFLOW_API_KEY").or_else(|_| std::env::var("SILICONFLOW_API_KEY")).map_err(|_| anyhow::anyhow!("SiliconFlow API key is missing"))?;
+    Ok(Box::new(SiliconFlowM3Provider::new(key, model, dim, None)))
 }
 
 pub fn provider_from_name(name: &str, dim: usize, model: Option<String>) -> Result<Box<dyn EmbeddingProvider>> {

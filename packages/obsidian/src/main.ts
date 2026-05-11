@@ -61,6 +61,27 @@ class OrderkSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
       }));
     new Setting(containerEl)
+      .setName("Embedding provider")
+      .setDesc("Use siliconflow for production cloud vectors; use mock only for offline tests.")
+      .addText((text) => text.setValue(this.plugin.settings.embeddingProvider ?? "siliconflow").onChange(async (value) => {
+        this.plugin.settings.embeddingProvider = value || "siliconflow";
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
+      .setName("Embedding model")
+      .setDesc("Production default: BAAI/bge-m3. API key must be available to Obsidian through HERMES_SILICONFLOW_API_KEY or SILICONFLOW_API_KEY.")
+      .addText((text) => text.setValue(this.plugin.settings.embeddingModel ?? "BAAI/bge-m3").onChange(async (value) => {
+        this.plugin.settings.embeddingModel = value || "BAAI/bge-m3";
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
+      .setName("Embedding dimension")
+      .setDesc("BAAI/bge-m3 uses 1024 dimensions in the default orderk profile.")
+      .addText((text) => text.setValue(String(this.plugin.settings.embeddingDim ?? 1024)).onChange(async (value) => {
+        this.plugin.settings.embeddingDim = Number(value) || 1024;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
       .setName("Search limit")
       .addText((text) => text.setValue(String(this.plugin.settings.searchLimit)).onChange(async (value) => {
         this.plugin.settings.searchLimit = Number(value) || 10;

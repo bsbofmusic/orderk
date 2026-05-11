@@ -97,6 +97,7 @@ pub struct StatusResponse {
 pub struct ScoreBreakdown {
     pub keyword: f32,
     pub vector: f32,
+    pub fusion: f32,
     pub path_boost: f32,
     pub tag_boost: f32,
     pub recency_boost: f32,

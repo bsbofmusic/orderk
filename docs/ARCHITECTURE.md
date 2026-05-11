@@ -40,12 +40,15 @@ Default backend: `sqlite-vec` virtual table.
 
 Exact vector search exists as a fallback/test path, not the primary delivery path.
 
+The index stores the active provider/model/dimension/backend in SQLite settings and refuses to search against a mismatched profile. That keeps agent-facing retrieval deterministic instead of silently mixing embeddings.
+
 ## Ranking
 
 v1 uses lightweight score fusion:
 
 - keyword score from FTS5/BM25
 - vector similarity from sqlite-vec
+- reciprocal-rank fusion for keyword/vector candidate overlap
 - path/tag/recency boosts
 
 No LLM reranker is used.

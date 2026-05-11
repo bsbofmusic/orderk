@@ -21,7 +21,7 @@ export const DEFAULT_SETTINGS: OrderkSettings = {
   searchLimit: 10,
   openInNewPane: false,
   debugLogging: false,
-  embeddingProvider: "mock",
+  embeddingProvider: "siliconflow",
   embeddingModel: "BAAI/bge-m3",
   embeddingDim: 1024,
 };
