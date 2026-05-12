@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use orderk_core::{
-    classify_error_message, feedback, health_report, index_vault, init, provider_from_name, query, status,
+    classify_error_message, feedback, health_report, index_vault, init, provider_from_name, query, query_with_filter, status,
     EmbeddingProvider, FeedbackEvent, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
@@ -67,8 +67,9 @@ fn run() -> Result<()> {
             let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024)?;
             let embedding_model = take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
             let vector_backend = parse_backend(&take_string(&mut args, "--vector-backend", "sqlite_vec".to_string())?)?;
+            let filter = take_optional_string(&mut args, "--filter")?;
             let provider = provider_from_name(&embedding_provider, embedding_dim, Some(embedding_model.clone()))?;
-            let resp = query(&db, &query_text, limit, provider.as_ref(), vector_backend)?;
+            let resp = query_with_filter(&db, &query_text, limit, provider.as_ref(), vector_backend, filter.as_deref())?;
             print_json(&resp)?;
         }
         "status" => {
@@ -493,6 +494,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 fn print_usage() {
     eprintln!("orderk <init|index|search|status|health|doctor|eval|maintain|feedback> [--flags]");
+    eprintln!("search flags include: --query <text> [--filter \"tag == 'rust' && has_code == true\"]");
 }
 
 #[derive(Debug, Deserialize)]

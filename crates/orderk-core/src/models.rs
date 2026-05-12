@@ -57,6 +57,10 @@ pub struct Chunk {
     pub text: String,
     pub hash: String,
     pub tags: Vec<String>,
+    pub has_code: bool,
+    pub has_link: bool,
+    pub has_task_list: bool,
+    pub has_incomplete_tasks: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +246,9 @@ pub struct QueryRoutingEvidence {
     pub strategy: String,
     pub route: String,
     pub routes_attempted: Vec<String>,
+    pub filter: Option<String>,
+    pub filter_mode: Option<String>,
+    pub filtered_candidates: Option<usize>,
     pub keyword_candidates: usize,
     pub vector_candidates: usize,
     pub route_candidates: usize,

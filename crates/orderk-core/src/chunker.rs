@@ -104,6 +104,10 @@ fn push_chunk(
         heading,
         line_start: start,
         line_end: end,
+        has_code: has_code(&text),
+        has_link: has_link(&text),
+        has_task_list: has_task_list(&text),
+        has_incomplete_tasks: has_incomplete_tasks(&text),
         text,
         hash,
         tags: doc.tags.clone(),
@@ -157,6 +161,36 @@ fn toggle_fence(current: Option<char>, line: &str) -> Option<char> {
     }
 }
 
+pub fn has_code(text: &str) -> bool {
+    text.lines().any(|line| fence_marker_match(line.trim_start()).is_some())
+}
+
+pub fn has_link(text: &str) -> bool {
+    text.contains("http://")
+        || text.contains("https://")
+        || text.contains("[[")
+        || (text.contains('[') && text.contains("]("))
+}
+
+pub fn has_task_list(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("- [ ]")
+            || trimmed.starts_with("- [x]")
+            || trimmed.starts_with("- [X]")
+            || trimmed.starts_with("* [ ]")
+            || trimmed.starts_with("* [x]")
+            || trimmed.starts_with("* [X]")
+    })
+}
+
+pub fn has_incomplete_tasks(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("- [ ]") || trimmed.starts_with("* [ ]")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +217,36 @@ mod tests {
         assert!(chunks.iter().any(|chunk| chunk.heading.as_deref() == Some("Alpha > Beta") && chunk.text.contains("```rust") && chunk.text.contains("println!")), "{chunks:#?}");
         assert!(chunks.iter().any(|chunk| chunk.text.contains("after")), "{chunks:#?}");
         assert!(chunks.iter().all(|chunk| !chunk.text.contains("fn main() {") || chunk.text.contains("```rust")), "code block should stay intact");
+    }
+
+    #[test]
+    fn chunker_detects_structural_metadata() {
+        // has_code: fenced code blocks
+        assert!(has_code("before\n```rust\nfn main() {}\n```\nafter"));
+        assert!(has_code("~~~\ncode\n~~~"));
+        assert!(!has_code("no code here\njust text"));
+
+        // has_link: URLs and Markdown links
+        assert!(has_link("see https://example.com for details"));
+        assert!(has_link("check http://localhost:8080"));
+        assert!(has_link("ref [[wikilink]] in text"));
+        assert!(has_link("see [link](https://a.com) here"));
+        assert!(!has_link("no link here"));
+
+        // has_task_list: checked and unchecked
+        assert!(has_task_list("- [ ] todo item"));
+        assert!(has_task_list("- [x] done item"));
+        assert!(has_task_list("- [X] done item uppercase"));
+        assert!(has_task_list("* [ ] star todo"));
+        assert!(has_task_list("* [x] star done"));
+        assert!(!has_task_list("no task here"));
+        assert!(has_task_list("  - [ ] indented task"));
+
+        // has_incomplete_tasks: only unchecked
+        assert!(has_incomplete_tasks("- [ ] todo item"));
+        assert!(has_incomplete_tasks("* [ ] star todo"));
+        assert!(!has_incomplete_tasks("- [x] done item"));
+        assert!(!has_incomplete_tasks("- [X] done uppercase"));
+        assert!(!has_incomplete_tasks("no task"));
     }
 }

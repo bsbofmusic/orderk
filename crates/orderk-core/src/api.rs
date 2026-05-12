@@ -32,8 +32,19 @@ pub fn query(
     provider: &dyn EmbeddingProvider,
     vector_backend: VectorBackend,
 ) -> Result<QueryResponse> {
+    query_with_filter(db_path, query, limit, provider, vector_backend, None)
+}
+
+pub fn query_with_filter(
+    db_path: &Path,
+    query: &str,
+    limit: usize,
+    provider: &dyn EmbeddingProvider,
+    vector_backend: VectorBackend,
+    filter: Option<&str>,
+) -> Result<QueryResponse> {
     let conn = open_existing(db_path)?;
-    IndexStore::query(&conn, query, limit, provider, &vector_backend)
+    IndexStore::query_with_filter(&conn, query, limit, provider, &vector_backend, filter)
 }
 
 pub fn status(db_path: &Path) -> Result<StatusResponse> {
@@ -68,5 +79,6 @@ fn open_existing(db_path: &Path) -> Result<Connection> {
     crate::index::register_sqlite_vec();
     let conn = Connection::open(db_path)?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    crate::index::migrate_chunk_metadata_columns(&conn)?;
     Ok(conn)
 }
