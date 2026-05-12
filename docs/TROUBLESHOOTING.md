@@ -19,7 +19,7 @@ orderk is a scanner with a fault ticket printer:
 | `E_NO_EMBEDDINGS` / `needs_index` | DB exists but has no vectors yet | Run `orderk index` with the intended profile | `orderk status --db ...` |
 | Search works by keyword but vector quality looks wrong | Wrong profile, stale index, or vector backend unavailable | Rebuild and run eval | `orderk eval --queries ...` |
 | Obsidian plugin cannot run | Native CLI is missing | Set plugin binary path or `ORDERK_BIN` | `Orderk: Health Check` in Obsidian |
-| npm package installed but CLI missing | Wrapper cannot resolve native binary | Check `ORDERK_BIN`, GitHub release asset, or local `target/release/orderk` | `orderk --version` |
+| npm package installed but CLI missing | Wrapper cannot resolve native binary | Check `ORDERK_BIN`, the npm vendor binary, GitHub release asset, or `orderk` on `PATH` | `orderk --version` |
 | Startup indexing did not run | `indexOnStartup` disabled or vault path missing | Enable plugin setting and set vault path | Obsidian notice + `orderk status` |
 
 ## Evidence-first commands

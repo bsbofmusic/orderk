@@ -201,15 +201,12 @@ function resolveOrderkBinary(explicitPath?: string): string {
     if (candidate === "orderk") return candidate;
     if (fs.existsSync(candidate)) return candidate;
   }
-  throw new Error("orderk CLI not found. Set ORDERK_BIN or install the native binary.");
+  throw new Error("orderk CLI not found. Set ORDERK_BIN, configure the plugin binary path, or install orderk on PATH.");
 }
 
 function localBinary(): string | undefined {
   const packageRoot = path.resolve(__dirname);
-  const repoRoot = path.resolve(packageRoot, "..", "..");
   const candidates = [
-    path.join(repoRoot, "target", "release", process.platform === "win32" ? "orderk.exe" : "orderk"),
-    path.join(repoRoot, "target", "debug", process.platform === "win32" ? "orderk.exe" : "orderk"),
     path.join(packageRoot, "vendor", process.platform === "win32" ? "orderk.exe" : "orderk"),
   ];
   return candidates.find((candidate) => fs.existsSync(candidate));

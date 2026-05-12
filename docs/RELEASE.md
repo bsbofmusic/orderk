@@ -26,8 +26,8 @@ npm pack --workspaces --dry-run
 - `orderk-cli`: JavaScript wrapper for the native binary.
 - `orderk-obsidian`: Obsidian desktop plugin package.
 
-Platform binary packages are intentionally left as a release-pipeline step; local development resolves `target/release/orderk` or `ORDERK_BIN`.
-The v0.1.5 npm one-click path targets Linux x64 first; other platforms can build from source or point `ORDERK_BIN` at a local binary.
+Runtime installs resolve a stable native binary through `ORDERK_BIN`, a package-local vendor binary, or `orderk` on `PATH`; they do not depend on Cargo `target/` build artifacts.
+The v0.1.5 npm one-click path targets Linux x64 first; other platforms can build from source and install/copy the resulting binary to a stable path.
 
 ## Obsidian artifact
 
