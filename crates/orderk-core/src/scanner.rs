@@ -1,4 +1,3 @@
-
 use crate::models::ScannedFile;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -8,7 +7,9 @@ use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
 pub fn scan_vault(vault: &Path) -> Result<Vec<ScannedFile>> {
-    let vault = vault.canonicalize().with_context(|| format!("vault path not found: {}", vault.display()))?;
+    let vault = vault
+        .canonicalize()
+        .with_context(|| format!("vault path not found: {}", vault.display()))?;
     let mut files = Vec::new();
     for entry in WalkDir::new(&vault).follow_links(false).into_iter() {
         let entry = entry?;
@@ -19,11 +20,16 @@ pub fn scan_vault(vault: &Path) -> Result<Vec<ScannedFile>> {
         if !entry.file_type().is_file() || path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
-        let rel = path.strip_prefix(&vault)?.to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(&vault)?
+            .to_string_lossy()
+            .replace('\\', "/");
         let metadata = entry.metadata()?;
         let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let hash = hex::encode(Sha256::digest(&bytes));
-        let mtime = metadata.modified().ok()
+        let mtime = metadata
+            .modified()
+            .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or_default();
@@ -43,7 +49,10 @@ fn should_skip(path: &Path) -> bool {
     path.components().any(|component| {
         if let Component::Normal(name) = component {
             let s = name.to_string_lossy();
-            matches!(s.as_ref(), ".obsidian" | ".trash" | ".git" | "node_modules" | "target")
+            matches!(
+                s.as_ref(),
+                ".obsidian" | ".trash" | ".git" | "node_modules" | "target"
+            )
         } else {
             false
         }
@@ -58,7 +67,10 @@ mod tests {
 
     fn temp_dir() -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         dir.push(format!("orderk-scanner-{}-{}", std::process::id(), unique));
         fs::create_dir_all(&dir).unwrap();
         dir

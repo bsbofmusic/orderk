@@ -1,13 +1,14 @@
 use anyhow::{anyhow, Result};
 use orderk_core::{
-    classify_error_message, feedback, health_report, index_vault, init, provider_from_name, query, query_with_filter, status,
-    EmbeddingProvider, FeedbackEvent, VectorBackend,
+    classify_error_message, feedback, health_report, index_vault, init, provider_from_name, query,
+    query_with_options, status, EmbeddingProvider, FeedbackEvent, QueryOptions, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,7 +21,11 @@ fn main() {
             "error_code": error_code,
             "message": err.to_string(),
         });
-        eprintln!("{}", serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| "{\"ok\":false}".to_string()));
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&envelope)
+                .unwrap_or_else(|_| "{\"ok\":false}".to_string())
+        );
         std::process::exit(1);
     }
 }
@@ -42,8 +47,13 @@ fn run() -> Result<()> {
         "init" => {
             let db = take_path(&mut args, "--db")?;
             let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024)?;
-            let embedding_model = take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-            let vector_backend = parse_backend(&take_string(&mut args, "--vector-backend", "sqlite_vec".to_string())?)?;
+            let embedding_model =
+                take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
+            let vector_backend = parse_backend(&take_string(
+                &mut args,
+                "--vector-backend",
+                "sqlite_vec".to_string(),
+            )?)?;
             let vector_backend_name = vector_backend.as_str().to_string();
             init(&db, embedding_dim, &embedding_model, vector_backend)?;
             print_json(&json!({"ok": true, "db": db, "vector_backend": vector_backend_name}))?;
@@ -51,25 +61,68 @@ fn run() -> Result<()> {
         "index" => {
             let vault = take_path(&mut args, "--vault")?;
             let db = take_path(&mut args, "--db")?;
-            let embedding_provider = take_string(&mut args, "--embedding-provider", "siliconflow".to_string())?;
+            let embedding_provider =
+                take_string(&mut args, "--embedding-provider", "siliconflow".to_string())?;
             let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024)?;
-            let embedding_model = take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-            let vector_backend = parse_backend(&take_string(&mut args, "--vector-backend", "sqlite_vec".to_string())?)?;
-            let provider = provider_from_name(&embedding_provider, embedding_dim, Some(embedding_model.clone()))?;
-            let summary = index_vault(&vault, &db, provider.as_ref(), embedding_dim, &embedding_model, vector_backend)?;
+            let embedding_model =
+                take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
+            let vector_backend = parse_backend(&take_string(
+                &mut args,
+                "--vector-backend",
+                "sqlite_vec".to_string(),
+            )?)?;
+            let provider = provider_from_name(
+                &embedding_provider,
+                embedding_dim,
+                Some(embedding_model.clone()),
+            )?;
+            let summary = index_vault(
+                &vault,
+                &db,
+                provider.as_ref(),
+                embedding_dim,
+                &embedding_model,
+                vector_backend,
+            )?;
             print_json(&summary)?;
         }
         "search" => {
             let db = take_path(&mut args, "--db")?;
             let query_text = take_required_string(&mut args, "--query")?;
             let limit = take_usize(&mut args, "--limit", 10)?;
-            let embedding_provider = take_string(&mut args, "--embedding-provider", "siliconflow".to_string())?;
+            let embedding_provider =
+                take_string(&mut args, "--embedding-provider", "siliconflow".to_string())?;
             let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024)?;
-            let embedding_model = take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-            let vector_backend = parse_backend(&take_string(&mut args, "--vector-backend", "sqlite_vec".to_string())?)?;
+            let embedding_model =
+                take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
+            let vector_backend = parse_backend(&take_string(
+                &mut args,
+                "--vector-backend",
+                "sqlite_vec".to_string(),
+            )?)?;
             let filter = take_optional_string(&mut args, "--filter")?;
-            let provider = provider_from_name(&embedding_provider, embedding_dim, Some(embedding_model.clone()))?;
-            let resp = query_with_filter(&db, &query_text, limit, provider.as_ref(), vector_backend, filter.as_deref())?;
+            let min_score = take_optional_f32(&mut args, "--min-score")?;
+            let threshold = take_optional_f32(&mut args, "--threshold")?;
+            let context_chunks = take_usize(&mut args, "--context-chunks", 0)?;
+            let include_links = take_flag(&mut args, "--include-links");
+            let provider = provider_from_name(
+                &embedding_provider,
+                embedding_dim,
+                Some(embedding_model.clone()),
+            )?;
+            let resp = query_with_options(
+                &db,
+                &query_text,
+                &QueryOptions {
+                    limit,
+                    filter,
+                    min_score: min_score.or(threshold),
+                    context_chunks,
+                    include_links,
+                },
+                provider.as_ref(),
+                vector_backend,
+            )?;
             print_json(&resp)?;
         }
         "status" => {
@@ -93,15 +146,32 @@ fn run() -> Result<()> {
             let resp = maintain_command(&mut args)?;
             print_json(&resp)?;
         }
+        "mcp" => {
+            run_mcp_server(&mut args)?;
+        }
         "feedback" => {
             let db = take_path(&mut args, "--db")?;
             let event_json = take_required_string(&mut args, "--event")?;
             let raw: serde_json::Value = serde_json::from_str(&event_json)?;
             let event = FeedbackEvent {
-                event: raw.get("event").or_else(|| raw.get("type")).and_then(|v| v.as_str()).unwrap_or("event").to_string(),
-                query_id: raw.get("query_id").and_then(|v| v.as_str()).map(ToString::to_string),
-                chunk_id: raw.get("chunk_id").and_then(|v| v.as_str()).map(ToString::to_string),
-                query: raw.get("query").and_then(|v| v.as_str()).map(ToString::to_string),
+                event: raw
+                    .get("event")
+                    .or_else(|| raw.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("event")
+                    .to_string(),
+                query_id: raw
+                    .get("query_id")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                chunk_id: raw
+                    .get("chunk_id")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                query: raw
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
                 payload: raw,
             };
             let resp = feedback(&db, &event)?;
@@ -125,9 +195,17 @@ fn health_like_command(args: &mut Vec<String>, _doctor: bool) -> Result<serde_js
     let embedding_provider = take_string(args, "--embedding-provider", "siliconflow".to_string())?;
     let embedding_dim = take_usize(args, "--embedding-dim", 1024)?;
     let embedding_model = take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-    let vector_backend = parse_backend(&take_string(args, "--vector-backend", "sqlite_vec".to_string())?)?;
+    let vector_backend = parse_backend(&take_string(
+        args,
+        "--vector-backend",
+        "sqlite_vec".to_string(),
+    )?)?;
     let smoke_query = take_optional_string(args, "--smoke-query")?;
-    let (provider, provider_error) = resolve_provider(&embedding_provider, embedding_dim, Some(embedding_model.clone()));
+    let (provider, provider_error) = resolve_provider(
+        &embedding_provider,
+        embedding_dim,
+        Some(embedding_model.clone()),
+    );
     let report = health_report(
         &db,
         vault.as_deref(),
@@ -149,14 +227,25 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let embedding_provider = take_string(args, "--embedding-provider", "siliconflow".to_string())?;
     let embedding_dim = take_usize(args, "--embedding-dim", 1024)?;
     let embedding_model = take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-    let vector_backend = parse_backend(&take_string(args, "--vector-backend", "sqlite_vec".to_string())?)?;
-    let provider = provider_from_name(&embedding_provider, embedding_dim, Some(embedding_model.clone()))?;
+    let vector_backend = parse_backend(&take_string(
+        args,
+        "--vector-backend",
+        "sqlite_vec".to_string(),
+    )?)?;
+    let provider = provider_from_name(
+        &embedding_provider,
+        embedding_dim,
+        Some(embedding_model.clone()),
+    )?;
 
-    let raw = fs::read_to_string(&queries_path)?;
+    let raw = fs::read_to_string(queries_path)?;
     let spec: EvalFile = serde_json::from_str(&raw)?;
     if let Some(schema_version) = spec.schema_version.as_deref() {
         if schema_version != "orderk.eval_queries.v1" {
-            return Err(anyhow!("unsupported eval query schema_version: {}", schema_version));
+            return Err(anyhow!(
+                "unsupported eval query schema_version: {}",
+                schema_version
+            ));
         }
     }
     if spec.queries.is_empty() {
@@ -184,7 +273,13 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             }
         }
 
-        let resp = query(&db, &case.query, limit, provider.as_ref(), vector_backend.clone())?;
+        let resp = query(
+            &db,
+            &case.query,
+            limit,
+            provider.as_ref(),
+            vector_backend.clone(),
+        )?;
         let mut found_rank = None;
         let mut top_rank_hit = false;
         let mut matched_ranks = Vec::new();
@@ -192,7 +287,10 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         for (idx, result) in resp.results.iter().enumerate() {
             if expected_seen.contains(&result.path) && matched_seen.insert(result.path.clone()) {
                 let rank = idx + 1;
-                matched_ranks.push(EvalMatchedRank { path: result.path.clone(), rank });
+                matched_ranks.push(EvalMatchedRank {
+                    path: result.path.clone(),
+                    rank,
+                });
                 if found_rank.is_none() {
                     found_rank = Some(rank);
                 }
@@ -278,8 +376,16 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let embedding_provider = take_string(args, "--embedding-provider", "siliconflow".to_string())?;
     let embedding_dim = take_usize(args, "--embedding-dim", 1024)?;
     let embedding_model = take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-    let vector_backend = parse_backend(&take_string(args, "--vector-backend", "sqlite_vec".to_string())?)?;
-    let (provider, provider_error) = resolve_provider(&embedding_provider, embedding_dim, Some(embedding_model.clone()));
+    let vector_backend = parse_backend(&take_string(
+        args,
+        "--vector-backend",
+        "sqlite_vec".to_string(),
+    )?)?;
+    let (provider, provider_error) = resolve_provider(
+        &embedding_provider,
+        embedding_dim,
+        Some(embedding_model.clone()),
+    );
 
     let health = health_report(
         &db,
@@ -330,7 +436,10 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                         "eval",
                         classify_error_message(&err.to_string()),
                         format!("eval gate failed: {err}"),
-                        Some("run `orderk eval` with the same arguments and inspect the JSON error".to_string()),
+                        Some(
+                            "run `orderk eval` with the same arguments and inspect the JSON error"
+                                .to_string(),
+                        ),
                         json!({"queries": queries_path.to_string_lossy()}),
                     ));
                     None
@@ -422,6 +531,296 @@ fn run_eval_report(
     eval_command(&mut args)
 }
 
+#[derive(Debug, Clone)]
+struct McpConfig {
+    db: PathBuf,
+    embedding_provider: String,
+    embedding_dim: usize,
+    embedding_model: String,
+    vector_backend: VectorBackend,
+}
+
+fn run_mcp_server(args: &mut Vec<String>) -> Result<()> {
+    let config = McpConfig {
+        db: take_path(args, "--db")?,
+        embedding_provider: take_string(args, "--embedding-provider", "siliconflow".to_string())?,
+        embedding_dim: take_usize(args, "--embedding-dim", 1024)?,
+        embedding_model: take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?,
+        vector_backend: parse_backend(&take_string(
+            args,
+            "--vector-backend",
+            "sqlite_vec".to_string(),
+        )?)?,
+    };
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let framed = detect_framed_mcp(&mut reader)?;
+    if framed {
+        run_mcp_framed_loop(&mut reader, &mut stdout, &config)?;
+    } else {
+        run_mcp_jsonl_loop(&mut reader, &mut stdout, &config)?;
+    }
+    Ok(())
+}
+
+fn detect_framed_mcp<R: BufRead>(reader: &mut R) -> Result<bool> {
+    let buffer = reader.fill_buf()?;
+    Ok(buffer.starts_with(b"Content-Length:"))
+}
+
+fn run_mcp_jsonl_loop<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    config: &McpConfig,
+) -> Result<()> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(err) => {
+                writeln!(
+                    writer,
+                    "{}",
+                    jsonrpc_error(json!(null), -32700, &format!("parse error: {err}"))
+                )?;
+                writer.flush()?;
+                continue;
+            }
+        };
+        if let Some(response) = handle_mcp_message(&message, config) {
+            writeln!(writer, "{}", response)?;
+            writer.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn run_mcp_framed_loop<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    config: &McpConfig,
+) -> Result<()> {
+    while let Some(message) = read_mcp_frame(reader)? {
+        if let Some(response) = handle_mcp_message(&message, config) {
+            write_mcp_frame(writer, &response)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_mcp_frame<R: BufRead>(reader: &mut R) -> Result<Option<serde_json::Value>> {
+    let mut content_length: Option<usize> = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse()?);
+        }
+    }
+    let Some(len) = content_length else {
+        return Err(anyhow!("missing MCP Content-Length header"));
+    };
+    let mut body = vec![0_u8; len];
+    reader.read_exact(&mut body)?;
+    Ok(Some(serde_json::from_slice(&body)?))
+}
+
+fn write_mcp_frame<W: Write>(writer: &mut W, value: &serde_json::Value) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    writer.write_all(&body)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn handle_mcp_message(
+    message: &serde_json::Value,
+    config: &McpConfig,
+) -> Option<serde_json::Value> {
+    let id = message.get("id").cloned();
+    let Some(method) = message.get("method").and_then(|v| v.as_str()) else {
+        return id.map(|id| jsonrpc_error(id, -32600, "invalid request"));
+    };
+    let id = id?;
+    let result = match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": message
+                .get("params")
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("2024-11-05"),
+            "serverInfo": {"name": "orderk", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"tools": {}}
+        })),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({"tools": mcp_tool_definitions()})),
+        "tools/call" => handle_mcp_tool_call(message, config),
+        _ => Err(anyhow!("unknown MCP method: {method}")),
+    };
+    Some(match result {
+        Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
+        Err(err) => jsonrpc_error(id, -32603, &err.to_string()),
+    })
+}
+
+fn handle_mcp_tool_call(
+    message: &serde_json::Value,
+    config: &McpConfig,
+) -> Result<serde_json::Value> {
+    let params = message
+        .get("params")
+        .ok_or_else(|| anyhow!("tools/call params are required"))?;
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("tools/call params.name is required"))?;
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let value = match name {
+        "search" => mcp_search(config, &arguments)?,
+        "status" => serde_json::to_value(status(&config.db)?)?,
+        "health" => mcp_health(config, &arguments)?,
+        other => return Err(anyhow!("unknown orderk MCP tool: {other}")),
+    };
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&value)?}],
+        "structuredContent": value,
+        "isError": false
+    }))
+}
+
+fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde_json::Value> {
+    let query_text = arguments
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("search.query is required"))?;
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
+    let min_score = arguments
+        .get("min_score")
+        .or_else(|| arguments.get("threshold"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
+    let context_chunks = arguments
+        .get("context_chunks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(3) as usize;
+    let filter = arguments
+        .get("filter")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let include_links = arguments
+        .get("include_links")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let provider = provider_from_name(
+        &config.embedding_provider,
+        config.embedding_dim,
+        Some(config.embedding_model.clone()),
+    )?;
+    let response = query_with_options(
+        &config.db,
+        query_text,
+        &QueryOptions {
+            limit,
+            filter,
+            min_score,
+            context_chunks,
+            include_links,
+        },
+        provider.as_ref(),
+        config.vector_backend.clone(),
+    )?;
+    Ok(serde_json::to_value(response)?)
+}
+
+fn mcp_health(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde_json::Value> {
+    let smoke_query = arguments.get("smoke_query").and_then(|v| v.as_str());
+    let (provider, provider_error) = resolve_provider(
+        &config.embedding_provider,
+        config.embedding_dim,
+        Some(config.embedding_model.clone()),
+    );
+    Ok(serde_json::to_value(health_report(
+        &config.db,
+        None,
+        provider.as_deref(),
+        provider_error,
+        &config.embedding_provider,
+        config.embedding_dim,
+        &config.embedding_model,
+        &config.vector_backend,
+        smoke_query,
+    ))?)
+}
+
+fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+fn mcp_tool_definitions() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "name": "search",
+            "description": "Read-only orderk search over the configured Obsidian vault index. Returns JSON evidence only; it never writes notes or reindexes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                    "filter": {"type": "string", "description": "Optional mini filter DSL, e.g. tag == 'rust' && has_code == true"},
+                    "min_score": {"type": "number", "description": "Drop results below this fused score"},
+                    "threshold": {"type": "number", "description": "Alias for min_score"},
+                    "context_chunks": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
+                    "include_links": {"type": "boolean", "default": false}
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "status",
+            "description": "Read-only machine-readable status for the configured orderk SQLite index.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "health",
+            "description": "Read-only health/doctor report for the configured orderk index and embedding profile.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "smoke_query": {"type": "string", "description": "Optional query that must return at least one result"}
+                }
+            }
+        }),
+    ]
+}
+
 fn write_report(dir: &Path, stem: &str, value: &serde_json::Value) -> Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -471,7 +870,21 @@ fn take_required_string(args: &mut Vec<String>, name: &str) -> Result<String> {
 
 fn take_usize(args: &mut Vec<String>, name: &str, default: usize) -> Result<usize> {
     let raw = take_string(args, name, default.to_string())?;
-    raw.parse().map_err(|_| anyhow!("{} must be a positive integer", name))
+    raw.parse()
+        .map_err(|_| anyhow!("{} must be a positive integer", name))
+}
+
+fn take_optional_f32(args: &mut Vec<String>, name: &str) -> Result<Option<f32>> {
+    let Some(raw) = take_optional_string(args, name)? else {
+        return Ok(None);
+    };
+    let value: f32 = raw
+        .parse()
+        .map_err(|_| anyhow!("{} must be a finite number", name))?;
+    if !value.is_finite() {
+        return Err(anyhow!("{} must be a finite number", name));
+    }
+    Ok(Some(value))
 }
 
 fn take_path(args: &mut Vec<String>, name: &str) -> Result<PathBuf> {
@@ -493,8 +906,12 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 }
 
 fn print_usage() {
-    eprintln!("orderk <init|index|search|status|health|doctor|eval|maintain|feedback> [--flags]");
-    eprintln!("search flags include: --query <text> [--filter \"tag == 'rust' && has_code == true\"]");
+    eprintln!(
+        "orderk <init|index|search|status|health|doctor|eval|maintain|mcp|feedback> [--flags]"
+    );
+    eprintln!(
+        "search flags include: --query <text> [--filter \"tag == 'rust' && has_code == true\"] [--min-score <n>] [--context-chunks <n>] [--include-links]"
+    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -552,4 +969,37 @@ struct EvalResponse {
     embedding_dim: usize,
     vector_backend: String,
     outcomes: Vec<EvalCaseResult>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_tool_surface_is_read_only() {
+        let names = mcp_tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("name")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["search", "status", "health"]);
+        assert!(!names
+            .iter()
+            .any(|name| matches!(name.as_str(), "index" | "maintain" | "feedback")));
+    }
+
+    #[test]
+    fn mcp_framing_roundtrips_content_length_messages() {
+        let message = json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}});
+        let mut out = Vec::new();
+        write_mcp_frame(&mut out, &message).unwrap();
+        assert!(out.starts_with(b"Content-Length: "));
+        let mut reader = BufReader::new(out.as_slice());
+        assert!(detect_framed_mcp(&mut reader).unwrap());
+        let parsed = read_mcp_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(parsed, message);
+    }
 }

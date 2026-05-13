@@ -1,4 +1,3 @@
-
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -16,7 +15,8 @@ pub trait EmbeddingProvider: Send + Sync {
 
     fn embed_query(&self, input: &str) -> Result<Vec<f32>> {
         let mut out = self.embed_documents(&[input.to_string()])?;
-        out.pop().ok_or_else(|| anyhow!("embedding provider returned no query vector"))
+        out.pop()
+            .ok_or_else(|| anyhow!("embedding provider returned no query vector"))
     }
 }
 
@@ -28,7 +28,10 @@ pub struct MockEmbeddingProvider {
 
 impl MockEmbeddingProvider {
     pub fn new(dim: usize) -> Self {
-        Self { dim, model: format!("mock-{}", dim) }
+        Self {
+            dim,
+            model: format!("mock-{}", dim),
+        }
     }
 
     fn embed_one(&self, text: &str) -> Vec<f32> {
@@ -48,10 +51,18 @@ impl MockEmbeddingProvider {
 }
 
 impl EmbeddingProvider for MockEmbeddingProvider {
-    fn provider_id(&self) -> &str { "mock" }
-    fn model_id(&self) -> &str { &self.model }
-    fn dimension(&self) -> usize { self.dim }
-    fn health(&self) -> Result<()> { Ok(()) }
+    fn provider_id(&self) -> &str {
+        "mock"
+    }
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+    fn health(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn embed_documents(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         Ok(inputs.iter().map(|s| self.embed_one(s)).collect())
@@ -82,12 +93,18 @@ struct SiliconFlowEmbeddingRow {
 }
 
 impl SiliconFlowM3Provider {
-    pub fn new(api_key: String, model: Option<String>, dim: usize, base_url: Option<String>) -> Self {
+    pub fn new(
+        api_key: String,
+        model: Option<String>,
+        dim: usize,
+        base_url: Option<String>,
+    ) -> Self {
         Self {
             api_key,
             model: model.unwrap_or_else(|| "BAAI/bge-m3".to_string()),
             dim,
-            base_url: base_url.unwrap_or_else(|| "https://api.siliconflow.cn/v1/embeddings".to_string()),
+            base_url: base_url
+                .unwrap_or_else(|| "https://api.siliconflow.cn/v1/embeddings".to_string()),
         }
     }
 
@@ -108,9 +125,12 @@ impl SiliconFlowM3Provider {
                 .send_string(&body)
             {
                 Ok(response) => {
-                    let response_body = response.into_string().context("read SiliconFlow embedding response")?;
-                    let parsed: SiliconFlowEmbeddingsResponse = serde_json::from_str(&response_body)
-                        .context("parse SiliconFlow embedding response")?;
+                    let response_body = response
+                        .into_string()
+                        .context("read SiliconFlow embedding response")?;
+                    let parsed: SiliconFlowEmbeddingsResponse =
+                        serde_json::from_str(&response_body)
+                            .context("parse SiliconFlow embedding response")?;
                     let mut rows = Vec::with_capacity(parsed.data.len());
                     for row in parsed.data {
                         if row.embedding.len() != self.dim {
@@ -150,7 +170,11 @@ impl SiliconFlowM3Provider {
                         thread::sleep(Duration::from_millis(retry_backoff_ms(attempt)));
                         continue;
                     }
-                    return Err(anyhow!("SiliconFlow embedding request failed after {} attempts: {}", SILICONFLOW_MAX_ATTEMPTS, message));
+                    return Err(anyhow!(
+                        "SiliconFlow embedding request failed after {} attempts: {}",
+                        SILICONFLOW_MAX_ATTEMPTS,
+                        message
+                    ));
                 }
             }
         }
@@ -158,15 +182,25 @@ impl SiliconFlowM3Provider {
         Err(anyhow!(
             "SiliconFlow embedding request failed after {} attempts: {}",
             SILICONFLOW_MAX_ATTEMPTS,
-            if last_error.is_empty() { "unknown error" } else { &last_error }
+            if last_error.is_empty() {
+                "unknown error"
+            } else {
+                &last_error
+            }
         ))
     }
 }
 
 impl EmbeddingProvider for SiliconFlowM3Provider {
-    fn provider_id(&self) -> &str { "siliconflow" }
-    fn model_id(&self) -> &str { &self.model }
-    fn dimension(&self) -> usize { self.dim }
+    fn provider_id(&self) -> &str {
+        "siliconflow"
+    }
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+    fn dimension(&self) -> usize {
+        self.dim
+    }
     fn health(&self) -> Result<()> {
         if self.api_key.trim().is_empty() {
             return Err(anyhow!("SiliconFlow API key is missing; set HERMES_SILICONFLOW_API_KEY or SILICONFLOW_API_KEY"));
@@ -207,13 +241,21 @@ fn retry_backoff_ms(attempt: usize) -> u64 {
 fn summarize_error_body(body: &str) -> String {
     let trimmed = body.trim();
     let preview: String = trimmed.chars().take(300).collect();
-    if preview.is_empty() { "<empty body>".to_string() } else if preview.len() < trimmed.len() { format!("{}…", preview) } else { preview }
+    if preview.is_empty() {
+        "<empty body>".to_string()
+    } else if preview.len() < trimmed.len() {
+        format!("{}…", preview)
+    } else {
+        preview
+    }
 }
 
 pub fn normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
-        for x in v.iter_mut() { *x /= norm; }
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
     }
 }
 
@@ -250,7 +292,9 @@ mod tests {
             let n = stream.read(&mut buf).unwrap();
             let request = String::from_utf8_lossy(&buf[..n]);
             assert!(request.contains("POST /v1/embeddings HTTP/1.1"));
-            assert!(request.to_lowercase().contains("authorization: bearer test-key"));
+            assert!(request
+                .to_lowercase()
+                .contains("authorization: bearer test-key"));
             assert!(request.contains("application/json"));
 
             let response = r#"{"data":[{"embedding":[3.0,0.0,4.0]}]}"#;
@@ -269,7 +313,9 @@ mod tests {
             3,
             Some(format!("http://{}/v1/embeddings", addr)),
         );
-        let vectors = provider.embed_documents(&["hello world".to_string()]).unwrap();
+        let vectors = provider
+            .embed_documents(&["hello world".to_string()])
+            .unwrap();
         assert_eq!(vectors.len(), 1);
         assert!((vectors[0][0] - 0.6).abs() < 1e-6, "{:?}", vectors[0]);
         assert!((vectors[0][2] - 0.8).abs() < 1e-6, "{:?}", vectors[0]);

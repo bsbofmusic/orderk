@@ -122,13 +122,47 @@ orderk search \
   --vector-backend sqlite_vec
 ```
 
-### 5) Inspect status
+Agent-facing evidence controls borrowed from the Supermemory audit:
+
+```bash
+orderk search \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --query "vector search for knowledge notes" \
+  --limit 10 \
+  --min-score 0.2 \
+  --context-chunks 1 \
+  --include-links \
+  --embedding-provider siliconflow \
+  --embedding-model BAAI/bge-m3 \
+  --embedding-dim 1024 \
+  --vector-backend sqlite_vec
+```
+
+- `--min-score` / `--threshold`: drop low fused-score tails after candidate ranking.
+- `--context-chunks N`: include before/after same-file chunk evidence.
+- `--include-links`: include Obsidian wikilink/backlink evidence from indexed vault text.
+- `--filter "tag == 'rust' && has_code == true"`: optional metadata filter DSL.
+
+### 5) MCP read-only server
+
+```bash
+orderk mcp \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --embedding-provider siliconflow \
+  --embedding-model BAAI/bge-m3 \
+  --embedding-dim 1024 \
+  --vector-backend sqlite_vec
+```
+
+The MCP surface is intentionally thin and read-only: `search`, `status`, and `health`. It supports standard `Content-Length` stdio frames and a JSONL compatibility mode for simple smoke tests. It does not expose index, feedback, maintain, save, forget, note-write, or chat tools.
+
+### 6) Inspect status
 
 ```bash
 orderk status --db /path/to/vault/.obsidian/orderk/orderk.sqlite
 ```
 
-### 6) Run health / doctor
+### 7) Run health / doctor
 
 ```bash
 orderk health \
@@ -150,7 +184,7 @@ orderk doctor \
 
 Optional `--smoke-query` turns `doctor` into a retrieval smoke probe; without it, `doctor` behaves like `health`.
 
-### 7) Run maintain
+### 8) Run maintain
 
 ```bash
 orderk maintain \
@@ -168,13 +202,13 @@ orderk maintain \
 
 `maintain` emits `orderk.maintain.v1` JSON: nested health evidence, optional eval evidence, typed error codes, and a persisted report path when `--report-dir` is provided.
 
-### 8) Run eval
+### 9) Run eval
 
 ```bash
 python3 scripts/eval.py
 ```
 
-The eval report includes `recall_at_k`, `ndcg_at_k`, `mrr`, and per-case matched ranks.
+The eval script is a deterministic offline quality gate. It indexes the checked-in fixture vault at `fixtures/eval/vault`, runs `fixtures/eval/queries.json`, and compares the report against `baselines/orderk-eval-baseline.json`. The gate fails on missing fixtures, zero-hit cases, top-1 regressions, or metric regressions in `recall_at_k`, `ndcg_at_k`, `mrr`, and mean latency. Advanced/dev-only overrides are available through `ORDERK_EVAL_VAULT`, `ORDERK_EVAL_QUERIES`, and `ORDERK_EVAL_BASELINE`; release runs should use the checked-in defaults.
 
 The CLI prints JSON by default.
 
@@ -187,8 +221,10 @@ This is the shortest path for an agent or automation:
 3. Use `siliconflow` as the embedding provider.
 4. Set `BAAI/bge-m3` + `1024` unless you have a strong reason to change them.
 5. Use `sqlite_vec` as the vector backend.
-6. Consume the JSON output directly. Search responses include `route`, `routing`, per-result `score_breakdown`, `evidence`, and `tags`.
-7. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
+6. Consume the JSON output directly. Search responses include `route`, `routing`, per-result `score_breakdown`, `evidence`, `tags`, optional neighbor `context_chunks`, and optional Obsidian link evidence.
+7. Use `--min-score`/`--threshold`, `--context-chunks`, and `--include-links` when an agent needs thicker evidence rather than more low-quality tails.
+8. If the client supports MCP, use `orderk mcp` for read-only `search`/`status`/`health` tools instead of asking the agent to guess shell flags.
+9. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
 
 ### Obsidian plugin settings
 
@@ -206,6 +242,9 @@ Required settings:
 ## Verification
 
 ```bash
+python3 -m unittest scripts/test_release_gate.py scripts/test_eval_gate.py scripts/test_feedback_to_eval.py
+cargo fmt --all -- --check
+cargo clippy --workspace --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo build --workspace --all-features --release
 python3 scripts/contract.py
@@ -219,7 +258,7 @@ npm test --workspaces --if-present
 npm pack --workspaces --dry-run
 ```
 
-If `rustfmt` and `clippy` are installed in your environment, run them too. They are part of the CI contract.
+`python3 scripts/release_gate.py` is the canonical pre-publish gate. It also checks version consistency, secret/package cleanliness, release/eval/feedback-growth gate unit tests, the resource baseline in `baselines/orderk-resource-baseline.json`, and the eval quality baseline in `baselines/orderk-eval-baseline.json`.
 
 ## Troubleshooting
 

@@ -55,7 +55,9 @@ pub fn parse_filter(raw: &str) -> Result<FilterExpr> {
         return Err(anyhow!("invalid filter: expression is too long"));
     }
     if raw.contains("||") || raw.contains('(') || raw.contains(')') {
-        return Err(anyhow!("invalid filter: only flat && expressions are supported"));
+        return Err(anyhow!(
+            "invalid filter: only flat && expressions are supported"
+        ));
     }
 
     let parts = split_conjunctions(raw)?;
@@ -97,10 +99,13 @@ impl FilterExpr {
 fn condition_to_sql(condition: &FilterCondition, alias: &str) -> Result<FilterSql> {
     match condition.field {
         FilterField::Tag => compile_tag_condition(condition),
-        FilterField::HasCode | FilterField::HasLink | FilterField::HasTaskList | FilterField::HasIncompleteTasks => {
-            compile_bool_condition(condition, alias)
+        FilterField::HasCode
+        | FilterField::HasLink
+        | FilterField::HasTaskList
+        | FilterField::HasIncompleteTasks => compile_bool_condition(condition, alias),
+        FilterField::Path | FilterField::Title | FilterField::Heading => {
+            compile_string_condition(condition, alias)
         }
-        FilterField::Path | FilterField::Title | FilterField::Heading => compile_string_condition(condition, alias),
     }
 }
 
@@ -117,15 +122,22 @@ fn compile_tag_condition(condition: &FilterCondition) -> Result<FilterSql> {
         FilterOp::Ne => format!("NOT {exists}"),
         FilterOp::Contains => unreachable!(),
     };
-    Ok(FilterSql { sql, args: vec![Value::Text(value.clone())] })
+    Ok(FilterSql {
+        sql,
+        args: vec![Value::Text(value.clone())],
+    })
 }
 
 fn compile_bool_condition(condition: &FilterCondition, alias: &str) -> Result<FilterSql> {
     if condition.op == FilterOp::Contains {
-        return Err(anyhow!("invalid filter: boolean fields do not support contains"));
+        return Err(anyhow!(
+            "invalid filter: boolean fields do not support contains"
+        ));
     }
     let FilterValue::Bool(value) = &condition.value else {
-        return Err(anyhow!("invalid filter: boolean field expects true or false"));
+        return Err(anyhow!(
+            "invalid filter: boolean field expects true or false"
+        ));
     };
     let value = *value;
     let column = bool_column(condition.field, alias)?;
@@ -142,7 +154,9 @@ fn compile_bool_condition(condition: &FilterCondition, alias: &str) -> Result<Fi
 
 fn compile_string_condition(condition: &FilterCondition, alias: &str) -> Result<FilterSql> {
     let FilterValue::String(value) = &condition.value else {
-        return Err(anyhow!("invalid filter: string field expects a quoted string value"));
+        return Err(anyhow!(
+            "invalid filter: string field expects a quoted string value"
+        ));
     };
     let column = string_column(condition.field, alias)?;
     let sql = match condition.op {
@@ -150,7 +164,10 @@ fn compile_string_condition(condition: &FilterCondition, alias: &str) -> Result<
         FilterOp::Ne => format!("coalesce({column}, '') != ?"),
         FilterOp::Contains => format!("instr(lower(coalesce({column}, '')), lower(?)) > 0"),
     };
-    Ok(FilterSql { sql, args: vec![Value::Text(value.clone())] })
+    Ok(FilterSql {
+        sql,
+        args: vec![Value::Text(value.clone())],
+    })
 }
 
 fn string_column(field: FilterField, alias: &str) -> Result<String> {
@@ -190,19 +207,31 @@ fn parse_condition(raw: &str) -> Result<FilterCondition> {
         let field = parse_field(left.trim())?;
         let value = FilterValue::String(parse_quoted_string(right.trim())?);
         validate_operator_value(field, FilterOp::Contains, &value)?;
-        return Ok(FilterCondition { field, op: FilterOp::Contains, value });
+        return Ok(FilterCondition {
+            field,
+            op: FilterOp::Contains,
+            value,
+        });
     }
     if let Some((left, right)) = split_once_operator(raw, "==")? {
         let field = parse_field(left.trim())?;
         let value = parse_value(right.trim())?;
         validate_operator_value(field, FilterOp::Eq, &value)?;
-        return Ok(FilterCondition { field, op: FilterOp::Eq, value });
+        return Ok(FilterCondition {
+            field,
+            op: FilterOp::Eq,
+            value,
+        });
     }
     if let Some((left, right)) = split_once_operator(raw, "!=")? {
         let field = parse_field(left.trim())?;
         let value = parse_value(right.trim())?;
         validate_operator_value(field, FilterOp::Ne, &value)?;
-        return Ok(FilterCondition { field, op: FilterOp::Ne, value });
+        return Ok(FilterCondition {
+            field,
+            op: FilterOp::Ne,
+            value,
+        });
     }
     Err(anyhow!("invalid filter: unsupported operator"))
 }
@@ -213,7 +242,9 @@ fn validate_operator_value(field: FilterField, op: FilterOp, value: &FilterValue
             if matches!(value, FilterValue::String(_)) {
                 Ok(())
             } else {
-                Err(anyhow!("invalid filter: string field expects a quoted string value"))
+                Err(anyhow!(
+                    "invalid filter: string field expects a quoted string value"
+                ))
             }
         }
         FilterField::Tag => {
@@ -226,14 +257,21 @@ fn validate_operator_value(field: FilterField, op: FilterOp, value: &FilterValue
                 Err(anyhow!("invalid filter: tag expects a quoted string value"))
             }
         }
-        FilterField::HasCode | FilterField::HasLink | FilterField::HasTaskList | FilterField::HasIncompleteTasks => {
+        FilterField::HasCode
+        | FilterField::HasLink
+        | FilterField::HasTaskList
+        | FilterField::HasIncompleteTasks => {
             if op == FilterOp::Contains {
-                return Err(anyhow!("invalid filter: boolean fields do not support contains"));
+                return Err(anyhow!(
+                    "invalid filter: boolean fields do not support contains"
+                ));
             }
             if matches!(value, FilterValue::Bool(_)) {
                 Ok(())
             } else {
-                Err(anyhow!("invalid filter: boolean field expects true or false"))
+                Err(anyhow!(
+                    "invalid filter: boolean field expects true or false"
+                ))
             }
         }
     }
@@ -263,7 +301,9 @@ fn parse_value(raw: &str) -> Result<FilterValue> {
 
 fn parse_quoted_string(raw: &str) -> Result<String> {
     let mut chars = raw.chars();
-    let quote = chars.next().ok_or_else(|| anyhow!("invalid filter: missing value"))?;
+    let quote = chars
+        .next()
+        .ok_or_else(|| anyhow!("invalid filter: missing value"))?;
     if quote != '\'' && quote != '"' {
         return Err(anyhow!("invalid filter: string values must be quoted"));
     }
@@ -288,7 +328,9 @@ fn parse_quoted_string(raw: &str) -> Result<String> {
     }
     let consumed_len = raw[..raw.len()].find_closing_quote_len(quote)?;
     if !raw[consumed_len..].trim().is_empty() {
-        return Err(anyhow!("invalid filter: trailing characters after string value"));
+        return Err(anyhow!(
+            "invalid filter: trailing characters after string value"
+        ));
     }
     Ok(out)
 }
@@ -389,7 +431,8 @@ mod tests {
 
     #[test]
     fn parses_flat_conjunction() {
-        let expr = parse_filter("tag == 'rust' && has_code == true && path contains \"brain/\"").unwrap();
+        let expr =
+            parse_filter("tag == 'rust' && has_code == true && path contains \"brain/\"").unwrap();
         assert_eq!(expr.conditions.len(), 3);
         assert_eq!(expr.conditions[0].field, FilterField::Tag);
         assert_eq!(expr.conditions[1].value, FilterValue::Bool(true));
@@ -409,19 +452,34 @@ mod tests {
 
     #[test]
     fn parses_escaped_quotes_in_string_values() {
-        let expr = parse_filter("path contains 'Bob\\'s notes' && title == \"A \\\"quoted\\\" title\"").unwrap();
-        assert_eq!(expr.conditions[0].value, FilterValue::String("Bob's notes".to_string()));
-        assert_eq!(expr.conditions[1].value, FilterValue::String("A \"quoted\" title".to_string()));
+        let expr =
+            parse_filter("path contains 'Bob\\'s notes' && title == \"A \\\"quoted\\\" title\"")
+                .unwrap();
+        assert_eq!(
+            expr.conditions[0].value,
+            FilterValue::String("Bob's notes".to_string())
+        );
+        assert_eq!(
+            expr.conditions[1].value,
+            FilterValue::String("A \"quoted\" title".to_string())
+        );
     }
 
     #[test]
     fn compiles_parameterized_sql() {
-        let sql = compile_filter(Some("tag == 'rust' && has_code == true && path contains 'brain/'"), "c")
-            .unwrap()
-            .unwrap();
+        let sql = compile_filter(
+            Some("tag == 'rust' && has_code == true && path contains 'brain/'"),
+            "c",
+        )
+        .unwrap()
+        .unwrap();
         assert!(sql.sql.contains("json_each(c.tags_json)"), "{}", sql.sql);
         assert!(sql.sql.contains("c.has_code = ?"), "{}", sql.sql);
-        assert!(sql.sql.contains("instr(lower(coalesce(c.file_path"), "{}", sql.sql);
+        assert!(
+            sql.sql.contains("instr(lower(coalesce(c.file_path"),
+            "{}",
+            sql.sql
+        );
         assert_eq!(sql.args.len(), 3);
     }
 
@@ -431,6 +489,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!sql.sql.contains("DROP TABLE"));
-        assert_eq!(sql.args, vec![Value::Text("'; DROP TABLE chunks; --".to_string())]);
+        assert_eq!(
+            sql.args,
+            vec![Value::Text("'; DROP TABLE chunks; --".to_string())]
+        );
     }
 }

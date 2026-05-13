@@ -1,0 +1,10 @@
+{
+  "schema_version": "orderk.resource_baseline.v1",
+  "captured_for": "orderk v0.1.5 productization gate",
+  "binary_max_bytes": 31457280,
+  "daemon_count_max": 0,
+  "notes": {
+    "binary_max_bytes": "30 MiB ceiling for the release binary in target/release/orderk; v0.1.5 local unstripped binary was about 23 MiB and GitHub release asset about 8.1 MiB.",
+    "daemon_count_max": "orderk is a one-shot headless CLI; normal runtime should not leave resident orderk processes."
+  }
+}

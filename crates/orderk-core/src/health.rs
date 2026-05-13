@@ -1,7 +1,7 @@
 use crate::embedding::EmbeddingProvider;
 use crate::index::{register_sqlite_vec, IndexStore};
 use crate::models::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 use std::path::Path;
 
@@ -17,15 +17,30 @@ pub fn classify_error_message(message: &str) -> ErrorCode {
         ErrorCode::EEmbeddingDimensionMismatch
     } else if lower.contains("count mismatch") {
         ErrorCode::EEmbeddingCountMismatch
-    } else if lower.contains("siliconflow") || lower.contains("api key") || lower.contains("embedding request failed") {
+    } else if lower.contains("siliconflow")
+        || lower.contains("api key")
+        || lower.contains("embedding request failed")
+    {
         ErrorCode::EProviderDown
-    } else if lower.contains("sqlite-vec") || lower.contains("sqlite_vec") || lower.contains("vec_chunks") {
+    } else if lower.contains("sqlite-vec")
+        || lower.contains("sqlite_vec")
+        || lower.contains("vec_chunks")
+    {
         ErrorCode::EVectorBackendMissing
-    } else if lower.contains("vault") && (lower.contains("read") || lower.contains("unreadable") || lower.contains("missing")) {
+    } else if lower.contains("vault")
+        && (lower.contains("read") || lower.contains("unreadable") || lower.contains("missing"))
+    {
         ErrorCode::EVaultUnreadable
-    } else if lower.contains("unknown command") || lower.contains("unknown flag") || lower.contains("invalid") || lower.contains("required") {
+    } else if lower.contains("unknown command")
+        || lower.contains("unknown flag")
+        || lower.contains("invalid")
+        || lower.contains("required")
+    {
         ErrorCode::EInvalidArgument
-    } else if lower.contains("database disk image") || lower.contains("malformed") || lower.contains("corrupt") {
+    } else if lower.contains("database disk image")
+        || lower.contains("malformed")
+        || lower.contains("corrupt")
+    {
         ErrorCode::EDbCorrupt
     } else if lower.contains("no such table") || lower.contains("schema") {
         ErrorCode::ESchemaMissing
@@ -80,7 +95,7 @@ pub fn health_report(
     }
 
     register_sqlite_vec();
-    let conn = match Connection::open(db_path) {
+    let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => conn,
         Err(err) => {
             checks.push(HealthCheck::fail(
@@ -127,7 +142,10 @@ pub fn health_report(
             "embedding_provider",
             classify_error_message(&err),
             format!("embedding provider `{expected_provider}` is not available: {err}"),
-            Some("set the provider credentials/profile explicitly; mock is only for tests".to_string()),
+            Some(
+                "set the provider credentials/profile explicitly; mock is only for tests"
+                    .to_string(),
+            ),
             json!({"expected_provider": expected_provider}),
         ));
     } else if let Some(provider) = provider {
@@ -167,8 +185,14 @@ pub fn health_report(
                 checks.push(HealthCheck::fail(
                     "embedding_dim",
                     ErrorCode::EProfileMismatch,
-                    format!("embedding dimension mismatch: existing {}, expected {}", status_ref.embedding_dim, embedding_dim),
-                    Some("search/index with the same embedding dimension or rebuild the DB".to_string()),
+                    format!(
+                        "embedding dimension mismatch: existing {}, expected {}",
+                        status_ref.embedding_dim, embedding_dim
+                    ),
+                    Some(
+                        "search/index with the same embedding dimension or rebuild the DB"
+                            .to_string(),
+                    ),
                     json!({"existing": status_ref.embedding_dim, "expected": embedding_dim}),
                 ));
             }
@@ -182,18 +206,21 @@ pub fn health_report(
         }
     }
 
-    if let (Some(provider), Some(query)) = (provider, smoke_query.filter(|q| !q.trim().is_empty())) {
+    if let (Some(provider), Some(query)) = (provider, smoke_query.filter(|q| !q.trim().is_empty()))
+    {
         let blocking_errors = collect_error_codes(&checks);
         let can_search = status.as_ref().map(|s| s.embeddings > 0).unwrap_or(false)
-            && !blocking_errors.iter().any(|code| matches!(
-                code,
-                &ErrorCode::EProfileMismatch
-                    | &ErrorCode::EProviderDown
-                    | &ErrorCode::EVectorBackendMissing
-                    | &ErrorCode::EDbOpenFailed
-                    | &ErrorCode::EDbCorrupt
-                    | &ErrorCode::ESchemaMissing
-            ));
+            && !blocking_errors.iter().any(|code| {
+                matches!(
+                    code,
+                    &ErrorCode::EProfileMismatch
+                        | &ErrorCode::EProviderDown
+                        | &ErrorCode::EVectorBackendMissing
+                        | &ErrorCode::EDbOpenFailed
+                        | &ErrorCode::EDbCorrupt
+                        | &ErrorCode::ESchemaMissing
+                )
+            });
         if can_search {
             match IndexStore::query(&conn, query, 1, provider, vector_backend) {
                 Ok(resp) if !resp.results.is_empty() => checks.push(HealthCheck::ok(
@@ -222,7 +249,13 @@ pub fn health_report(
     finish_report(db_path, vault_path, checks, status.take())
 }
 
-fn profile_check(checks: &mut Vec<HealthCheck>, component: &str, existing: &str, expected: &str, label: &str) {
+fn profile_check(
+    checks: &mut Vec<HealthCheck>,
+    component: &str,
+    existing: &str,
+    expected: &str,
+    label: &str,
+) {
     if existing != expected {
         checks.push(HealthCheck::fail(
             component,
@@ -275,8 +308,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db(name: &str) -> std::path::PathBuf {
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("orderk-{name}-{}-{unique}.sqlite", std::process::id()))
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "orderk-{name}-{}-{unique}.sqlite",
+            std::process::id()
+        ))
     }
 
     #[test]

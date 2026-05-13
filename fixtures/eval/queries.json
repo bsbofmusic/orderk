@@ -1,0 +1,25 @@
+{
+  "schema_version": "orderk.eval_queries.v1",
+  "queries": [
+    {
+      "id": "alpha",
+      "query": "alpha retrieval blade sqlite vec semantic search",
+      "expected_paths": ["projects/alpha.md"]
+    },
+    {
+      "id": "bravo",
+      "query": "bravo obsidian plugin packaging npm workspace",
+      "expected_paths": ["projects/bravo.md"]
+    },
+    {
+      "id": "quality-gates",
+      "query": "retrieval quality eval gates maintenance reports recall ndcg mrr",
+      "expected_paths": ["quality/eval-gates.md"]
+    },
+    {
+      "id": "release-resources",
+      "query": "release gate resource baseline binary size daemon count",
+      "expected_paths": ["ops/release-gate.md"]
+    }
+  ]
+}

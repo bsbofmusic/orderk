@@ -10,15 +10,32 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
+import tomllib
+from collections.abc import Iterable
+from typing import Any
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 TARGET_ORDERK = REPO / "target" / "release" / ("orderk.exe" if os.name == "nt" else "orderk")
 GENERATED_VENDOR_ORDERK = REPO / "packages" / "cli" / "vendor" / ("orderk.exe" if os.name == "nt" else "orderk")
+RESOURCE_BASELINE = REPO / "baselines" / "orderk-resource-baseline.json"
 
 COMMANDS = [
+    [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts/test_release_gate.py",
+        "scripts/test_eval_gate.py",
+        "scripts/test_feedback_to_eval.py",
+    ],
+    ["cargo", "test", "-p", "orderk-core", "--all-features", "query_options_"],
+    ["cargo", "test", "-p", "orderk-cli", "--all-features", "mcp_"],
+    ["cargo", "fmt", "--all", "--", "--check"],
+    ["cargo", "clippy", "--workspace", "--all-features", "--", "-D", "warnings"],
     ["cargo", "test", "--workspace", "--all-features"],
     ["cargo", "build", "--workspace", "--all-features", "--release"],
     ["python3", "scripts/contract.py"],
@@ -30,6 +47,43 @@ COMMANDS = [
     ["npm", "test", "--workspaces", "--if-present"],
     ["npm", "pack", "--workspaces", "--dry-run"],
 ]
+
+SECRET_PATTERNS = [
+    ("private_key", re.compile(r"BEGIN (?:RSA|OPENSSH|EC|DSA) PRIVATE KEY")),
+    ("token_shape", re.compile(r"(?:sk|ghp|github_pat|xox[baprs]?)-[A-Za-z0-9_\-]{20,}")),
+    (
+        "secret_assignment",
+        re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*['\"][^'\"]{12,}['\"]"),
+    ),
+]
+SECRET_SCAN_EXCLUDES = {
+    "Cargo.lock",
+    "package-lock.json",
+}
+DANGEROUS_PACKAGE_SUFFIXES = (
+    ".sqlite",
+    ".sqlite-shm",
+    ".sqlite-wal",
+    ".log",
+    ".pyc",
+)
+DANGEROUS_PACKAGE_PREFIXES = (
+    "target/",
+    "node_modules/",
+    "packages/cli/vendor/",
+)
+DANGEROUS_PACKAGE_PARTS = {"__pycache__"}
+
+
+def make_result(name: str, ok: bool, started: float, stdout: str = "", stderr: str = "") -> dict[str, object]:
+    return {
+        "cmd": ["internal", name],
+        "ok": ok,
+        "exit_code": 0 if ok else 1,
+        "took_ms": int((time.time() - started) * 1000),
+        "stdout_tail": stdout[-4000:],
+        "stderr_tail": stderr[-4000:],
+    }
 
 
 def run(cmd: list[str]) -> dict[str, object]:
@@ -50,16 +104,196 @@ def run(cmd: list[str]) -> dict[str, object]:
     }
 
 
+def list_repo_files(repo: pathlib.Path) -> list[pathlib.Path]:
+    if (repo / ".git").exists():
+        proc = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return [pathlib.Path(line) for line in proc.stdout.splitlines() if line.strip()]
+    return [path.relative_to(repo) for path in repo.rglob("*") if path.is_file() and ".git" not in path.parts]
+
+
+def read_json(path: pathlib.Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_cargo_workspace_version(repo: pathlib.Path) -> str:
+    data = tomllib.loads((repo / "Cargo.toml").read_text(encoding="utf-8"))
+    return str(data["workspace"]["package"]["version"])
+
+
+def check_version_consistency(repo: pathlib.Path = REPO) -> dict[str, object]:
+    started = time.time()
+    try:
+        versions = {
+            "Cargo.toml workspace.package.version": read_cargo_workspace_version(repo),
+            "package.json": str(read_json(repo / "package.json")["version"]),
+            "packages/cli/package.json": str(read_json(repo / "packages" / "cli" / "package.json")["version"]),
+            "packages/obsidian/package.json": str(read_json(repo / "packages" / "obsidian" / "package.json")["version"]),
+            "packages/obsidian/manifest.json": str(read_json(repo / "packages" / "obsidian" / "manifest.json")["version"]),
+        }
+        expected = versions["Cargo.toml workspace.package.version"]
+        mismatches = {path: version for path, version in versions.items() if version != expected}
+        versions_json = read_json(repo / "packages" / "obsidian" / "versions.json")
+        if expected not in versions_json:
+            mismatches["packages/obsidian/versions.json"] = f"missing {expected}"
+        ok = not mismatches
+        stdout = json.dumps({"expected": expected, "versions": versions}, indent=2, sort_keys=True)
+        stderr = "" if ok else "version mismatch: " + json.dumps(mismatches, indent=2, sort_keys=True)
+        return make_result("version_consistency", ok, started, stdout, stderr)
+    except Exception as err:  # noqa: BLE001 - release gate should return structured failure evidence.
+        return make_result("version_consistency", False, started, stderr=f"version consistency check failed: {err}")
+
+
+def check_secret_scan(repo: pathlib.Path = REPO, files: Iterable[pathlib.Path] | None = None) -> dict[str, object]:
+    started = time.time()
+    findings: list[str] = []
+    scan_files = list(files) if files is not None else list_repo_files(repo)
+    for rel in scan_files:
+        rel = pathlib.Path(rel)
+        rel_text = rel.as_posix()
+        if rel.name in SECRET_SCAN_EXCLUDES or rel_text.startswith(("target/", "node_modules/", ".git/")):
+            continue
+        path = repo / rel
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as err:
+            findings.append(f"{rel_text}:0:read_error:{err}")
+            continue
+        if b"\0" in data or len(data) > 2_000_000:
+            continue
+        text = data.decode("utf-8", errors="ignore")
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            for name, pattern in SECRET_PATTERNS:
+                if pattern.search(line):
+                    findings.append(f"{rel_text}:{line_no}:{name}")
+    return make_result("secret_scan", not findings, started, "\n".join(findings), "" if not findings else "possible secrets found")
+
+
+def check_package_cleanliness(repo: pathlib.Path = REPO, files: Iterable[pathlib.Path] | None = None) -> dict[str, object]:
+    started = time.time()
+    scan_files = list(files) if files is not None else list_repo_files(repo)
+    dangerous: list[str] = []
+    for rel in scan_files:
+        rel_path = pathlib.Path(rel)
+        rel_text = rel_path.as_posix()
+        if (
+            rel_text.startswith(DANGEROUS_PACKAGE_PREFIXES)
+            or rel_text.endswith(DANGEROUS_PACKAGE_SUFFIXES)
+            or any(part in DANGEROUS_PACKAGE_PARTS for part in rel_path.parts)
+        ):
+            dangerous.append(rel_text)
+        if rel_text == ".env" or rel_text.endswith("/.env"):
+            dangerous.append(rel_text)
+    if files is None:
+        for rel_text in (".env", f"packages/cli/vendor/{TARGET_ORDERK.name}"):
+            if (repo / rel_text).exists():
+                dangerous.append(rel_text)
+        for pattern in ("*.sqlite", "*.sqlite-shm", "*.sqlite-wal", "*.log"):
+            for path in repo.rglob(pattern):
+                rel_text = path.relative_to(repo).as_posix()
+                if not rel_text.startswith((".git/", "target/", "node_modules/")):
+                    dangerous.append(rel_text)
+    return make_result(
+        "package_cleanliness",
+        not dangerous,
+        started,
+        "\n".join(sorted(set(dangerous))),
+        "" if not dangerous else "runtime/build/private artifacts are present in package scope",
+    )
+
+
+def load_resource_baseline(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    return read_json(repo / RESOURCE_BASELINE.relative_to(REPO))
+
+
+def count_orderk_processes() -> int:
+    proc_root = pathlib.Path("/proc")
+    if not proc_root.exists():
+        return 0
+    count = 0
+    current_pid = os.getpid()
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == current_pid:
+            continue
+        try:
+            comm = (entry / "comm").read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            continue
+        if comm == "orderk":
+            count += 1
+    return count
+
+
+def check_resource_baseline(
+    repo: pathlib.Path = REPO,
+    baseline: dict[str, Any] | None = None,
+    binary: pathlib.Path = TARGET_ORDERK,
+    run_runtime_checks: bool = True,
+) -> dict[str, object]:
+    started = time.time()
+    try:
+        baseline = baseline or load_resource_baseline(repo)
+        details: dict[str, Any] = {
+            "schema_version": "orderk.resource_gate.v1",
+            "binary": str(binary),
+        }
+        failures: list[str] = []
+        if not binary.exists():
+            failures.append(f"release binary missing: {binary}")
+        else:
+            size = binary.stat().st_size
+            details["binary_size_bytes"] = size
+            max_size = int(baseline.get("binary_max_bytes", 0))
+            details["binary_max_bytes"] = max_size
+            if max_size and size > max_size:
+                failures.append(f"binary_size_bytes {size} > binary_max_bytes {max_size}")
+        if run_runtime_checks:
+            daemon_count = count_orderk_processes()
+            details["daemon_count"] = daemon_count
+            max_daemon_count = int(baseline.get("daemon_count_max", 0))
+            details["daemon_count_max"] = max_daemon_count
+            if daemon_count > max_daemon_count:
+                failures.append(f"daemon_count {daemon_count} > daemon_count_max {max_daemon_count}")
+        ok = not failures
+        stdout = json.dumps(details, indent=2, sort_keys=True)
+        stderr = "" if ok else "\n".join(failures)
+        return make_result("resource_baseline", ok, started, stdout, stderr)
+    except Exception as err:  # noqa: BLE001 - release gate should return structured failure evidence.
+        return make_result("resource_baseline", False, started, stderr=f"resource baseline check failed: {err}")
+
+
+def emit_failure(failed: dict[str, object], results: list[dict[str, object]]) -> int:
+    print(json.dumps({"ok": False, "schema_version": "orderk.release_gate.v1", "failed": failed, "results": results}, indent=2))
+    return 1
+
+
 def main() -> int:
     if GENERATED_VENDOR_ORDERK.exists():
         GENERATED_VENDOR_ORDERK.unlink()
-    results = []
+    results: list[dict[str, object]] = []
+    for check in (check_version_consistency, check_secret_scan, check_package_cleanliness):
+        result = check(REPO)
+        results.append(result)
+        if not result["ok"]:
+            return emit_failure(result, results)
     for cmd in COMMANDS:
         result = run(cmd)
         results.append(result)
         if not result["ok"]:
-            print(json.dumps({"ok": False, "schema_version": "orderk.release_gate.v1", "failed": result, "results": results}, indent=2))
-            return 1
+            return emit_failure(result, results)
+        if cmd[:2] == ["cargo", "build"]:
+            resource_result = check_resource_baseline(REPO)
+            results.append(resource_result)
+            if not resource_result["ok"]:
+                return emit_failure(resource_result, results)
     print(json.dumps({"ok": True, "schema_version": "orderk.release_gate.v1", "results": results}, indent=2))
     return 0
 

@@ -54,6 +54,23 @@ orderk maintain \
 
 Output schema: `orderk.maintain.v1`.
 
+### Read-only MCP recall surface
+
+For MCP-capable clients, run a thin stdio server:
+
+```bash
+orderk mcp \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --embedding-provider siliconflow \
+  --embedding-model BAAI/bge-m3 \
+  --embedding-dim 1024 \
+  --vector-backend sqlite_vec
+```
+
+Only `search`, `status`, and `health` are exposed. The MCP server supports standard `Content-Length` stdio frames plus JSONL compatibility for smoke tests, opens the index through read-only search/status/health paths, and deliberately omits `index`, `maintain`, `feedback`, note-write, save, forget, summary, and chat tools.
+
+Search can request thicker evidence with `min_score`/`threshold`, `context_chunks`, `include_links`, and the same metadata `filter` DSL as CLI search.
+
 Important fields:
 
 - `ok`: machine gate for agents.
@@ -76,16 +93,24 @@ npm run verify
 
 The release gate runs:
 
-1. Rust tests.
-2. Rust release build.
-3. JSON contract fixture gate.
-4. Smoke test.
-5. Stress test with update/delete churn.
-6. Eval fixture gate.
-7. npm install.
-8. workspace builds.
-9. workspace tests.
-10. npm pack dry-run.
+1. Version consistency across Cargo, npm packages, Obsidian manifest, and `versions.json`.
+2. Secret scan for common private key/token/API-key shapes.
+3. Package cleanliness scan for build/runtime/private artifacts such as `target/`, `node_modules/`, vendor binaries, `.env`, logs, and SQLite files.
+4. Supermemory absorption regression tests for search thresholds, neighbor chunks, Obsidian link evidence, and read-only MCP tool allowlisting.
+5. Release/eval/feedback-growth gate unit tests: `scripts/test_release_gate.py`, `scripts/test_eval_gate.py`, and `scripts/test_feedback_to_eval.py`.
+6. `cargo fmt --all -- --check`.
+7. `cargo clippy --workspace --all-features -- -D warnings`.
+8. Rust tests.
+9. Rust release build.
+10. Resource baseline gate from `baselines/orderk-resource-baseline.json`.
+11. JSON contract fixture gate.
+12. Smoke test.
+13. Stress test with update/delete churn.
+14. Eval fixture gate from `fixtures/eval/*` and `baselines/orderk-eval-baseline.json`.
+15. npm install.
+16. workspace builds.
+17. workspace tests.
+18. npm pack dry-run.
 
 It emits `orderk.release_gate.v1` JSON and fails on the first broken gate.
 

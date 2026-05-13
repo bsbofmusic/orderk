@@ -9,6 +9,11 @@ python3 scripts/release_gate.py
 Equivalent expanded gate:
 
 ```bash
+python3 -m unittest scripts/test_release_gate.py scripts/test_eval_gate.py scripts/test_feedback_to_eval.py
+cargo test -p orderk-core --all-features query_options_
+cargo test -p orderk-cli --all-features mcp_
+cargo fmt --all -- --check
+cargo clippy --workspace --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo build --workspace --all-features --release
 python3 scripts/contract.py
@@ -20,6 +25,19 @@ npm run build --workspaces --if-present
 npm test --workspaces --if-present
 npm pack --workspaces --dry-run
 ```
+
+`python3 scripts/release_gate.py` also runs internal version-consistency, secret-scan, package-cleanliness, Supermemory absorption regressions, release/eval/feedback-growth gate unit tests, resource-baseline, and eval-quality-baseline checks. Resource thresholds live in `baselines/orderk-resource-baseline.json`; deterministic eval thresholds live in `baselines/orderk-eval-baseline.json` and use `fixtures/eval/*`.
+
+## Supermemory absorption surface
+
+This release adds agent-facing retrieval controls without changing orderk's boundary:
+
+- `orderk search --min-score` / `--threshold` to suppress low-score tails.
+- `orderk search --context-chunks N` to include same-file neighbor chunks.
+- `orderk search --include-links` to expose Obsidian wikilink/backlink evidence.
+- `orderk mcp` as a thin read-only stdio MCP surface exposing only `search`, `status`, and `health` with standard `Content-Length` frames plus JSONL smoke compatibility.
+
+These features return vault evidence only; they do not write notes, generate summaries, run chat, auto-save memories, or expose index mutation through MCP.
 
 ## npm packages
 

@@ -1,4 +1,3 @@
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -160,7 +159,11 @@ pub struct HealthCheck {
 }
 
 impl HealthCheck {
-    pub fn ok(component: impl Into<String>, message: impl Into<String>, details: serde_json::Value) -> Self {
+    pub fn ok(
+        component: impl Into<String>,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
         Self {
             component: component.into(),
             ok: true,
@@ -233,12 +236,70 @@ pub struct ScoreBreakdown {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LinkEvidence {
+    pub outgoing: Vec<OutgoingLinkEvidence>,
+    pub backlinks: Vec<BacklinkEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutgoingLinkEvidence {
+    pub target: String,
+    pub normalized_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklinkEvidence {
+    pub source_path: String,
+    pub source_title: Option<String>,
+    pub target: String,
+    pub normalized_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchResultEvidence {
     pub sources: Vec<String>,
     pub keyword_rank: Option<usize>,
     pub vector_rank: Option<usize>,
     pub route: Option<String>,
     pub route_score: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<LinkEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchContextChunk {
+    pub relation: String,
+    pub chunk_id: String,
+    pub path: String,
+    pub heading: Option<String>,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryOptions {
+    pub limit: usize,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    #[serde(default)]
+    pub context_chunks: usize,
+    #[serde(default)]
+    pub include_links: bool,
+}
+
+impl QueryOptions {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            filter: None,
+            min_score: None,
+            context_chunks: 0,
+            include_links: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -249,6 +310,10 @@ pub struct QueryRoutingEvidence {
     pub filter: Option<String>,
     pub filter_mode: Option<String>,
     pub filtered_candidates: Option<usize>,
+    pub min_score: Option<f32>,
+    pub threshold_filtered: Option<usize>,
+    pub context_chunks: usize,
+    pub include_links: bool,
     pub keyword_candidates: usize,
     pub vector_candidates: usize,
     pub route_candidates: usize,
@@ -269,6 +334,8 @@ pub struct SearchResult {
     pub score: f32,
     pub score_breakdown: ScoreBreakdown,
     pub evidence: SearchResultEvidence,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_chunks: Vec<SearchContextChunk>,
     pub tags: Vec<String>,
     pub mtime: Option<DateTime<Utc>>,
 }

@@ -1,4 +1,3 @@
-
 use crate::models::ParsedDocument;
 use anyhow::Result;
 use regex::Regex;
@@ -14,7 +13,13 @@ pub fn parse_markdown(path: &str, source: &str) -> Result<ParsedDocument> {
         trimmed.strip_prefix("# ").map(|s| s.trim().to_string())
     });
     let wikilinks = extract_wikilinks(body);
-    Ok(ParsedDocument { path: path.to_string(), title, tags, wikilinks, body: body.to_string() })
+    Ok(ParsedDocument {
+        path: path.to_string(),
+        title,
+        tags,
+        wikilinks,
+        body: body.to_string(),
+    })
 }
 
 fn split_frontmatter(source: &str) -> (Option<&str>, &str) {
@@ -42,13 +47,20 @@ fn extract_tags(frontmatter: &str) -> Vec<String> {
         if let Some(rest) = trimmed.strip_prefix("tags:") {
             let rest = rest.trim();
             if rest.starts_with('[') && rest.ends_with(']') {
-                tags.extend(rest.trim_matches(&['[', ']'][..]).split(',').map(clean_tag).filter(|s| !s.is_empty()));
+                tags.extend(
+                    rest.trim_matches(&['[', ']'][..])
+                        .split(',')
+                        .map(clean_tag)
+                        .filter(|s| !s.is_empty()),
+                );
             } else if !rest.is_empty() {
                 tags.push(clean_tag(rest));
             }
         } else if trimmed.starts_with('-') {
             let tag = clean_tag(trimmed.trim_start_matches('-'));
-            if !tag.is_empty() { tags.push(tag); }
+            if !tag.is_empty() {
+                tags.push(tag);
+            }
         }
     }
     tags
@@ -56,12 +68,17 @@ fn extract_tags(frontmatter: &str) -> Vec<String> {
 
 fn extract_inline_tags(body: &str) -> Vec<String> {
     let re = Regex::new(r"(?:^|\s)#([\p{L}\p{N}_/-]+)").unwrap();
-    re.captures_iter(body).map(|c| clean_tag(&c[1])).filter(|s| !s.is_empty()).collect()
+    re.captures_iter(body)
+        .map(|c| clean_tag(&c[1]))
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn extract_wikilinks(body: &str) -> Vec<String> {
     let re = Regex::new(r"!?\[\[([^\]]+)\]\]").unwrap();
-    re.captures_iter(body).map(|c| c[1].trim().to_string()).collect()
+    re.captures_iter(body)
+        .map(|c| c[1].trim().to_string())
+        .collect()
 }
 
 fn clean_tag(s: &str) -> String {
@@ -74,7 +91,11 @@ mod tests {
 
     #[test]
     fn parser_extracts_frontmatter_tags_heading_and_wikilinks() {
-        let doc = parse_markdown("a.md", "---\ntags: [project, alpha]\n---\n# Alpha\nSee [[Bravo]] #rust").unwrap();
+        let doc = parse_markdown(
+            "a.md",
+            "---\ntags: [project, alpha]\n---\n# Alpha\nSee [[Bravo]] #rust",
+        )
+        .unwrap();
         assert_eq!(doc.title.as_deref(), Some("Alpha"));
         assert!(doc.tags.contains(&"project".to_string()));
         assert!(doc.tags.contains(&"rust".to_string()));

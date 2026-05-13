@@ -22,10 +22,32 @@ orderk search \
   --db /path/to/orderk.sqlite \
   --query "naval leverage" \
   --limit 10 \
+  --min-score 0.2 \
+  --context-chunks 1 \
+  --include-links \
   --embedding-provider siliconflow \
   --embedding-dim 1024 \
   --embedding-model BAAI/bge-m3
 ```
+
+Optional search controls:
+
+- `--min-score` / `--threshold`: filter low fused-score results after candidate ranking.
+- `--context-chunks N`: include before/after same-file chunk evidence from the index.
+- `--include-links`: include Obsidian wikilink/backlink evidence parsed from indexed Markdown.
+- `--filter "tag == 'rust' && has_code == true"`: apply the small whitelisted metadata filter DSL.
+
+### MCP read-only server
+
+```bash
+orderk mcp \
+  --db /path/to/orderk.sqlite \
+  --embedding-provider siliconflow \
+  --embedding-dim 1024 \
+  --embedding-model BAAI/bge-m3
+```
+
+MCP exposes only `search`, `status`, and `health`; it supports standard `Content-Length` stdio frames plus JSONL compatibility for smoke tests. It does not expose index, feedback, maintain, write, save, forget, or chat tools.
 
 ### Health / Doctor
 
@@ -77,7 +99,7 @@ orderk eval \
   --embedding-model BAAI/bge-m3
 ```
 
-Eval prints a JSON report with `hits_at_k`, `top1_hits`, `zero_hit`, `recall_at_k`, `ndcg_at_k`, `mrr`, and mean latency, plus per-query matched ranks and result metadata.
+Eval prints a JSON report with `hits_at_k`, `top1_hits`, `zero_hit`, `recall_at_k`, `ndcg_at_k`, `mrr`, and mean latency, plus per-query matched ranks and result metadata. `python3 scripts/eval.py` is the checked-in offline quality gate: it indexes `fixtures/eval/vault`, runs `fixtures/eval/queries.json`, and validates the report against `baselines/orderk-eval-baseline.json`. Override those paths with `ORDERK_EVAL_VAULT`, `ORDERK_EVAL_QUERIES`, and `ORDERK_EVAL_BASELINE` for local experiments.
 
 Eval query file schema:
 

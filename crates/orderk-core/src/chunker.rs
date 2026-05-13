@@ -34,14 +34,21 @@ pub fn chunk_document(doc: &ParsedDocument, max_chars: usize) -> Vec<Chunk> {
 
         if is_heading {
             if let Some((level, heading)) = parse_heading(trimmed) {
-                while heading_stack.last().map(|(existing_level, _)| *existing_level >= level).unwrap_or(false) {
+                while heading_stack
+                    .last()
+                    .map(|(existing_level, _)| *existing_level >= level)
+                    .unwrap_or(false)
+                {
                     heading_stack.pop();
                 }
                 heading_stack.push((level, heading));
             }
         }
 
-        if current_text.len() + line.len() + 1 > max_chars && !current_text.trim().is_empty() && fence_marker.is_none() {
+        if current_text.len() + line.len() + 1 > max_chars
+            && !current_text.trim().is_empty()
+            && fence_marker.is_none()
+        {
             push_chunk(
                 &mut chunks,
                 &mut id_counts,
@@ -92,11 +99,20 @@ fn push_chunk(
     let heading_seed = heading.as_deref().unwrap_or("");
     let title_seed = doc.title.as_deref().unwrap_or("");
     let tags_seed = doc.tags.join("\u{1f}");
-    let id_key = format!("{}\0{}\0{}\0{}\0{}", doc.path, title_seed, tags_seed, heading_seed, hash);
+    let id_key = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        doc.path, title_seed, tags_seed, heading_seed, hash
+    );
     let occurrence = *id_counts.entry(id_key.clone()).or_insert(0);
     id_counts.insert(id_key.clone(), occurrence + 1);
-    let id_seed = format!("{}\0{}\0{}\0{}\0{}\0{}", doc.path, title_seed, tags_seed, heading_seed, hash, occurrence);
-    let id = format!("chk_{}", &hex::encode(Sha256::digest(id_seed.as_bytes()))[..24]);
+    let id_seed = format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        doc.path, title_seed, tags_seed, heading_seed, hash, occurrence
+    );
+    let id = format!(
+        "chk_{}",
+        &hex::encode(Sha256::digest(id_seed.as_bytes()))[..24]
+    );
     chunks.push(Chunk {
         id,
         file_path: doc.path.clone(),
@@ -162,7 +178,8 @@ fn toggle_fence(current: Option<char>, line: &str) -> Option<char> {
 }
 
 pub fn has_code(text: &str) -> bool {
-    text.lines().any(|line| fence_marker_match(line.trim_start()).is_some())
+    text.lines()
+        .any(|line| fence_marker_match(line.trim_start()).is_some())
 }
 
 pub fn has_link(text: &str) -> bool {
@@ -214,9 +231,24 @@ mod tests {
         )
         .unwrap();
         let chunks = chunk_document(&doc, 40);
-        assert!(chunks.iter().any(|chunk| chunk.heading.as_deref() == Some("Alpha > Beta") && chunk.text.contains("```rust") && chunk.text.contains("println!")), "{chunks:#?}");
-        assert!(chunks.iter().any(|chunk| chunk.text.contains("after")), "{chunks:#?}");
-        assert!(chunks.iter().all(|chunk| !chunk.text.contains("fn main() {") || chunk.text.contains("```rust")), "code block should stay intact");
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.heading.as_deref() == Some("Alpha > Beta")
+                    && chunk.text.contains("```rust")
+                    && chunk.text.contains("println!")),
+            "{chunks:#?}"
+        );
+        assert!(
+            chunks.iter().any(|chunk| chunk.text.contains("after")),
+            "{chunks:#?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !chunk.text.contains("fn main() {") || chunk.text.contains("```rust")),
+            "code block should stay intact"
+        );
     }
 
     #[test]
