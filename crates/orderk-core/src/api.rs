@@ -78,7 +78,7 @@ pub fn query_with_options(
     provider: &dyn EmbeddingProvider,
     vector_backend: VectorBackend,
 ) -> Result<QueryResponse> {
-    let conn = open_existing(db_path)?;
+    let conn = open_writable_existing(db_path)?;
     IndexStore::query_with_options(&conn, query, options, provider, &vector_backend)
 }
 

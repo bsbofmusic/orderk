@@ -132,6 +132,7 @@ orderk search \
   --min-score 0.2 \
   --context-chunks 1 \
   --include-links \
+  --filter "confidence == 'high' && status == 'active'" \
   --embedding-provider siliconflow \
   --embedding-model BAAI/bge-m3 \
   --embedding-dim 1024 \
@@ -141,7 +142,8 @@ orderk search \
 - `--min-score` / `--threshold`: drop low fused-score tails after candidate ranking.
 - `--context-chunks N`: include before/after same-file chunk evidence.
 - `--include-links`: include Obsidian wikilink/backlink evidence from indexed vault text.
-- `--filter "tag == 'rust' && has_code == true"`: optional metadata filter DSL.
+- `--filter "tag == 'rust' && has_code == true && confidence == 'high'"`: optional metadata filter DSL. Supported fields are `path`, `title`, `heading`, `tag`, `has_code`, `has_link`, `has_task_list`, `has_incomplete_tasks`, `confidence`, `status`, and `source_type`.
+- `--no-rerank`: disable deterministic metadata-aware rerank. By default orderk adds a bounded `score_breakdown.metadata_boost` from indexed structure/frontmatter, with no LLM or cross-encoder reranker.
 
 ### 5) MCP read-only server
 
@@ -221,8 +223,8 @@ This is the shortest path for an agent or automation:
 3. Use `siliconflow` as the embedding provider.
 4. Set `BAAI/bge-m3` + `1024` unless you have a strong reason to change them.
 5. Use `sqlite_vec` as the vector backend.
-6. Consume the JSON output directly. Search responses include `route`, `routing`, per-result `score_breakdown`, `evidence`, `tags`, optional neighbor `context_chunks`, and optional Obsidian link evidence.
-7. Use `--min-score`/`--threshold`, `--context-chunks`, and `--include-links` when an agent needs thicker evidence rather than more low-quality tails.
+6. Consume the JSON output directly. Search responses include `route`, `routing`, per-result `score_breakdown`, `evidence`, `tags`, `confidence`, `status`, `source_type`, optional neighbor `context_chunks`, and optional Obsidian link evidence.
+7. Use `--min-score`/`--threshold`, `--context-chunks`, `--include-links`, `--filter`, and `--no-rerank` when an agent needs thicker evidence or wants deterministic metadata rerank disabled.
 8. If the client supports MCP, use `orderk mcp` for read-only `search`/`status`/`health` tools instead of asking the agent to guess shell flags.
 9. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
 

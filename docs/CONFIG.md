@@ -25,6 +25,7 @@ orderk search \
   --min-score 0.2 \
   --context-chunks 1 \
   --include-links \
+  --filter "confidence == 'high' && status == 'active'" \
   --embedding-provider siliconflow \
   --embedding-dim 1024 \
   --embedding-model BAAI/bge-m3
@@ -35,7 +36,8 @@ Optional search controls:
 - `--min-score` / `--threshold`: filter low fused-score results after candidate ranking.
 - `--context-chunks N`: include before/after same-file chunk evidence from the index.
 - `--include-links`: include Obsidian wikilink/backlink evidence parsed from indexed Markdown.
-- `--filter "tag == 'rust' && has_code == true"`: apply the small whitelisted metadata filter DSL.
+- `--filter "tag == 'rust' && has_code == true && confidence == 'high'"`: apply the small whitelisted metadata filter DSL. Supported fields are `path`, `title`, `heading`, `tag`, `has_code`, `has_link`, `has_task_list`, `has_incomplete_tasks`, `confidence`, `status`, and `source_type`.
+- `--no-rerank`: disable deterministic metadata-aware rerank; default search adds bounded `score_breakdown.metadata_boost` from indexed structure/frontmatter without LLM or cross-encoder reranking.
 
 ### MCP read-only server
 

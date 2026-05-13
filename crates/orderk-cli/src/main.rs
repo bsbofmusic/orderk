@@ -105,6 +105,7 @@ fn run() -> Result<()> {
             let threshold = take_optional_f32(&mut args, "--threshold")?;
             let context_chunks = take_usize(&mut args, "--context-chunks", 0)?;
             let include_links = take_flag(&mut args, "--include-links");
+            let rerank = !take_flag(&mut args, "--no-rerank");
             let provider = provider_from_name(
                 &embedding_provider,
                 embedding_dim,
@@ -119,6 +120,7 @@ fn run() -> Result<()> {
                     min_score: min_score.or(threshold),
                     context_chunks,
                     include_links,
+                    rerank,
                 },
                 provider.as_ref(),
                 vector_backend,
@@ -739,6 +741,10 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
         .get("include_links")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let rerank = arguments
+        .get("rerank")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let provider = provider_from_name(
         &config.embedding_provider,
         config.embedding_dim,
@@ -753,6 +759,7 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
             min_score,
             context_chunks,
             include_links,
+            rerank,
         },
         provider.as_ref(),
         config.vector_backend.clone(),
@@ -794,11 +801,12 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
                 "properties": {
                     "query": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
-                    "filter": {"type": "string", "description": "Optional mini filter DSL, e.g. tag == 'rust' && has_code == true"},
+                    "filter": {"type": "string", "description": "Optional mini filter DSL, e.g. tag == 'rust' && has_code == true && confidence == 'high'"},
                     "min_score": {"type": "number", "description": "Drop results below this fused score"},
                     "threshold": {"type": "number", "description": "Alias for min_score"},
                     "context_chunks": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
-                    "include_links": {"type": "boolean", "default": false}
+                    "include_links": {"type": "boolean", "default": false},
+                    "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, etc.)"}
                 },
                 "required": ["query"]
             }
@@ -910,7 +918,7 @@ fn print_usage() {
         "orderk <init|index|search|status|health|doctor|eval|maintain|mcp|feedback> [--flags]"
     );
     eprintln!(
-        "search flags include: --query <text> [--filter \"tag == 'rust' && has_code == true\"] [--min-score <n>] [--context-chunks <n>] [--include-links]"
+        "search flags include: --query <text> [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--no-rerank]"
     );
 }
 

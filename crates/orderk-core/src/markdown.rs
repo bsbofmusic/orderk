@@ -19,6 +19,9 @@ pub fn parse_markdown(path: &str, source: &str) -> Result<ParsedDocument> {
         tags,
         wikilinks,
         body: body.to_string(),
+        confidence: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "confidence"),
+        status: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "status"),
+        source_type: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "source_type"),
     })
 }
 
@@ -85,6 +88,21 @@ fn clean_tag(s: &str) -> String {
     s.trim().trim_matches(['"', '\'', '#', ' ']).to_string()
 }
 
+fn extract_frontmatter_scalar(frontmatter: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(&prefix) else {
+            continue;
+        };
+        let value = rest.trim().trim_matches(['"', '\'']).trim();
+        if !value.is_empty() && !value.starts_with('[') && !value.starts_with('{') {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,13 +111,16 @@ mod tests {
     fn parser_extracts_frontmatter_tags_heading_and_wikilinks() {
         let doc = parse_markdown(
             "a.md",
-            "---\ntags: [project, alpha]\n---\n# Alpha\nSee [[Bravo]] #rust",
+            "---\ntags: [project, alpha]\nconfidence: high\nstatus: active\nsource_type: audit\n---\n# Alpha\nSee [[Bravo]] #rust",
         )
         .unwrap();
         assert_eq!(doc.title.as_deref(), Some("Alpha"));
         assert!(doc.tags.contains(&"project".to_string()));
         assert!(doc.tags.contains(&"rust".to_string()));
         assert_eq!(doc.wikilinks, vec!["Bravo"]);
+        assert_eq!(doc.confidence.as_deref(), Some("high"));
+        assert_eq!(doc.status.as_deref(), Some("active"));
+        assert_eq!(doc.source_type.as_deref(), Some("audit"));
         assert!(!doc.body.contains("tags:"));
     }
 }

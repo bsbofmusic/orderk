@@ -43,6 +43,9 @@ pub struct ParsedDocument {
     pub tags: Vec<String>,
     pub wikilinks: Vec<String>,
     pub body: String,
+    pub confidence: Option<String>,
+    pub status: Option<String>,
+    pub source_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +63,9 @@ pub struct Chunk {
     pub has_link: bool,
     pub has_task_list: bool,
     pub has_incomplete_tasks: bool,
+    pub confidence: Option<String>,
+    pub status: Option<String>,
+    pub source_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +239,7 @@ pub struct ScoreBreakdown {
     pub tag_boost: f32,
     pub route_boost: f32,
     pub recency_boost: f32,
+    pub metadata_boost: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -288,6 +295,12 @@ pub struct QueryOptions {
     pub context_chunks: usize,
     #[serde(default)]
     pub include_links: bool,
+    #[serde(default = "default_rerank")]
+    pub rerank: bool,
+}
+
+fn default_rerank() -> bool {
+    true
 }
 
 impl QueryOptions {
@@ -298,6 +311,7 @@ impl QueryOptions {
             min_score: None,
             context_chunks: 0,
             include_links: false,
+            rerank: default_rerank(),
         }
     }
 }
@@ -337,6 +351,9 @@ pub struct SearchResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_chunks: Vec<SearchContextChunk>,
     pub tags: Vec<String>,
+    pub confidence: Option<String>,
+    pub status: Option<String>,
+    pub source_type: Option<String>,
     pub mtime: Option<DateTime<Utc>>,
 }
 

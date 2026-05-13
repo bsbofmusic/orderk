@@ -25,6 +25,9 @@ pub enum FilterField {
     HasLink,
     HasTaskList,
     HasIncompleteTasks,
+    Confidence,
+    Status,
+    SourceType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +106,12 @@ fn condition_to_sql(condition: &FilterCondition, alias: &str) -> Result<FilterSq
         | FilterField::HasLink
         | FilterField::HasTaskList
         | FilterField::HasIncompleteTasks => compile_bool_condition(condition, alias),
-        FilterField::Path | FilterField::Title | FilterField::Heading => {
-            compile_string_condition(condition, alias)
-        }
+        FilterField::Path
+        | FilterField::Title
+        | FilterField::Heading
+        | FilterField::Confidence
+        | FilterField::Status
+        | FilterField::SourceType => compile_string_condition(condition, alias),
     }
 }
 
@@ -175,6 +181,9 @@ fn string_column(field: FilterField, alias: &str) -> Result<String> {
         FilterField::Path => "file_path",
         FilterField::Title => "title",
         FilterField::Heading => "heading",
+        FilterField::Confidence => "confidence",
+        FilterField::Status => "status",
+        FilterField::SourceType => "source_type",
         _ => return Err(anyhow!("invalid filter: field is not a string field")),
     };
     Ok(format!("{alias}.{name}"))
@@ -238,7 +247,12 @@ fn parse_condition(raw: &str) -> Result<FilterCondition> {
 
 fn validate_operator_value(field: FilterField, op: FilterOp, value: &FilterValue) -> Result<()> {
     match field {
-        FilterField::Path | FilterField::Title | FilterField::Heading => {
+        FilterField::Path
+        | FilterField::Title
+        | FilterField::Heading
+        | FilterField::Confidence
+        | FilterField::Status
+        | FilterField::SourceType => {
             if matches!(value, FilterValue::String(_)) {
                 Ok(())
             } else {
@@ -287,6 +301,9 @@ fn parse_field(raw: &str) -> Result<FilterField> {
         "has_link" => Ok(FilterField::HasLink),
         "has_task_list" => Ok(FilterField::HasTaskList),
         "has_incomplete_tasks" => Ok(FilterField::HasIncompleteTasks),
+        "confidence" => Ok(FilterField::Confidence),
+        "status" => Ok(FilterField::Status),
+        "source_type" => Ok(FilterField::SourceType),
         _ => Err(anyhow!("invalid filter: unknown field `{raw}`")),
     }
 }
@@ -431,9 +448,11 @@ mod tests {
 
     #[test]
     fn parses_flat_conjunction() {
-        let expr =
-            parse_filter("tag == 'rust' && has_code == true && path contains \"brain/\"").unwrap();
-        assert_eq!(expr.conditions.len(), 3);
+        let expr = parse_filter(
+            "tag == 'rust' && has_code == true && path contains \"brain/\" && confidence == 'high' && status != 'archived' && source_type == 'audit'",
+        )
+        .unwrap();
+        assert_eq!(expr.conditions.len(), 6);
         assert_eq!(expr.conditions[0].field, FilterField::Tag);
         assert_eq!(expr.conditions[1].value, FilterValue::Bool(true));
         assert_eq!(expr.conditions[2].op, FilterOp::Contains);
@@ -468,7 +487,7 @@ mod tests {
     #[test]
     fn compiles_parameterized_sql() {
         let sql = compile_filter(
-            Some("tag == 'rust' && has_code == true && path contains 'brain/'"),
+            Some("tag == 'rust' && has_code == true && path contains 'brain/' && confidence == 'high'"),
             "c",
         )
         .unwrap()
@@ -480,7 +499,7 @@ mod tests {
             "{}",
             sql.sql
         );
-        assert_eq!(sql.args.len(), 3);
+        assert_eq!(sql.args.len(), 4);
     }
 
     #[test]

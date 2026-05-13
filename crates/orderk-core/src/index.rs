@@ -183,6 +183,9 @@ pub fn init_schema(
             has_link INTEGER NOT NULL DEFAULT 0,
             has_task_list INTEGER NOT NULL DEFAULT 0,
             has_incomplete_tasks INTEGER NOT NULL DEFAULT 0,
+            confidence TEXT,
+            status TEXT,
+            source_type TEXT,
             chunk_hash TEXT NOT NULL,
             mtime INTEGER NOT NULL
         );
@@ -225,7 +228,7 @@ pub fn init_schema(
     upsert_setting(conn, "embedding_model", embedding_model)?;
     upsert_setting(conn, "vector_backend", vector_backend.as_str())?;
     upsert_setting(conn, "vector_backend_mode", vector_backend.as_str())?;
-    upsert_setting(conn, "schema_version", "3")?;
+    upsert_setting(conn, "schema_version", "4")?;
     Ok(())
 }
 
@@ -264,6 +267,15 @@ pub(crate) fn migrate_chunk_metadata_columns(conn: &Connection) -> Result<()> {
             "has_incomplete_tasks",
             "ALTER TABLE chunks ADD COLUMN has_incomplete_tasks INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "confidence",
+            "ALTER TABLE chunks ADD COLUMN confidence TEXT",
+        ),
+        ("status", "ALTER TABLE chunks ADD COLUMN status TEXT"),
+        (
+            "source_type",
+            "ALTER TABLE chunks ADD COLUMN source_type TEXT",
+        ),
     ];
     let mut added_any = false;
     for (column, sql) in migrations {
@@ -272,10 +284,10 @@ pub(crate) fn migrate_chunk_metadata_columns(conn: &Connection) -> Result<()> {
             added_any = true;
         }
     }
-    if added_any || schema_version.as_deref() != Some("3") {
+    if added_any || schema_version.as_deref() != Some("4") {
         backfill_chunk_metadata(conn)?;
     }
-    upsert_setting(conn, "schema_version", "3")?;
+    upsert_setting(conn, "schema_version", "4")?;
     Ok(())
 }
 
@@ -779,12 +791,24 @@ impl IndexStore {
             vector_backend,
         )?;
         let (mut results, mut routing) = match vector_backend {
-            VectorBackend::SqliteVec => {
-                query_hybrid(conn, query, &plan, limit, provider, filter_sql.as_ref())?
-            }
-            VectorBackend::Exact => {
-                query_exact(conn, query, &plan, limit, provider, filter_sql.as_ref())?
-            }
+            VectorBackend::SqliteVec => query_hybrid(
+                conn,
+                query,
+                &plan,
+                limit,
+                provider,
+                filter_sql.as_ref(),
+                options.rerank,
+            )?,
+            VectorBackend::Exact => query_exact(
+                conn,
+                query,
+                &plan,
+                limit,
+                provider,
+                filter_sql.as_ref(),
+                options.rerank,
+            )?,
         };
         let filtered_candidates = results.len();
         if let Some(min_score) = options.min_score {
@@ -942,8 +966,8 @@ fn reindex_file<P: EmbeddingProvider + ?Sized>(
             record.ok_or_else(|| anyhow!("missing embedding record for chunk {}", chunk.id))?;
         let tags = serde_json::to_string(&chunk.tags)?;
         tx.execute(
-            "INSERT INTO chunks(chunk_id, file_path, file_hash, title, heading, line_start, line_end, text, tags_json, links_json, has_code, has_link, has_task_list, has_incomplete_tasks, chunk_hash, mtime)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO chunks(chunk_id, file_path, file_hash, title, heading, line_start, line_end, text, tags_json, links_json, has_code, has_link, has_task_list, has_incomplete_tasks, confidence, status, source_type, chunk_hash, mtime)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 chunk.id,
                 chunk.file_path,
@@ -959,6 +983,9 @@ fn reindex_file<P: EmbeddingProvider + ?Sized>(
                 bool_to_i64(chunk.has_link),
                 bool_to_i64(chunk.has_task_list),
                 bool_to_i64(chunk.has_incomplete_tasks),
+                chunk.confidence,
+                chunk.status,
+                chunk.source_type,
                 chunk.hash,
                 file.mtime,
             ],
@@ -1259,6 +1286,7 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
     limit: usize,
     provider: &P,
     filter: Option<&FilterSql>,
+    rerank: bool,
 ) -> Result<(Vec<SearchResult>, QueryRoutingEvidence)> {
     let mut keyword_scores: HashMap<i64, (usize, f32)> = HashMap::new();
     if let Some(keyword_query) = plan.keyword_query() {
@@ -1307,6 +1335,7 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
             plan,
             query,
             filter,
+            rerank,
         )? {
             results.push(result);
         }
@@ -1344,10 +1373,11 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
     limit: usize,
     provider: &P,
     filter: Option<&FilterSql>,
+    rerank: bool,
 ) -> Result<(Vec<SearchResult>, QueryRoutingEvidence)> {
     let qvec = provider.embed_query(query)?;
     let mut sql = String::from(
-        "SELECT c.id, c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, e.embedding, f.mtime, f.hash
+        "SELECT c.id, c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, e.embedding, f.mtime, f.hash, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type
          FROM chunks c
          JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id
          LEFT JOIN files f ON f.path = c.file_path
@@ -1372,6 +1402,14 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             row.get::<_, String>(8)?,
             row.get::<_, i64>(9)?,
             vec,
+            row.get::<_, Option<i64>>(11)?,
+            row.get::<_, i64>(13)? != 0,
+            row.get::<_, i64>(14)? != 0,
+            row.get::<_, i64>(15)? != 0,
+            row.get::<_, i64>(16)? != 0,
+            row.get::<_, Option<String>>(17)?,
+            row.get::<_, Option<String>>(18)?,
+            row.get::<_, Option<String>>(19)?,
         ))
     })?;
     let mut scored = Vec::new();
@@ -1389,6 +1427,14 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             tags_json,
             mtime,
             vec,
+            file_mtime,
+            has_code,
+            has_link,
+            has_task_list,
+            has_incomplete_tasks,
+            confidence,
+            status,
+            source_type,
         ) = row?;
         let distance = l2_distance(&qvec, &vec);
         let vector_score = distance_to_score(distance);
@@ -1413,7 +1459,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             line_end,
             &text,
             &tags_json,
-            Some(mtime),
+            file_mtime.or(Some(mtime)),
             None,
             None,
             keyword_score,
@@ -1421,6 +1467,14 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             route_hit.as_ref(),
             plan,
             query,
+            has_code,
+            has_link,
+            has_task_list,
+            has_incomplete_tasks,
+            confidence,
+            status,
+            source_type,
+            rerank,
         )?;
         scored.push(result);
     }
@@ -1472,9 +1526,10 @@ fn load_chunk_result(
     plan: &QueryPlan,
     query: &str,
     filter: Option<&FilterSql>,
+    rerank: bool,
 ) -> Result<Option<SearchResult>> {
     let mut sql = String::from(
-        "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, f.mtime
+        "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, f.mtime, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type
          FROM chunks c
          LEFT JOIN files f ON f.path = c.file_path
          WHERE c.id = ?",
@@ -1496,6 +1551,13 @@ fn load_chunk_result(
                 row.get::<_, String>(7)?,
                 row.get::<_, i64>(8)?,
                 row.get::<_, Option<i64>>(9)?,
+                row.get::<_, i64>(10)? != 0,
+                row.get::<_, i64>(11)? != 0,
+                row.get::<_, i64>(12)? != 0,
+                row.get::<_, i64>(13)? != 0,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
             ))
         })
         .optional()?;
@@ -1510,6 +1572,13 @@ fn load_chunk_result(
         tags_json,
         mtime,
         file_mtime,
+        has_code,
+        has_link,
+        has_task_list,
+        has_incomplete_tasks,
+        confidence,
+        status,
+        source_type,
     )) = row
     else {
         return Ok(None);
@@ -1532,6 +1601,14 @@ fn load_chunk_result(
         route_hit,
         plan,
         query,
+        has_code,
+        has_link,
+        has_task_list,
+        has_incomplete_tasks,
+        confidence,
+        status,
+        source_type,
+        rerank,
     )
     .map(Some)
 }
@@ -1705,10 +1782,31 @@ fn build_result(
     route_hit: Option<&RouteHit>,
     plan: &QueryPlan,
     query: &str,
+    has_code: bool,
+    has_link: bool,
+    has_task_list: bool,
+    has_incomplete_tasks: bool,
+    confidence: Option<String>,
+    status: Option<String>,
+    source_type: Option<String>,
+    rerank: bool,
 ) -> Result<SearchResult> {
     let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
     let route_boost = route_hit.map(|hit| hit.score).unwrap_or(0.0);
     let fusion = reciprocal_rank_fusion(keyword_rank, vector_rank);
+    let metadata_boost = if rerank {
+        metadata_boost_score(
+            has_code,
+            has_link,
+            has_task_list,
+            has_incomplete_tasks,
+            confidence.as_deref(),
+            status.as_deref(),
+            source_type.as_deref(),
+        )
+    } else {
+        0.0
+    };
     let breakdown = ScoreBreakdown {
         keyword: keyword_score,
         vector: vector_score,
@@ -1717,6 +1815,7 @@ fn build_result(
         tag_boost: tag_boost(&tags, query),
         route_boost,
         recency_boost: recency_boost(mtime),
+        metadata_boost,
     };
     let score = (keyword_score * 0.35)
         + (vector_score * 0.35)
@@ -1724,7 +1823,8 @@ fn build_result(
         + breakdown.path_boost
         + breakdown.tag_boost
         + breakdown.route_boost
-        + breakdown.recency_boost;
+        + breakdown.recency_boost
+        + metadata_boost;
     let snippet = snippet(text, query);
     let mut sources = Vec::new();
     if keyword_rank.is_some() || keyword_score > 0.0 {
@@ -1761,6 +1861,9 @@ fn build_result(
         },
         context_chunks: Vec::new(),
         tags,
+        confidence,
+        status,
+        source_type,
         mtime: mtime.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
     })
 }
@@ -1814,6 +1917,56 @@ fn recency_boost(mtime: Option<i64>) -> f32 {
     };
     let age_days = ((Utc::now().timestamp() - mtime) as f32 / 86_400.0).max(0.0);
     (1.0 / (1.0 + age_days / 30.0)) * 0.03
+}
+
+fn metadata_boost_score(
+    has_code: bool,
+    has_link: bool,
+    has_task_list: bool,
+    has_incomplete_tasks: bool,
+    confidence: Option<&str>,
+    status: Option<&str>,
+    source_type: Option<&str>,
+) -> f32 {
+    let mut boost: f32 = 0.0;
+    if has_code {
+        boost += 0.02;
+    }
+    if has_task_list {
+        boost += 0.02;
+    }
+    if has_incomplete_tasks {
+        boost -= 0.02;
+    }
+    if has_link {
+        boost += 0.01;
+    }
+    match normalized_metadata_value(confidence).as_deref() {
+        Some("high") => boost += 0.03,
+        Some("medium") => boost += 0.01,
+        Some("low") => boost -= 0.03,
+        _ => {}
+    }
+    match normalized_metadata_value(status).as_deref() {
+        Some("active") => boost += 0.02,
+        Some("mature") => boost += 0.02,
+        Some("stale") => boost -= 0.02,
+        Some("archived") => boost -= 0.04,
+        Some("deprecated") => boost -= 0.05,
+        _ => {}
+    }
+    match normalized_metadata_value(source_type).as_deref() {
+        Some("source") | Some("original") | Some("audit") | Some("manual_audit") => boost += 0.01,
+        _ => {}
+    }
+    boost.clamp(-0.08, 0.08)
+}
+
+fn normalized_metadata_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
 }
 
 fn reciprocal_rank_fusion(keyword_rank: Option<usize>, vector_rank: Option<usize>) -> f32 {
@@ -2197,7 +2350,118 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "3");
+        assert_eq!(schema_version, "4");
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn public_query_migrates_old_schema_before_searching() {
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-public-query-old-schema-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        register_sqlite_vec();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO settings(key, value) VALUES
+              ('embedding_provider', 'mock'),
+              ('embedding_model', 'mock-8'),
+              ('embedding_dim', '8'),
+              ('vector_backend', 'exact'),
+              ('vector_backend_mode', 'exact'),
+              ('schema_version', '3');
+            CREATE TABLE files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                mtime INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                indexed_at TEXT NOT NULL
+            );
+            CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chunk_id TEXT NOT NULL UNIQUE,
+                file_path TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                title TEXT,
+                heading TEXT,
+                line_start INTEGER NOT NULL,
+                line_end INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                links_json TEXT NOT NULL DEFAULT '[]',
+                has_code INTEGER NOT NULL DEFAULT 0,
+                has_link INTEGER NOT NULL DEFAULT 0,
+                has_task_list INTEGER NOT NULL DEFAULT 0,
+                has_incomplete_tasks INTEGER NOT NULL DEFAULT 0,
+                chunk_hash TEXT NOT NULL,
+                mtime INTEGER NOT NULL
+            );
+            CREATE TABLE chunk_embeddings (
+                chunk_id TEXT PRIMARY KEY,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                embedding BLOB NOT NULL,
+                vector_hash TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE fts_chunks USING fts5(
+                chunk_id UNINDEXED,
+                file_path UNINDEXED,
+                title,
+                heading,
+                text,
+                tags,
+                tokenize = 'unicode61 remove_diacritics 2'
+            );
+            "#,
+        )
+        .unwrap();
+        let provider = MockEmbeddingProvider::new(8);
+        let text = "legacy orderk search migration evidence";
+        let embedding = vector_to_blob(&provider.embed_query(text).unwrap());
+        conn.execute(
+            "INSERT INTO files(path, mtime, size, hash, indexed_at) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![
+                "legacy.md",
+                1_i64,
+                text.len() as i64,
+                "filehash",
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks(chunk_id, file_path, file_hash, title, heading, line_start, line_end, text, tags_json, links_json, has_code, has_link, has_task_list, has_incomplete_tasks, chunk_hash, mtime)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params!["legacy_1", "legacy.md", "filehash", "Legacy", "Legacy", 1_i64, 1_i64, text, "[\"orderk\"]", "[]", 0_i64, 0_i64, 0_i64, 0_i64, "chunkhash", 1_i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO chunk_embeddings(chunk_id, model, dim, embedding, vector_hash) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params!["legacy_1", "mock-8", 8_i64, embedding, "vectorhash"],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO fts_chunks(rowid, chunk_id, file_path, title, heading, text, tags) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1_i64, "legacy_1", "legacy.md", "Legacy", "Legacy", text, "orderk"],
+        ).unwrap();
+        drop(conn);
+
+        let response = crate::api::query_with_options(
+            &db_path,
+            "orderk migration",
+            &QueryOptions::new(5),
+            &provider,
+            VectorBackend::Exact,
+        )
+        .unwrap();
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].file_path, "legacy.md");
+        assert!(
+            chunk_column_exists(&rusqlite::Connection::open(&db_path).unwrap(), "confidence")
+                .unwrap()
+        );
         let _ = fs::remove_file(&db_path);
     }
 
@@ -2212,7 +2476,7 @@ mod tests {
         fs::create_dir_all(&vault).unwrap();
         fs::write(
             vault.join("code.md"),
-            "---\ntags: [keep, rust]\n---\n# Filter Code\nshared retrieval needle\n```rust\nfn main() {}\n```\n",
+            "---\ntags: [keep, rust]\nconfidence: high\nstatus: active\nsource_type: audit\n---\n# Filter Code\nshared retrieval needle\n```rust\nfn main() {}\n```\n",
         ).unwrap();
         fs::write(
             vault.join("plain.md"),
@@ -2248,7 +2512,7 @@ mod tests {
             10,
             &provider,
             &VectorBackend::SqliteVec,
-            Some("tag == 'keep' && has_code == true"),
+            Some("tag == 'keep' && has_code == true && confidence == 'high' && status == 'active' && source_type == 'audit'"),
         )
         .unwrap();
         assert!(!res.results.is_empty());
@@ -2257,9 +2521,25 @@ mod tests {
             "{:#?}",
             res.results
         );
+        assert!(res
+            .results
+            .iter()
+            .all(|r| r.confidence.as_deref() == Some("high")));
+        assert!(res
+            .results
+            .iter()
+            .all(|r| r.status.as_deref() == Some("active")));
+        assert!(res
+            .results
+            .iter()
+            .all(|r| r.source_type.as_deref() == Some("audit")));
+        assert!(res
+            .results
+            .iter()
+            .all(|r| r.score_breakdown.metadata_boost > 0.0));
         assert_eq!(
             res.routing.filter,
-            Some("tag == 'keep' && has_code == true".to_string())
+            Some("tag == 'keep' && has_code == true && confidence == 'high' && status == 'active' && source_type == 'audit'".to_string())
         );
         assert_eq!(res.routing.filtered_candidates, Some(res.results.len()));
         assert_eq!(
@@ -3118,5 +3398,217 @@ mod tests {
 
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn metadata_boost_positive_for_has_code_negative_for_has_incomplete_tasks() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!(
+            "orderk-meta-boost-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("code.md"),
+            "---\ntags: [meta-test]\n---\n# Code Note\nRust code example:\n```rust\nfn main() {}\n```\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("task.md"),
+            "# Task Note\n- [ ] incomplete task\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("plain.md"),
+            "# Plain Note\nJust text no code no tasks.\n",
+        )
+        .unwrap();
+
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-meta-boost-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        let res = IndexStore::query_with_options(
+            &conn,
+            "code task",
+            &QueryOptions {
+                limit: 5,
+                ..QueryOptions::new(5)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        let code_result = res.results.iter().find(|r| r.path == "code.md");
+        let task_result = res.results.iter().find(|r| r.path == "task.md");
+        let plain_result = res.results.iter().find(|r| r.path == "plain.md");
+
+        assert!(
+            code_result.is_some(),
+            "code.md must appear in results for query"
+        );
+        assert!(
+            task_result.is_some(),
+            "task.md must appear in results for query"
+        );
+        assert!(
+            plain_result.is_some(),
+            "plain.md must appear in results for query"
+        );
+
+        // has_code => positive boost
+        assert!(
+            code_result.unwrap().score_breakdown.metadata_boost > 0.0,
+            "code chunk should get positive metadata boost, got {:?}",
+            code_result.unwrap().score_breakdown
+        );
+        // has_incomplete_tasks && no has_code => boost may be zero or slightly negative
+        assert!(
+            task_result.unwrap().score_breakdown.metadata_boost <= 0.0,
+            "incomplete task chunk should get non-positive boost, got {:?}",
+            task_result.unwrap().score_breakdown
+        );
+        // plain text has neither has_code nor has_task_list nor has_link nor has_incomplete_tasks
+        assert!(
+            (plain_result.unwrap().score_breakdown.metadata_boost - 0.0).abs() < f32::EPSILON,
+            "plain chunk should get zero metadata boost, got {:?}",
+            plain_result.unwrap().score_breakdown
+        );
+
+        let no_rerank = IndexStore::query_with_options(
+            &conn,
+            "code task",
+            &QueryOptions {
+                limit: 5,
+                rerank: false,
+                ..QueryOptions::new(5)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        let code_no_rerank = no_rerank
+            .results
+            .iter()
+            .find(|r| r.path == "code.md")
+            .expect("code.md must still appear when rerank is disabled");
+        let code_with_rerank = code_result.unwrap();
+        assert_eq!(code_no_rerank.score_breakdown.metadata_boost, 0.0);
+        assert!(
+            (code_with_rerank.score
+                - code_no_rerank.score
+                - code_with_rerank.score_breakdown.metadata_boost)
+                .abs()
+                < 0.0001,
+            "rerank=false score must remove metadata_boost: with={:?}, without={:?}",
+            code_with_rerank,
+            code_no_rerank
+        );
+
+        let threshold_between_scores = code_no_rerank.score + 0.001;
+        let thresholded_without_rerank = IndexStore::query_with_options(
+            &conn,
+            "code task",
+            &QueryOptions {
+                limit: 5,
+                min_score: Some(threshold_between_scores),
+                rerank: false,
+                ..QueryOptions::new(5)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert!(
+            thresholded_without_rerank
+                .results
+                .iter()
+                .all(|r| r.path != "code.md"),
+            "min_score with rerank=false must filter against unboosted score"
+        );
+        let thresholded_with_rerank = IndexStore::query_with_options(
+            &conn,
+            "code task",
+            &QueryOptions {
+                limit: 5,
+                min_score: Some(threshold_between_scores),
+                ..QueryOptions::new(5)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert!(
+            thresholded_with_rerank
+                .results
+                .iter()
+                .any(|r| r.path == "code.md"),
+            "default rerank should apply metadata boost before min_score filtering"
+        );
+
+        let exact_db_path = std::env::temp_dir().join(format!(
+            "orderk-meta-boost-exact-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut exact_conn = open_db(
+            &exact_db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut exact_conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        let exact_no_rerank = IndexStore::query_with_options(
+            &exact_conn,
+            "code task",
+            &QueryOptions {
+                limit: 5,
+                rerank: false,
+                ..QueryOptions::new(5)
+            },
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        let exact_code = exact_no_rerank
+            .results
+            .iter()
+            .find(|r| r.path == "code.md")
+            .expect("exact backend should include code.md");
+        assert_eq!(exact_code.score_breakdown.metadata_boost, 0.0);
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&exact_db_path);
     }
 }
