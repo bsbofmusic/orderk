@@ -105,6 +105,7 @@ fn run() -> Result<()> {
             let threshold = take_optional_f32(&mut args, "--threshold")?;
             let context_chunks = take_usize(&mut args, "--context-chunks", 0)?;
             let include_links = take_flag(&mut args, "--include-links");
+            let expand_links = take_usize(&mut args, "--expand-links", 0)?;
             let rerank = !take_flag(&mut args, "--no-rerank");
             let provider = provider_from_name(
                 &embedding_provider,
@@ -121,6 +122,7 @@ fn run() -> Result<()> {
                     context_chunks,
                     include_links,
                     rerank,
+                    expand_links,
                 },
                 provider.as_ref(),
                 vector_backend,
@@ -741,6 +743,11 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
         .get("include_links")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let expand_links = arguments
+        .get("expand_links")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(1) as usize;
     let rerank = arguments
         .get("rerank")
         .and_then(|v| v.as_bool())
@@ -760,6 +767,7 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
             context_chunks,
             include_links,
             rerank,
+            expand_links,
         },
         provider.as_ref(),
         config.vector_backend.clone(),
@@ -806,6 +814,7 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
                     "threshold": {"type": "number", "description": "Alias for min_score"},
                     "context_chunks": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
                     "include_links": {"type": "boolean", "default": false},
+                    "expand_links": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Expand recall one hop along indexed Obsidian wikilinks/backlinks; deterministic and off by default"},
                     "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, etc.)"}
                 },
                 "required": ["query"]
@@ -918,7 +927,7 @@ fn print_usage() {
         "orderk <init|index|search|status|health|doctor|eval|maintain|mcp|feedback> [--flags]"
     );
     eprintln!(
-        "search flags include: --query <text> [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--no-rerank]"
+        "search flags include: --query <text> [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--expand-links 1] [--no-rerank]"
     );
 }
 

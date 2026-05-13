@@ -35,6 +35,7 @@ This release adds agent-facing retrieval controls without changing orderk's boun
 - `orderk search --min-score` / `--threshold` to suppress low-score tails.
 - `orderk search --context-chunks N` to include same-file neighbor chunks.
 - `orderk search --include-links` to expose Obsidian wikilink/backlink evidence.
+- `orderk search --expand-links 1` to optionally recall one-hop linked/backlinked chunks with bounded deterministic link evidence.
 - `orderk mcp` as a thin read-only stdio MCP surface exposing only `search`, `status`, and `health` with standard `Content-Length` frames plus JSONL smoke compatibility.
 
 These features return vault evidence only; they do not write notes, generate summaries, run chat, auto-save memories, or expose index mutation through MCP.

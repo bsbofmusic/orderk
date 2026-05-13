@@ -240,6 +240,8 @@ pub struct ScoreBreakdown {
     pub route_boost: f32,
     pub recency_boost: f32,
     pub metadata_boost: f32,
+    #[serde(default)]
+    pub link_boost: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -265,6 +267,8 @@ pub struct BacklinkEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchResultEvidence {
     pub sources: Vec<String>,
+    #[serde(default)]
+    pub evidence_count: usize,
     pub keyword_rank: Option<usize>,
     pub vector_rank: Option<usize>,
     pub route: Option<String>,
@@ -297,6 +301,8 @@ pub struct QueryOptions {
     pub include_links: bool,
     #[serde(default = "default_rerank")]
     pub rerank: bool,
+    #[serde(default)]
+    pub expand_links: usize,
 }
 
 fn default_rerank() -> bool {
@@ -312,8 +318,20 @@ impl QueryOptions {
             context_chunks: 0,
             include_links: false,
             rerank: default_rerank(),
+            expand_links: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueryTimings {
+    pub keyword_ms: u128,
+    pub vector_ms: u128,
+    pub route_ms: u128,
+    pub merge_ms: u128,
+    pub link_expansion_ms: u128,
+    pub enrich_ms: u128,
+    pub total_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -328,11 +346,14 @@ pub struct QueryRoutingEvidence {
     pub threshold_filtered: Option<usize>,
     pub context_chunks: usize,
     pub include_links: bool,
+    pub expand_links: usize,
     pub keyword_candidates: usize,
     pub vector_candidates: usize,
     pub route_candidates: usize,
+    pub link_candidates: usize,
     pub merged_candidates: usize,
     pub returned: usize,
+    pub timings: QueryTimings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

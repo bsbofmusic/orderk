@@ -16,6 +16,8 @@ use std::sync::Once;
 use std::time::Instant;
 
 static SQLITE_VEC_REGISTER: Once = Once::new();
+const LINK_EXPANSION_BOOST: f32 = 0.03;
+const LINK_EXPANSION_SEED_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryRoute {
@@ -768,6 +770,9 @@ impl IndexStore {
                 return Err(anyhow!("--min-score must be a finite number"));
             }
         }
+        if options.expand_links > 1 {
+            return Err(anyhow!("--expand-links currently supports 0 or 1"));
+        }
         let query_id = format!(
             "q_{}_{}",
             chrono::Utc::now().timestamp_micros(),
@@ -810,6 +815,20 @@ impl IndexStore {
                 options.rerank,
             )?,
         };
+        if options.expand_links > 0 {
+            let expansion_started = Instant::now();
+            routing.link_candidates = expand_link_candidates(
+                conn,
+                &mut results,
+                limit,
+                &plan,
+                query,
+                filter_sql.as_ref(),
+                options.rerank,
+            )?;
+            routing.timings.link_expansion_ms = expansion_started.elapsed().as_millis();
+            routing.merged_candidates = results.len();
+        }
         let filtered_candidates = results.len();
         if let Some(min_score) = options.min_score {
             let before_threshold = results.len();
@@ -817,6 +836,7 @@ impl IndexStore {
             routing.threshold_filtered = Some(before_threshold.saturating_sub(results.len()));
         }
         results.truncate(limit);
+        let enrich_started = Instant::now();
         if options.context_chunks > 0 || options.include_links {
             enrich_results(
                 conn,
@@ -825,10 +845,15 @@ impl IndexStore {
                 options.include_links,
             )?;
         }
+        routing.timings.enrich_ms = enrich_started.elapsed().as_millis();
+        for result in &mut results {
+            refresh_evidence_count(result);
+        }
         routing.returned = results.len();
         routing.min_score = options.min_score;
         routing.context_chunks = options.context_chunks;
         routing.include_links = options.include_links;
+        routing.expand_links = options.expand_links;
         if filter_text.is_some() {
             routing.filtered_candidates = Some(filtered_candidates);
             routing.filter_mode = Some(match vector_backend {
@@ -837,10 +862,11 @@ impl IndexStore {
             });
         }
         routing.filter = filter_text;
+        routing.timings.total_ms = started.elapsed().as_millis();
         Ok(QueryResponse {
             query: query.to_string(),
             query_id,
-            took_ms: started.elapsed().as_millis(),
+            took_ms: routing.timings.total_ms,
             mode: routing.strategy.clone(),
             route: plan.route.as_str().to_string(),
             routing,
@@ -1288,6 +1314,8 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
     filter: Option<&FilterSql>,
     rerank: bool,
 ) -> Result<(Vec<SearchResult>, QueryRoutingEvidence)> {
+    let mut timings = QueryTimings::default();
+    let keyword_started = Instant::now();
     let mut keyword_scores: HashMap<i64, (usize, f32)> = HashMap::new();
     if let Some(keyword_query) = plan.keyword_query() {
         let mut sql = String::from(
@@ -1310,15 +1338,22 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
             keyword_scores.insert(rowid, (rank + 1, bm25_to_score(bm25)));
         }
     }
+    timings.keyword_ms = keyword_started.elapsed().as_millis();
 
+    let vector_started = Instant::now();
     let qvec = provider.embed_query(query)?;
     let vector_scores = if let Some(filter) = filter {
         filtered_exact_vector_scores(conn, &qvec, limit, filter)?
     } else {
         sqlite_vec_vector_scores(conn, &qvec, limit)?
     };
+    timings.vector_ms = vector_started.elapsed().as_millis();
 
+    let route_started = Instant::now();
     let route_scores = collect_route_hits(conn, plan, limit, filter)?;
+    timings.route_ms = route_started.elapsed().as_millis();
+
+    let merge_started = Instant::now();
     let mut candidate_ids: HashSet<i64> = keyword_scores.keys().copied().collect();
     candidate_ids.extend(vector_scores.keys().copied());
     candidate_ids.extend(route_scores.keys().copied());
@@ -1345,6 +1380,7 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    timings.merge_ms = merge_started.elapsed().as_millis();
 
     let routing = QueryRoutingEvidence {
         strategy: "hybrid".to_string(),
@@ -1357,11 +1393,14 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
         threshold_filtered: None,
         context_chunks: 0,
         include_links: false,
+        expand_links: 0,
         keyword_candidates: keyword_scores.len(),
         vector_candidates: vector_scores.len(),
         route_candidates: route_scores.len(),
+        link_candidates: 0,
         merged_candidates,
         returned: 0,
+        timings,
     };
     Ok((results, routing))
 }
@@ -1375,6 +1414,8 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
     filter: Option<&FilterSql>,
     rerank: bool,
 ) -> Result<(Vec<SearchResult>, QueryRoutingEvidence)> {
+    let mut timings = QueryTimings::default();
+    let vector_started = Instant::now();
     let qvec = provider.embed_query(query)?;
     let mut sql = String::from(
         "SELECT c.id, c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, e.embedding, f.mtime, f.hash, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type
@@ -1483,6 +1524,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    timings.vector_ms = vector_started.elapsed().as_millis();
     let total_candidates = scored.len();
     for (rank, result) in scored.iter_mut().enumerate() {
         result.evidence.vector_rank = Some(rank + 1);
@@ -1507,11 +1549,14 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
         threshold_filtered: None,
         context_chunks: 0,
         include_links: false,
+        expand_links: 0,
         keyword_candidates: 0,
         vector_candidates: total_candidates,
         route_candidates: route_matches,
+        link_candidates: 0,
         merged_candidates: total_candidates,
         returned: 0,
+        timings,
     };
     Ok((scored, routing))
 }
@@ -1611,6 +1656,163 @@ fn load_chunk_result(
         rerank,
     )
     .map(Some)
+}
+
+fn expand_link_candidates(
+    conn: &Connection,
+    results: &mut Vec<SearchResult>,
+    limit: usize,
+    plan: &QueryPlan,
+    query: &str,
+    filter: Option<&FilterSql>,
+    rerank: bool,
+) -> Result<usize> {
+    if results.is_empty() || limit == 0 {
+        return Ok(0);
+    }
+
+    let seeds = results
+        .iter()
+        .take(limit.min(LINK_EXPANSION_SEED_LIMIT))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut candidate_rowids = HashSet::new();
+    for seed in &seeds {
+        for rowid in outgoing_link_rowids(conn, seed)? {
+            candidate_rowids.insert(rowid);
+        }
+        for rowid in backlink_rowids(conn, seed)? {
+            candidate_rowids.insert(rowid);
+        }
+    }
+
+    let mut by_chunk_id = results
+        .iter()
+        .enumerate()
+        .map(|(idx, result)| (result.chunk_id.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut touched = 0usize;
+
+    for rowid in candidate_rowids {
+        let Some(mut candidate) =
+            load_chunk_result(conn, rowid, None, None, None, plan, query, filter, rerank)?
+        else {
+            continue;
+        };
+
+        if let Some(idx) = by_chunk_id.get(&candidate.chunk_id).copied() {
+            if apply_link_expansion_signal(&mut results[idx]) {
+                touched += 1;
+            }
+        } else {
+            apply_link_expansion_signal(&mut candidate);
+            by_chunk_id.insert(candidate.chunk_id.clone(), results.len());
+            results.push(candidate);
+            touched += 1;
+        }
+    }
+
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(touched)
+}
+
+fn apply_link_expansion_signal(result: &mut SearchResult) -> bool {
+    let mut changed = false;
+    if !result
+        .evidence
+        .sources
+        .iter()
+        .any(|source| source == "link_expansion")
+    {
+        result.evidence.sources.push("link_expansion".to_string());
+        changed = true;
+    }
+    if result.score_breakdown.link_boost < LINK_EXPANSION_BOOST {
+        let delta = LINK_EXPANSION_BOOST - result.score_breakdown.link_boost;
+        result.score_breakdown.link_boost = LINK_EXPANSION_BOOST;
+        result.score += delta;
+        changed = true;
+    }
+    refresh_evidence_count(result);
+    changed
+}
+
+fn outgoing_link_rowids(conn: &Connection, seed: &SearchResult) -> Result<Vec<i64>> {
+    let outgoing_json: Option<String> = conn
+        .query_row(
+            "SELECT links_json FROM chunks WHERE chunk_id = ?1 LIMIT 1",
+            params![seed.chunk_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let outgoing: Vec<String> = outgoing_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    if outgoing.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, title
+         FROM chunks
+         WHERE chunk_id != ?1",
+    )?;
+    let rows = stmt.query_map(params![seed.chunk_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut rowids = Vec::new();
+    for row in rows {
+        let (rowid, path, title) = row?;
+        if outgoing
+            .iter()
+            .any(|link| link_points_to(link, &path, title.as_deref()))
+        {
+            rowids.push(rowid);
+        }
+    }
+    Ok(rowids)
+}
+
+fn backlink_rowids(conn: &Connection, seed: &SearchResult) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, links_json
+         FROM chunks
+         WHERE chunk_id != ?1 AND links_json != '[]'",
+    )?;
+    let rows = stmt.query_map(params![seed.chunk_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut rowids = Vec::new();
+    for row in rows {
+        let (rowid, links_json) = row?;
+        let links: Vec<String> = serde_json::from_str(&links_json).unwrap_or_default();
+        if links
+            .iter()
+            .any(|link| link_points_to(link, &seed.path, seed.title.as_deref()))
+        {
+            rowids.push(rowid);
+        }
+    }
+    Ok(rowids)
+}
+
+fn refresh_evidence_count(result: &mut SearchResult) {
+    let link_count = result
+        .evidence
+        .links
+        .as_ref()
+        .map(|links| links.outgoing.len() + links.backlinks.len())
+        .unwrap_or(0);
+    result.evidence.evidence_count = result.evidence.sources.len() + link_count;
 }
 
 fn enrich_results(
@@ -1816,6 +2018,7 @@ fn build_result(
         route_boost,
         recency_boost: recency_boost(mtime),
         metadata_boost,
+        link_boost: 0.0,
     };
     let score = (keyword_score * 0.35)
         + (vector_score * 0.35)
@@ -1824,7 +2027,8 @@ fn build_result(
         + breakdown.tag_boost
         + breakdown.route_boost
         + breakdown.recency_boost
-        + metadata_boost;
+        + metadata_boost
+        + breakdown.link_boost;
     let snippet = snippet(text, query);
     let mut sources = Vec::new();
     if keyword_rank.is_some() || keyword_score > 0.0 {
@@ -1852,6 +2056,7 @@ fn build_result(
         score,
         score_breakdown: breakdown,
         evidence: SearchResultEvidence {
+            evidence_count: sources.len(),
             sources,
             keyword_rank,
             vector_rank,
@@ -3395,6 +3600,105 @@ mod tests {
             .sources
             .iter()
             .any(|source| source == "backlink"));
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn query_options_expand_obsidian_links_into_candidate_evidence() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!(
+            "orderk-link-expansion-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("alpha.md"),
+            "# Alpha\nneedle-hindsight-link-expansion lives here and points to [[Bravo]].\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("bravo.md"),
+            "# Bravo\nThis is the outbound linked note without the special needle.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("charlie.md"),
+            "# Charlie\nThis backlink note points back to [[Alpha]] without the special needle.\n",
+        )
+        .unwrap();
+
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-link-expansion-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        let res = IndexStore::query_with_options(
+            &conn,
+            "needle-hindsight-link-expansion",
+            &QueryOptions {
+                limit: 6,
+                expand_links: 1,
+                include_links: true,
+                ..QueryOptions::new(6)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        assert_eq!(res.routing.expand_links, 1);
+        assert!(res.routing.link_candidates >= 2, "{:#?}", res.routing);
+        assert!(res.routing.timings.keyword_ms <= res.took_ms);
+        assert!(res.routing.timings.vector_ms <= res.took_ms);
+        assert!(res.routing.timings.link_expansion_ms <= res.took_ms);
+
+        for expected_path in ["bravo.md", "charlie.md"] {
+            let linked = res
+                .results
+                .iter()
+                .find(|r| r.path == expected_path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{expected_path} should be expanded into results: {:#?}",
+                        res.results
+                    )
+                });
+            assert!(
+                linked
+                    .evidence
+                    .sources
+                    .iter()
+                    .any(|source| source == "link_expansion"),
+                "{linked:#?}"
+            );
+            assert!(
+                linked.score_breakdown.link_boost > 0.0,
+                "{:#?}",
+                linked.score_breakdown
+            );
+            assert!(linked.evidence.evidence_count >= linked.evidence.sources.len());
+        }
 
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);
