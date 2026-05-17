@@ -1,5 +1,7 @@
 export type OrderkSearchResultEvidence = {
   sources?: string[];
+  evidence_count?: number;
+  retrieval_depth?: number;
   keyword_rank?: number | null;
   vector_rank?: number | null;
   route?: string | null;
@@ -26,6 +28,13 @@ export type OrderkQueryRoutingEvidence = {
   strategy: string;
   route: string;
   routes_attempted: string[];
+  filter?: string | null;
+  filter_mode?: string | null;
+  min_score?: number | null;
+  context_chunks?: number;
+  include_links?: boolean;
+  expand_links?: number;
+  retrieval_depth?: number;
   keyword_candidates: number;
   vector_candidates: number;
   route_candidates: number;

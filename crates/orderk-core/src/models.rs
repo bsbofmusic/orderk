@@ -269,6 +269,8 @@ pub struct SearchResultEvidence {
     pub sources: Vec<String>,
     #[serde(default)]
     pub evidence_count: usize,
+    #[serde(default)]
+    pub retrieval_depth: usize,
     pub keyword_rank: Option<usize>,
     pub vector_rank: Option<usize>,
     pub route: Option<String>,
@@ -303,6 +305,8 @@ pub struct QueryOptions {
     pub rerank: bool,
     #[serde(default)]
     pub expand_links: usize,
+    #[serde(default)]
+    pub retrieval_depth: usize,
 }
 
 fn default_rerank() -> bool {
@@ -319,7 +323,18 @@ impl QueryOptions {
             include_links: false,
             rerank: default_rerank(),
             expand_links: 0,
+            retrieval_depth: 0,
         }
+    }
+
+    pub fn effective_retrieval_depth(&self) -> Result<usize, String> {
+        if self.expand_links > 1 {
+            return Err("--expand-links currently supports 0 or 1".to_string());
+        }
+        if self.retrieval_depth > 1 {
+            return Err("--retrieval-depth currently supports 0 or 1".to_string());
+        }
+        Ok(self.expand_links.max(self.retrieval_depth))
     }
 }
 
@@ -347,6 +362,8 @@ pub struct QueryRoutingEvidence {
     pub context_chunks: usize,
     pub include_links: bool,
     pub expand_links: usize,
+    #[serde(default)]
+    pub retrieval_depth: usize,
     pub keyword_candidates: usize,
     pub vector_candidates: usize,
     pub route_candidates: usize,

@@ -770,9 +770,9 @@ impl IndexStore {
                 return Err(anyhow!("--min-score must be a finite number"));
             }
         }
-        if options.expand_links > 1 {
-            return Err(anyhow!("--expand-links currently supports 0 or 1"));
-        }
+        let retrieval_depth = options
+            .effective_retrieval_depth()
+            .map_err(|err| anyhow!(err))?;
         let query_id = format!(
             "q_{}_{}",
             chrono::Utc::now().timestamp_micros(),
@@ -815,7 +815,7 @@ impl IndexStore {
                 options.rerank,
             )?,
         };
-        if options.expand_links > 0 {
+        if retrieval_depth > 0 {
             let expansion_started = Instant::now();
             routing.link_candidates = expand_link_candidates(
                 conn,
@@ -853,7 +853,8 @@ impl IndexStore {
         routing.min_score = options.min_score;
         routing.context_chunks = options.context_chunks;
         routing.include_links = options.include_links;
-        routing.expand_links = options.expand_links;
+        routing.expand_links = retrieval_depth;
+        routing.retrieval_depth = retrieval_depth;
         if filter_text.is_some() {
             routing.filtered_candidates = Some(filtered_candidates);
             routing.filter_mode = Some(match vector_backend {
@@ -1375,11 +1376,7 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
             results.push(result);
         }
     }
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_search_results(&mut results);
     timings.merge_ms = merge_started.elapsed().as_millis();
 
     let routing = QueryRoutingEvidence {
@@ -1394,6 +1391,7 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
         context_chunks: 0,
         include_links: false,
         expand_links: 0,
+        retrieval_depth: 0,
         keyword_candidates: keyword_scores.len(),
         vector_candidates: vector_scores.len(),
         route_candidates: route_scores.len(),
@@ -1519,11 +1517,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
         )?;
         scored.push(result);
     }
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_search_results(&mut scored);
     timings.vector_ms = vector_started.elapsed().as_millis();
     let total_candidates = scored.len();
     for (rank, result) in scored.iter_mut().enumerate() {
@@ -1550,6 +1544,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
         context_chunks: 0,
         include_links: false,
         expand_links: 0,
+        retrieval_depth: 0,
         keyword_candidates: 0,
         vector_candidates: total_candidates,
         route_candidates: route_matches,
@@ -1658,6 +1653,17 @@ fn load_chunk_result(
     .map(Some)
 }
 
+fn sort_search_results(results: &mut [SearchResult]) {
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line_start.cmp(&b.line_start))
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
+}
+
 fn expand_link_candidates(
     conn: &Connection,
     results: &mut Vec<SearchResult>,
@@ -1685,6 +1691,8 @@ fn expand_link_candidates(
             candidate_rowids.insert(rowid);
         }
     }
+    let mut candidate_rowids = candidate_rowids.into_iter().collect::<Vec<_>>();
+    candidate_rowids.sort_unstable();
 
     let mut by_chunk_id = results
         .iter()
@@ -1712,16 +1720,16 @@ fn expand_link_candidates(
         }
     }
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_search_results(results);
     Ok(touched)
 }
 
 fn apply_link_expansion_signal(result: &mut SearchResult) -> bool {
     let mut changed = false;
+    if result.evidence.retrieval_depth < 1 {
+        result.evidence.retrieval_depth = 1;
+        changed = true;
+    }
     if !result
         .evidence
         .sources
@@ -1779,6 +1787,8 @@ fn outgoing_link_rowids(conn: &Connection, seed: &SearchResult) -> Result<Vec<i6
             rowids.push(rowid);
         }
     }
+    rowids.sort_unstable();
+    rowids.dedup();
     Ok(rowids)
 }
 
@@ -1802,6 +1812,8 @@ fn backlink_rowids(conn: &Connection, seed: &SearchResult) -> Result<Vec<i64>> {
             rowids.push(rowid);
         }
     }
+    rowids.sort_unstable();
+    rowids.dedup();
     Ok(rowids)
 }
 
@@ -2062,6 +2074,7 @@ fn build_result(
             vector_rank,
             route: Some(plan.route.as_str().to_string()),
             route_score: route_boost,
+            retrieval_depth: 0,
             links: None,
         },
         context_chunks: Vec::new(),
@@ -3702,6 +3715,189 @@ mod tests {
 
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn query_options_retrieval_depth_one_marks_expanded_evidence() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!(
+            "orderk-retrieval-depth-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("alpha.md"),
+            "# Alpha\nneedle-graph-depth lives here and points to [[Bravo]].\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("bravo.md"),
+            "# Bravo\nThis linked note has no special needle.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("charlie.md"),
+            "# Charlie\nThis backlink note points to [[Alpha]] without the special needle.\n",
+        )
+        .unwrap();
+
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-retrieval-depth-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        let depth_zero = IndexStore::query_with_options(
+            &conn,
+            "needle-graph-depth",
+            &QueryOptions {
+                limit: 6,
+                retrieval_depth: 0,
+                ..QueryOptions::new(6)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert_eq!(depth_zero.routing.retrieval_depth, 0);
+        assert_eq!(depth_zero.routing.link_candidates, 0);
+        assert!(depth_zero
+            .results
+            .iter()
+            .all(|r| r.evidence.retrieval_depth == 0));
+        assert!(depth_zero.results.iter().all(|r| !r
+            .evidence
+            .sources
+            .iter()
+            .any(|s| s == "link_expansion")));
+
+        let depth_one = IndexStore::query_with_options(
+            &conn,
+            "needle-graph-depth",
+            &QueryOptions {
+                limit: 6,
+                retrieval_depth: 1,
+                include_links: true,
+                ..QueryOptions::new(6)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert_eq!(depth_one.routing.retrieval_depth, 1);
+        assert_eq!(depth_one.routing.expand_links, 1);
+        assert!(
+            depth_one.routing.link_candidates >= 2,
+            "{:#?}",
+            depth_one.routing
+        );
+
+        assert!(
+            depth_one
+                .results
+                .iter()
+                .any(|r| r.path == "alpha.md" && r.evidence.sources.iter().any(|s| s == "keyword")),
+            "direct matching result must stay present: {:#?}",
+            depth_one.results
+        );
+
+        for expected_path in ["bravo.md", "charlie.md"] {
+            let linked = depth_one
+                .results
+                .iter()
+                .find(|r| r.path == expected_path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{expected_path} should be expanded: {:#?}",
+                        depth_one.results
+                    )
+                });
+            assert_eq!(linked.evidence.retrieval_depth, 1, "{linked:#?}");
+            assert!(linked
+                .evidence
+                .sources
+                .iter()
+                .any(|s| s == "link_expansion"));
+            assert!(linked.score_breakdown.link_boost > 0.0);
+        }
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn query_options_retrieval_depth_rejects_gt_one() {
+        let vault = sample_vault();
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-retrieval-depth-invalid-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        let err = IndexStore::query_with_options(
+            &conn,
+            "alpha",
+            &QueryOptions {
+                limit: 3,
+                retrieval_depth: 2,
+                ..QueryOptions::new(3)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--retrieval-depth currently supports 0 or 1"));
+
+        let _ = fs::remove_dir_all(vault);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn query_options_retrieval_depth_aliases_expand_links() {
+        let options = QueryOptions {
+            limit: 4,
+            expand_links: 1,
+            retrieval_depth: 0,
+            ..QueryOptions::new(4)
+        };
+        assert_eq!(options.effective_retrieval_depth().unwrap(), 1);
     }
 
     #[test]

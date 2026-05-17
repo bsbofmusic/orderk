@@ -106,6 +106,7 @@ fn run() -> Result<()> {
             let context_chunks = take_usize(&mut args, "--context-chunks", 0)?;
             let include_links = take_flag(&mut args, "--include-links");
             let expand_links = take_usize(&mut args, "--expand-links", 0)?;
+            let retrieval_depth = take_usize(&mut args, "--retrieval-depth", 0)?;
             let rerank = !take_flag(&mut args, "--no-rerank");
             let provider = provider_from_name(
                 &embedding_provider,
@@ -123,6 +124,7 @@ fn run() -> Result<()> {
                     include_links,
                     rerank,
                     expand_links,
+                    retrieval_depth,
                 },
                 provider.as_ref(),
                 vector_backend,
@@ -748,6 +750,11 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
         .min(1) as usize;
+    let retrieval_depth = arguments
+        .get("retrieval_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(1) as usize;
     let rerank = arguments
         .get("rerank")
         .and_then(|v| v.as_bool())
@@ -768,6 +775,7 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
             include_links,
             rerank,
             expand_links,
+            retrieval_depth,
         },
         provider.as_ref(),
         config.vector_backend.clone(),
@@ -814,7 +822,8 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
                     "threshold": {"type": "number", "description": "Alias for min_score"},
                     "context_chunks": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
                     "include_links": {"type": "boolean", "default": false},
-                    "expand_links": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Expand recall one hop along indexed Obsidian wikilinks/backlinks; deterministic and off by default"},
+                    "retrieval_depth": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Retrieval depth over authored Obsidian wikilinks/backlinks: 0 direct only, 1 one-hop expansion; deterministic and off by default"},
+                    "expand_links": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Compatibility alias for retrieval_depth=1; expands recall one hop along indexed Obsidian wikilinks/backlinks"},
                     "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, etc.)"}
                 },
                 "required": ["query"]
@@ -927,7 +936,7 @@ fn print_usage() {
         "orderk <init|index|search|status|health|doctor|eval|maintain|mcp|feedback> [--flags]"
     );
     eprintln!(
-        "search flags include: --query <text> [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--expand-links 1] [--no-rerank]"
+        "search flags include: --query <text> [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--no-rerank]"
     );
 }
 
@@ -994,8 +1003,9 @@ mod tests {
 
     #[test]
     fn mcp_tool_surface_is_read_only() {
-        let names = mcp_tool_definitions()
-            .into_iter()
+        let tools = mcp_tool_definitions();
+        let names = tools
+            .iter()
             .filter_map(|tool| {
                 tool.get("name")
                     .and_then(|value| value.as_str())
@@ -1006,6 +1016,26 @@ mod tests {
         assert!(!names
             .iter()
             .any(|name| matches!(name.as_str(), "index" | "maintain" | "feedback")));
+
+        let search_tool = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(|v| v.as_str()) == Some("search"))
+            .expect("search tool must exist");
+        let retrieval_depth = search_tool
+            .pointer("/inputSchema/properties/retrieval_depth")
+            .expect("search tool schema must expose retrieval_depth");
+        assert_eq!(
+            retrieval_depth.get("minimum").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            retrieval_depth.get("maximum").and_then(|v| v.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            retrieval_depth.get("default").and_then(|v| v.as_i64()),
+            Some(0)
+        );
     }
 
     #[test]

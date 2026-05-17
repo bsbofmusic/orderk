@@ -58,10 +58,11 @@ v1 uses lightweight score fusion and query-aware routing:
 - vector similarity from sqlite-vec
 - reciprocal-rank fusion for keyword/vector candidate overlap
 - query routing for short / path / tag queries
-- optional one-hop Obsidian link expansion (`--expand-links 1`) that adds linked/backlink chunks as candidates with bounded `link_boost`
+- explicit retrieval depth over authored Obsidian links: `--retrieval-depth 0` returns direct keyword/vector/route candidates; `--retrieval-depth 1` adds one-hop wikilink/backlink chunks as candidates with bounded `link_boost`
+- compatibility alias `--expand-links 1` for the one-hop retrieval-depth mode
 - path/tag/recency boosts
 
-Each search result also carries structured `score_breakdown`, `evidence` with `evidence_count`, and tag metadata so agents can inspect why it surfaced. The response-level `routing.timings` reports keyword/vector/route/merge/link-expansion/enrichment stages for lightweight traceability.
+Each search result also carries structured `score_breakdown`, `evidence` with `evidence_count` and per-result `retrieval_depth`, and tag metadata so agents can inspect why it surfaced. The response-level `routing.timings` reports keyword/vector/route/merge/link-expansion/enrichment stages, while `routing.retrieval_depth` states whether authored graph-depth recall was active.
 
 No LLM reranker is used.
 
