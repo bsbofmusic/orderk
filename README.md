@@ -1,9 +1,10 @@
 # orderk
 
-orderk is a headless, ultra-light vector search plugin for Obsidian Markdown vaults.
+orderk is a tiny, local, read-only retrieval blade for Obsidian Markdown vaults.
 
-It is built for agents that need fast local retrieval.
-It is not a chat app, not an agent orchestrator, and not a note-writing system.
+It turns your vault into fast, structured evidence for humans, scripts, and AI agents. It does not write notes, generate summaries, run a background memory daemon, or try to become your second brain.
+
+Search your vault, feed agents grounded context, and keep your notes untouched.
 
 ## What it is
 
@@ -13,15 +14,69 @@ A fast, stable, low-overhead search blade:
 Obsidian vault -> scan -> parse -> chunk -> embed -> SQLite (FTS5 + sqlite-vec) -> JSON results
 ```
 
+Obsidian remains the place where knowledge lives. orderk is the retrieval layer beside it: small enough to forget, structured enough for automation, and strict enough to trust with agent workflows.
+
+The name is half serious: `order` for structure, `k` for knowledge at speed.
+
 ## Why orderk
 
-- **Headless first**: designed for CLI / agent / plugin automation.
-- **Rust core**: small surface area, fast startup, low memory.
-- **Single-file storage**: one SQLite DB for files, chunks, embeddings, FTS, and feedback.
-- **Hybrid retrieval**: keyword + vector + query-aware routing + path/tag/recency signals.
-- **Cloud embeddings**: production path uses SiliconFlow + BAAI/bge-m3.
-- **Obsidian-friendly**: keeps the vault workflow intact.
-- **No product bloat**: no chat, no note generation, no second-brain OS.
+Most knowledge tools try to become the place where your thinking happens. orderk does not. Your Markdown files remain the source of truth. orderk builds a disposable local SQLite index beside them and returns evidence through a CLI, JSON output, and a thin read-only MCP surface.
+
+It is built for people who want better recall without giving another app permission to rewrite their vault, run a hosted memory system, or turn search into a chat product.
+
+### Feature -> benefit
+
+| Feature | Benefit |
+|---|---|
+| Single Rust binary | Small surface area and fast startup. The installed Linux x64 binary for v0.1.6 is 23,323,368 bytes, about 22.2 MiB, under a 30 MiB release-gate ceiling. |
+| On-demand CLI | No always-on orderk daemon. Normal runtime is one command, one result, then exit. |
+| Low runtime memory | A status probe on the maintainer machine uses about 6.4 MiB max RSS; historical normal CLI probes sit around 6-8 MiB. |
+| Disposable SQLite index | Files, chunks, embeddings, FTS, vector rows, settings, and feedback live in one rebuildable DB. Delete the index and your Markdown vault is still intact. |
+| Hybrid retrieval | Keyword search, vector search, query-aware routing, path/tag/recency signals, and RRF-style fusion work together instead of pretending one score explains everything. |
+| Metadata-aware reranking | Paths, headings, tags, frontmatter, confidence, status, source type, and link evidence can influence rank without an LLM rewrite step. |
+| Obsidian-native evidence | Results can include snippets, headings, tags, wikilinks, backlinks, neighbor chunks, score breakdowns, and routing timings, so agents can explain what they found. |
+| Cheap embeddings by default | Production defaults use SiliconFlow + `BAAI/bge-m3` (`1024` dimensions), which is strong enough for everyday personal-vault recall without paying for a large memory platform. |
+| Read-only agent surface | CLI search and MCP expose retrieval, status, and health. They do not expose note writing, save, forget, chat, or index mutation tools. |
+| Obsidian workflow stays intact | No migration, no hosted workspace, no lock-in. Try it, rebuild it, or remove it without changing your notes. |
+
+### Benchmark snapshot
+
+These are maintainer-machine examples, not universal promises. They exist to make the "lightweight" claim falsifiable.
+
+| Metric | Example result |
+|---|---:|
+| Installed binary | 23,323,368 bytes (~22.2 MiB) |
+| Release binary budget | <= 30 MiB |
+| Status command max RSS | 6,400 KB |
+| Resident orderk daemon count | 0 |
+| Live vault notes | 1,117 |
+| Live vault chunks / embeddings | 6,164 / 6,164 |
+| Live SQLite index size | ~72 MiB |
+| Offline eval mean query time | 1-3 ms in local fixture runs |
+| Offline eval quality gate | 4/4 top-1 hits; recall@k, nDCG, and MRR all 1.0 |
+| Live semantic search example | 5 results in 1,575 ms, including the remote SiliconFlow embedding call |
+
+The local index path is millisecond-level. Live semantic search also asks the embedding provider for a fresh query vector, so network/provider latency can dominate. The point is simple: use cheap embeddings for recall, save expensive LLM calls for reasoning.
+
+### Fast, precise, sharp, stable
+
+| Constraint | How orderk handles it |
+|---|---|
+| Fast | Local SQLite index, small Rust binary, JSON-first CLI, no resident service. |
+| Precise | Hybrid keyword/vector retrieval, deterministic metadata boosts, Obsidian link evidence, and checked eval fixtures. |
+| Sharp | One job only: retrieve grounded evidence from your vault. |
+| Stable | Read-only design, profile guards, deterministic local ranking, disposable index, health/doctor/maintain gates. |
+
+### Smarter by stealing less
+
+orderk borrows useful ideas from memory tools without becoming one.
+
+- From Obsidian: local Markdown, links, headings, tags, and frontmatter.
+- From vector search: semantic recall.
+- From agent memory systems: structured retrieval APIs and evidence-rich context.
+- From ranking systems: fusion, metadata boosts, link expansion, and deterministic reranking.
+
+It rejects the heavy parts: note generation, automatic memory mutation, chat, hosted source of truth, hidden reflection loops, and always-on memory daemons.
 
 ## Architecture
 
