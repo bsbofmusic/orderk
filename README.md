@@ -101,7 +101,7 @@ Agent
 | Module | Responsibility |
 |---|---|
 | `crates/orderk-core` | scan, parse, chunk, embed, store, rank, return JSON |
-| `crates/orderk-cli` | native CLI entrypoint for index/search/status/health/doctor/eval/maintain/feedback |
+| `crates/orderk-cli` | native CLI entrypoint for index/search/status/health/doctor/eval/maintain/capsule/feedback |
 | `packages/cli` | npm wrapper that finds or downloads the native binary |
 | `packages/obsidian` | thin Obsidian desktop plugin wrapper |
 
@@ -262,7 +262,22 @@ orderk maintain \
 
 `maintain` emits `orderk.maintain.v1` JSON: nested health evidence, optional eval evidence, typed error codes, and a persisted report path when `--report-dir` is provided.
 
-### 9) Run eval
+### 9) Export / inspect a capsule manifest
+
+```bash
+orderk capsule export \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --vault /path/to/vault \
+  --out /path/to/orderk.capsule.json
+
+orderk capsule inspect \
+  --file /path/to/orderk.capsule.json \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite
+```
+
+A capsule manifest is a portable, self-describing JSON receipt for the SQLite index: schema/profile, note/chunk/embedding counts, DB + SQLite WAL/SHM sidecar size/checksum, and source vault pointer. It does not copy note contents, write Markdown, import/restore, expose MCP write tools, or replace the SQLite index. `capsule export --out` rejects paths inside the vault and paths that would overwrite the DB or SQLite sidecars.
+
+### 10) Run eval
 
 ```bash
 python3 scripts/eval.py
@@ -284,7 +299,8 @@ This is the shortest path for an agent or automation:
 6. Consume the JSON output directly. Search responses include `route`, `routing` with per-stage timings, `retrieval_depth`, and link expansion counts, per-result `score_breakdown`, `evidence` with `evidence_count` and per-result `retrieval_depth`, `tags`, `confidence`, `status`, `source_type`, optional neighbor `context_chunks`, and optional Obsidian link evidence.
 7. Use `--min-score`/`--threshold`, `--context-chunks`, `--include-links`, `--retrieval-depth 1`, `--expand-links 1`, `--filter`, and `--no-rerank` when an agent needs thicker evidence, authored one-hop graph recall, or wants deterministic metadata rerank disabled.
 8. If the client supports MCP, use `orderk mcp` for read-only `search`/`status`/`health` tools instead of asking the agent to guess shell flags.
-9. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
+9. Use `orderk capsule export` / `orderk capsule inspect` when an agent needs to verify that a portable SQLite index artifact still matches its recorded profile, counts, size, and checksum.
+10. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
 
 ### Obsidian plugin settings
 

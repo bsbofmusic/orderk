@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use orderk_core::{
-    classify_error_message, feedback, health_report, index_vault, init, provider_from_name, query,
-    query_with_options, status, EmbeddingProvider, FeedbackEvent, QueryOptions, VectorBackend,
+    classify_error_message, export_capsule_manifest, feedback, health_report, index_vault, init,
+    inspect_capsule_manifest, provider_from_name, query, query_with_options, status,
+    write_capsule_manifest, EmbeddingProvider, FeedbackEvent, QueryOptions, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -31,7 +32,11 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = env::args().skip(1).collect();
+    run_cli_args(args)
+}
+
+fn run_cli_args(mut args: Vec<String>) -> Result<()> {
     if args.is_empty() {
         print_usage();
         return Ok(());
@@ -140,6 +145,10 @@ fn run() -> Result<()> {
             let resp = health_like_command(&mut args, false)?;
             print_json(&resp)?;
         }
+        "capsule" => {
+            let resp = capsule_command(&mut args)?;
+            print_json(&resp)?;
+        }
         "doctor" => {
             let resp = health_like_command(&mut args, true)?;
             print_json(&resp)?;
@@ -193,6 +202,47 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn capsule_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    if args.is_empty() {
+        return Err(anyhow!("capsule requires a subcommand: export or inspect"));
+    }
+    let subcommand = args.remove(0);
+    match subcommand.as_str() {
+        "export" => {
+            let db = take_path(args, "--db")?;
+            let vault = take_optional_string(args, "--vault")?.map(PathBuf::from);
+            let out = take_optional_string(args, "--out")?.map(PathBuf::from);
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unexpected capsule export arguments: {}",
+                    args.join(" ")
+                ));
+            }
+            let manifest = if let Some(out_path) = out.as_ref() {
+                write_capsule_manifest(&db, vault.as_deref(), out_path)?
+            } else {
+                export_capsule_manifest(&db, vault.as_deref())?
+            };
+            Ok(serde_json::to_value(manifest)?)
+        }
+        "inspect" => {
+            let file = take_path(args, "--file")?;
+            let db = take_optional_string(args, "--db")?.map(PathBuf::from);
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unexpected capsule inspect arguments: {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(inspect_capsule_manifest(
+                &file,
+                db.as_deref(),
+            )?)?)
+        }
+        other => Err(anyhow!("unknown capsule subcommand: {other}")),
+    }
 }
 
 fn health_like_command(args: &mut Vec<String>, _doctor: bool) -> Result<serde_json::Value> {
@@ -931,13 +981,59 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
+    if args.is_empty() {
+        return Err(anyhow!("missing test command"));
+    }
+    let command = args.remove(0);
+    match command.as_str() {
+        "index" => {
+            let vault = take_path(&mut args, "--vault")?;
+            let db = take_path(&mut args, "--db")?;
+            let embedding_provider =
+                take_string(&mut args, "--embedding-provider", "mock".to_string())?;
+            let embedding_dim = take_usize(&mut args, "--embedding-dim", 8)?;
+            let embedding_model = take_string(
+                &mut args,
+                "--embedding-model",
+                format!("mock-{embedding_dim}"),
+            )?;
+            let vector_backend = parse_backend(&take_string(
+                &mut args,
+                "--vector-backend",
+                "exact".to_string(),
+            )?)?;
+            let provider = provider_from_name(
+                &embedding_provider,
+                embedding_dim,
+                Some(embedding_model.clone()),
+            )?;
+            Ok(serde_json::to_value(index_vault(
+                &vault,
+                &db,
+                provider.as_ref(),
+                embedding_dim,
+                &embedding_model,
+                vector_backend,
+            )?)?)
+        }
+        "capsule" => capsule_command(&mut args),
+        other => Err(anyhow!("unsupported test command: {other}")),
+    }
+}
+
 fn print_usage() {
     eprintln!(
-        "orderk <init|index|search|status|health|doctor|eval|maintain|mcp|feedback> [--flags]"
+        "orderk <init|index|search|status|health|doctor|eval|maintain|capsule|mcp|feedback> [--flags]"
     );
     eprintln!(
         "search flags include: --query <text> [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--no-rerank]"
     );
+    eprintln!(
+        "capsule export flags: --db <orderk.sqlite> [--vault <vault>] [--out <capsule.json>]"
+    );
+    eprintln!("capsule inspect flags: --file <capsule.json> [--db <orderk.sqlite>]");
 }
 
 #[derive(Debug, Deserialize)]
@@ -1036,6 +1132,104 @@ mod tests {
             retrieval_depth.get("default").and_then(|v| v.as_i64()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn capsule_cli_contract_exports_and_inspects_json_without_mcp_write_surface() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-capsule-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("note.md"), "# Note\nCapsule CLI proof.\n").unwrap();
+        let db = root.join("orderk.sqlite");
+        let out = root.join("capsule.json");
+
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let exported = run_with_args(vec![
+            "capsule".into(),
+            "export".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--out".into(),
+            out.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            exported.get("schema_version").and_then(|v| v.as_str()),
+            Some("orderk.capsule.v1")
+        );
+        assert!(out.is_file());
+
+        let inspected = run_with_args(vec![
+            "capsule".into(),
+            "inspect".into(),
+            "--file".into(),
+            out.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            inspected.get("schema_version").and_then(|v| v.as_str()),
+            Some("orderk.capsule_inspection.v1")
+        );
+        assert_eq!(inspected.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let tools = mcp_tool_definitions();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"capsule"));
+    }
+
+    #[test]
+    fn capsule_cli_rejects_unrecognized_extra_flags() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-capsule-extra-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("missing.sqlite");
+        let err = run_with_args(vec![
+            "capsule".into(),
+            "export".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--unexpected".into(),
+            "value".into(),
+        ])
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unexpected capsule export arguments"));
     }
 
     #[test]

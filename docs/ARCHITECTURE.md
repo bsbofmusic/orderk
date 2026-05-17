@@ -11,6 +11,7 @@ It now also exposes explicit health and evaluation contracts:
 - `doctor` for deeper probe + smoke query
 - `eval` for black-box retrieval regression checks
 - `maintain` for the cdper-style readiness/failure-ticket gate that nests health plus optional eval evidence and can persist a JSON report
+- `capsule export` / `capsule inspect` for a Memvid-inspired portable manifest that binds a SQLite index to schema/profile/counts/size/checksum without copying notes or replacing the DB
 
 ## Runtime flow
 
@@ -32,7 +33,9 @@ Obsidian thin wrapper
 
 ## Storage
 
-The default store is one SQLite file. It contains:
+The default store is one SQLite file. Capsule manifests are JSON receipts for that store: they record the DB path, combined DB/WAL/SHM byte size, aggregate SHA-256, per-file sidecar checksums, real SQLite settings schema/profile, and note/chunk/embedding counts. They are verification artifacts, not a replacement store or an import/restore format.
+
+It contains:
 
 - `files`
 - `chunks`
