@@ -114,6 +114,7 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let include_links = take_flag(&mut args, "--include-links");
             let expand_links = take_usize(&mut args, "--expand-links", 0)?;
             let retrieval_depth = take_usize(&mut args, "--retrieval-depth", 0)?;
+            let explain = take_flag(&mut args, "--explain");
             let rerank = !take_flag(&mut args, "--no-rerank");
             let provider = provider_from_name(
                 &embedding_provider,
@@ -132,6 +133,7 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
                     rerank,
                     expand_links,
                     retrieval_depth,
+                    explain,
                 },
                 provider.as_ref(),
                 vector_backend,
@@ -393,6 +395,20 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                 }
             }
         }
+        let mut matched_expected_phrases = Vec::new();
+        for phrase in &case.expected_phrases {
+            let needle = phrase.trim();
+            if needle.is_empty() {
+                continue;
+            }
+            let needle_lower = needle.to_lowercase();
+            if resp.results.iter().any(|result| {
+                expected_seen.contains(&result.path)
+                    && result.snippet.to_lowercase().contains(&needle_lower)
+            }) {
+                matched_expected_phrases.push(phrase.clone());
+            }
+        }
         if top_rank_hit {
             top1_hits += 1;
         }
@@ -423,6 +439,8 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             id: case.id.clone(),
             query: case.query.clone(),
             expected_paths: case.expected_paths.clone(),
+            expected_phrases: case.expected_phrases.clone(),
+            matched_expected_phrases,
             hit: found_rank.is_some(),
             rank: found_rank,
             top_path: resp.results.first().map(|r| r.path.clone()),
@@ -848,6 +866,10 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
         .get("rerank")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let explain = arguments
+        .get("explain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let view = arguments
         .get("view")
         .and_then(|v| v.as_str())
@@ -869,6 +891,7 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
             rerank,
             expand_links,
             retrieval_depth,
+            explain,
         },
         provider.as_ref(),
         config.vector_backend.clone(),
@@ -970,7 +993,8 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
                     "include_links": {"type": "boolean", "default": false},
                     "retrieval_depth": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Retrieval depth over authored Obsidian wikilinks/backlinks: 0 direct only, 1 one-hop expansion; deterministic and off by default"},
                     "expand_links": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Compatibility alias for retrieval_depth=1; expands recall one hop along indexed Obsidian wikilinks/backlinks"},
-                    "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, etc.)"}
+                    "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, etc.)"},
+                    "explain": {"type": "boolean", "default": false, "description": "Include deterministic retrieval trace metadata; off by default"}
                 },
                 "required": ["query"]
             }
@@ -1153,6 +1177,7 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                 "--vector-backend",
                 "exact".to_string(),
             )?)?;
+            let explain = take_flag(&mut args, "--explain");
             let provider = provider_from_name(
                 &embedding_provider,
                 embedding_dim,
@@ -1170,6 +1195,7 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                     rerank: !take_flag(&mut args, "--no-rerank"),
                     expand_links: take_usize(&mut args, "--expand-links", 0)?,
                     retrieval_depth: take_usize(&mut args, "--retrieval-depth", 0)?,
+                    explain,
                 },
                 provider.as_ref(),
                 vector_backend,
@@ -1221,7 +1247,7 @@ fn print_usage() {
         "orderk <init|index|search|get|status|health|doctor|eval|maintain|capsule|mcp|feedback> [--flags]"
     );
     eprintln!(
-        "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--no-rerank]"
+        "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--explain] [--no-rerank]"
     );
     eprintln!("get flags: --db <orderk.sqlite> (--chunk-id <id> | --ids <id,id>) [--detail full|summary] [--context-chunks <n>]");
     eprintln!(
@@ -1243,6 +1269,8 @@ struct EvalCase {
     id: String,
     query: String,
     expected_paths: Vec<String>,
+    #[serde(default)]
+    expected_phrases: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1250,6 +1278,10 @@ struct EvalCaseResult {
     id: String,
     query: String,
     expected_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expected_phrases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    matched_expected_phrases: Vec<String>,
     hit: bool,
     rank: Option<usize>,
     top_path: Option<String>,
@@ -1583,6 +1615,90 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .contains("refresh token"));
+    }
+
+    #[test]
+    fn eval_expected_phrases_must_match_expected_path_snippets_only() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-eval-phrase-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("expected.md"),
+            "# Expected\nalpha unique expected path has local evidence only.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("decoy.md"),
+            "# Decoy\nborrowed phrase lives only in the decoy result.\n",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let queries = root.join("queries.json");
+        fs::write(
+            &queries,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "orderk.eval_queries.v1",
+                "queries": [{
+                    "id": "phrase-path-binding",
+                    "query": "alpha unique expected path",
+                    "expected_paths": ["expected.md"],
+                    "expected_phrases": ["borrowed phrase"]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let report = eval_command(&mut vec![
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--queries".into(),
+            queries.to_string_lossy().to_string(),
+            "--limit".into(),
+            "5".into(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let outcome = report["outcomes"]
+            .as_array()
+            .and_then(|outcomes| outcomes.first())
+            .expect("eval returns the test case outcome");
+        assert_eq!(outcome.get("hit").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            outcome.get("matched_expected_phrases").is_none(),
+            "decoy-only phrase must not satisfy expected path evidence: {outcome}"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

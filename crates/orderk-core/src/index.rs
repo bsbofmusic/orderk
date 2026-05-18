@@ -19,6 +19,96 @@ static SQLITE_VEC_REGISTER: Once = Once::new();
 const LINK_EXPANSION_BOOST: f32 = 0.03;
 const LINK_EXPANSION_SEED_LIMIT: usize = 10;
 
+fn encode_uri_component(input: &str) -> String {
+    let mut out = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn evidence_uri(chunk_id: &str) -> String {
+    format!("orderk://chunk/{}", encode_uri_component(chunk_id))
+}
+
+fn open_uri(path: &str, line_start: usize) -> String {
+    format!(
+        "obsidian://open?path={}&line={}",
+        encode_uri_component(path),
+        line_start
+    )
+}
+
+fn build_query_explain_trace(
+    routing: &QueryRoutingEvidence,
+    results: &[SearchResult],
+    vector_backend: &str,
+    limit: usize,
+) -> QueryExplainTrace {
+    QueryExplainTrace {
+        schema_version: "orderk.explain_trace.v1".to_string(),
+        route: routing.route.clone(),
+        strategy: routing.strategy.clone(),
+        vector_backend: vector_backend.to_string(),
+        limit,
+        returned: results.len(),
+        filter: routing.filter.clone(),
+        min_score: routing.min_score,
+        retrieval_depth: routing.retrieval_depth,
+        timings: routing.timings.clone(),
+        stages: vec![
+            QueryExplainStage {
+                name: "keyword".to_string(),
+                candidates: routing.keyword_candidates,
+                took_ms: routing.timings.keyword_ms,
+            },
+            QueryExplainStage {
+                name: "vector".to_string(),
+                candidates: routing.vector_candidates,
+                took_ms: routing.timings.vector_ms,
+            },
+            QueryExplainStage {
+                name: "route".to_string(),
+                candidates: routing.route_candidates,
+                took_ms: routing.timings.route_ms,
+            },
+            QueryExplainStage {
+                name: "link_expansion".to_string(),
+                candidates: routing.link_candidates,
+                took_ms: routing.timings.link_expansion_ms,
+            },
+            QueryExplainStage {
+                name: "merge".to_string(),
+                candidates: routing.merged_candidates,
+                took_ms: routing.timings.merge_ms,
+            },
+            QueryExplainStage {
+                name: "enrich".to_string(),
+                candidates: results.len(),
+                took_ms: routing.timings.enrich_ms,
+            },
+        ],
+        result_ranks: results
+            .iter()
+            .enumerate()
+            .map(|(idx, result)| QueryExplainResult {
+                rank: idx + 1,
+                chunk_id: result.chunk_id.clone(),
+                path: result.path.clone(),
+                score: result.score,
+                sources: result.evidence.sources.clone(),
+                keyword_rank: result.evidence.keyword_rank,
+                vector_rank: result.evidence.vector_rank,
+            })
+            .collect(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryRoute {
     Semantic,
@@ -864,6 +954,16 @@ impl IndexStore {
         }
         routing.filter = filter_text;
         routing.timings.total_ms = started.elapsed().as_millis();
+        let explain = if options.explain {
+            Some(build_query_explain_trace(
+                &routing,
+                &results,
+                vector_backend.as_str(),
+                limit,
+            ))
+        } else {
+            None
+        };
         Ok(QueryResponse {
             query: query.to_string(),
             query_id,
@@ -872,6 +972,7 @@ impl IndexStore {
             route: plan.route.as_str().to_string(),
             routing,
             vector_backend: vector_backend.as_str().to_string(),
+            explain,
             results,
         })
     }
@@ -1950,6 +2051,8 @@ fn load_chunk_by_chunk_id(
         ChunkGetDetail::Full => text,
         ChunkGetDetail::Summary => snippet(&text, ""),
     };
+    let evidence_uri = evidence_uri(&chunk_id);
+    let open_uri = open_uri(&path, line_start);
     Ok(Some(ChunkGetResult {
         chunk_id,
         path,
@@ -1957,6 +2060,8 @@ fn load_chunk_by_chunk_id(
         heading,
         line_start,
         line_end,
+        evidence_uri,
+        open_uri,
         text,
         tags,
         confidence,
@@ -2236,6 +2341,8 @@ fn build_result(
         heading,
         line_start,
         line_end,
+        evidence_uri: evidence_uri(chunk_id),
+        open_uri: open_uri(path, line_start),
         snippet,
         score,
         score_breakdown: breakdown,
@@ -2494,6 +2601,14 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn open_uri_percent_encodes_path_query_component() {
+        assert_eq!(
+            open_uri("dir/a b&c?.md", 12),
+            "obsidian://open?path=dir%2Fa%20b%26c%3F.md&line=12"
+        );
+    }
+
     #[derive(Debug, Clone)]
     struct CountingMockEmbeddingProvider {
         inner: MockEmbeddingProvider,
@@ -2654,6 +2769,13 @@ mod tests {
         assert!(response.results[0]
             .text
             .contains("Compact recall get boundary text"));
+        assert!(response.results[0]
+            .evidence_uri
+            .starts_with("orderk://chunk/"));
+        assert_eq!(
+            response.results[0].open_uri,
+            open_uri(&response.results[0].path, response.results[0].line_start)
+        );
 
         let missing = IndexStore::get_chunks(
             &conn,
@@ -2678,6 +2800,65 @@ mod tests {
         .unwrap();
         assert_eq!(summary.results.len(), 1);
         assert!(summary.results[0].text.len() <= 180);
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn query_explain_trace_is_opt_in_and_mechanical() {
+        let vault = sample_vault();
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-explain-trace-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+
+        let mut options = QueryOptions::new(5);
+        let without_explain = IndexStore::query_with_options(
+            &conn,
+            "sqlite vec semantic search",
+            &options,
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        assert!(without_explain.explain.is_none());
+
+        options.explain = true;
+        let with_explain = IndexStore::query_with_options(
+            &conn,
+            "sqlite vec semantic search",
+            &options,
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        let explain = with_explain
+            .explain
+            .expect("--explain should include a trace");
+        assert_eq!(explain.schema_version, "orderk.explain_trace.v1");
+        assert!(explain.stages.iter().any(|stage| stage.name == "vector"));
+        assert!(explain.stages.iter().any(|stage| stage.name == "merge"));
+        assert_eq!(explain.returned, with_explain.results.len());
+        assert_eq!(explain.route, with_explain.route);
 
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);

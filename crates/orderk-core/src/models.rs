@@ -307,6 +307,8 @@ pub struct QueryOptions {
     pub expand_links: usize,
     #[serde(default)]
     pub retrieval_depth: usize,
+    #[serde(default)]
+    pub explain: bool,
 }
 
 fn default_rerank() -> bool {
@@ -324,6 +326,7 @@ impl QueryOptions {
             rerank: default_rerank(),
             expand_links: 0,
             retrieval_depth: 0,
+            explain: false,
         }
     }
 
@@ -335,6 +338,17 @@ impl QueryOptions {
             return Err("--retrieval-depth currently supports 0 or 1".to_string());
         }
         Ok(self.expand_links.max(self.retrieval_depth))
+    }
+}
+
+#[cfg(test)]
+mod model_contract_tests {
+    use super::*;
+
+    #[test]
+    fn query_options_default_keeps_explain_trace_off() {
+        let options = QueryOptions::new(3);
+        assert!(!options.explain);
     }
 }
 
@@ -374,6 +388,40 @@ pub struct QueryRoutingEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryExplainStage {
+    pub name: String,
+    pub candidates: usize,
+    pub took_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryExplainResult {
+    pub rank: usize,
+    pub chunk_id: String,
+    pub path: String,
+    pub score: f32,
+    pub sources: Vec<String>,
+    pub keyword_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryExplainTrace {
+    pub schema_version: String,
+    pub route: String,
+    pub strategy: String,
+    pub vector_backend: String,
+    pub limit: usize,
+    pub returned: usize,
+    pub filter: Option<String>,
+    pub min_score: Option<f32>,
+    pub retrieval_depth: usize,
+    pub timings: QueryTimings,
+    pub stages: Vec<QueryExplainStage>,
+    pub result_ranks: Vec<QueryExplainResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub chunk_id: String,
     pub file_path: String,
@@ -382,6 +430,10 @@ pub struct SearchResult {
     pub heading: Option<String>,
     pub line_start: usize,
     pub line_end: usize,
+    #[serde(default)]
+    pub evidence_uri: String,
+    #[serde(default)]
+    pub open_uri: String,
     pub snippet: String,
     pub score: f32,
     pub score_breakdown: ScoreBreakdown,
@@ -404,6 +456,8 @@ pub struct QueryResponse {
     pub route: String,
     pub routing: QueryRoutingEvidence,
     pub vector_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<QueryExplainTrace>,
     pub results: Vec<SearchResult>,
 }
 
@@ -416,6 +470,10 @@ pub struct SearchIndexEntry {
     pub heading: Option<String>,
     pub line_start: usize,
     pub line_end: usize,
+    #[serde(default)]
+    pub evidence_uri: String,
+    #[serde(default)]
+    pub open_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,6 +487,8 @@ pub struct SearchIndexResponse {
     pub route: String,
     pub routing: QueryRoutingEvidence,
     pub vector_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<QueryExplainTrace>,
     pub results: Vec<SearchIndexEntry>,
 }
 
@@ -448,8 +508,11 @@ impl From<QueryResponse> for SearchIndexResponse {
                 heading: result.heading,
                 line_start: result.line_start,
                 line_end: result.line_end,
+                evidence_uri: result.evidence_uri,
+                open_uri: result.open_uri,
             })
             .collect();
+        let explain = response.explain;
         Self {
             schema_version: "orderk.search_index.v1".to_string(),
             query: response.query,
@@ -460,6 +523,7 @@ impl From<QueryResponse> for SearchIndexResponse {
             route: response.route,
             routing: response.routing,
             vector_backend: response.vector_backend,
+            explain,
             results,
         }
     }
@@ -502,6 +566,10 @@ pub struct ChunkGetResult {
     pub heading: Option<String>,
     pub line_start: usize,
     pub line_end: usize,
+    #[serde(default)]
+    pub evidence_uri: String,
+    #[serde(default)]
+    pub open_uri: String,
     pub text: String,
     pub tags: Vec<String>,
     pub confidence: Option<String>,

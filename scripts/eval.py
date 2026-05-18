@@ -121,6 +121,21 @@ def validate_eval_quality(report: dict[str, Any], baseline: dict[str, Any]) -> d
             expected = float(case_thresholds["min_ndcg_at_k"])
             if not isinstance(ndcg, (int, float)) or isinstance(ndcg, bool) or float(ndcg) < expected:
                 failures.append(f"case {case_id} ndcg_at_k {ndcg} < {expected}")
+        expected_phrases = case.get("expected_phrases", [])
+        if expected_phrases:
+            if not isinstance(expected_phrases, list):
+                failures.append(f"case {case_id} expected_phrases must be a list")
+                expected_phrases = []
+            matched_expected_phrases = case.get("matched_expected_phrases", [])
+            if not isinstance(matched_expected_phrases, list):
+                matched_expected_phrases = []
+            matched_set = {phrase for phrase in matched_expected_phrases if isinstance(phrase, str)}
+            for phrase in expected_phrases:
+                if not isinstance(phrase, str) or not phrase.strip():
+                    failures.append(f"case {case_id} expected phrase must be a non-empty string")
+                    continue
+                if phrase not in matched_set:
+                    failures.append(f"case {case_id} missing expected phrase: {phrase}")
 
     return {
         "schema_version": "orderk.eval_quality_gate.v1",
