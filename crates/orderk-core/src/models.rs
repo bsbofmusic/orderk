@@ -78,6 +78,45 @@ pub struct Chunk {
     pub updated: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexOptions {
+    #[serde(default = "default_chunk_max_chars")]
+    pub chunk_max_chars: usize,
+    #[serde(default)]
+    pub chunk_overlap_chars: usize,
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            chunk_max_chars: default_chunk_max_chars(),
+            chunk_overlap_chars: 0,
+        }
+    }
+}
+
+impl IndexOptions {
+    pub fn normalized(&self) -> Self {
+        let chunk_max_chars = self.chunk_max_chars.max(200);
+        Self {
+            chunk_max_chars,
+            chunk_overlap_chars: self.chunk_overlap_chars.min(chunk_max_chars / 2),
+        }
+    }
+
+    pub fn strategy(&self) -> &'static str {
+        if self.normalized().chunk_overlap_chars > 0 {
+            "heading_overlap"
+        } else {
+            "heading"
+        }
+    }
+}
+
+pub fn default_chunk_max_chars() -> usize {
+    1200
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSummary {
     pub ok: bool,
@@ -94,6 +133,12 @@ pub struct IndexSummary {
     pub embedding_provider: String,
     pub embedding_model: String,
     pub vector_backend: String,
+    #[serde(default)]
+    pub chunk_strategy: String,
+    #[serde(default = "default_chunk_max_chars")]
+    pub chunk_max_chars: usize,
+    #[serde(default)]
+    pub chunk_overlap_chars: usize,
     pub took_ms: u128,
 }
 
@@ -260,6 +305,8 @@ pub struct ScoreBreakdown {
     pub status_boost: f32,
     #[serde(default)]
     pub evidence_count_boost: f32,
+    #[serde(default)]
+    pub reranker_boost: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -394,6 +441,10 @@ pub struct QueryOptions {
     pub as_of: Option<String>,
     #[serde(default)]
     pub include_stale: bool,
+    #[serde(default)]
+    pub query_expansion: bool,
+    #[serde(default)]
+    pub external_reranker: bool,
 }
 
 fn default_rerank() -> bool {
@@ -415,6 +466,8 @@ impl QueryOptions {
             freshness: FreshnessMode::default(),
             as_of: None,
             include_stale: false,
+            query_expansion: false,
+            external_reranker: false,
         }
     }
 
@@ -466,6 +519,12 @@ pub struct QueryRoutingEvidence {
     pub expand_links: usize,
     #[serde(default)]
     pub retrieval_depth: usize,
+    #[serde(default)]
+    pub query_expansion: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query_expansion_terms: Vec<String>,
+    #[serde(default)]
+    pub external_reranker: bool,
     pub keyword_candidates: usize,
     pub vector_candidates: usize,
     pub route_candidates: usize,

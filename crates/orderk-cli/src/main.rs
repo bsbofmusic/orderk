@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Result};
 use orderk_core::{
     classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
-    index_vault, init, inspect_capsule_manifest, provider_from_name, query, query_with_options,
-    status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider,
-    FeedbackEvent, FreshnessMode, QueryOptions, SearchIndexResponse, VectorBackend,
+    index_vault_with_options, init, inspect_capsule_manifest, provider_from_name, query,
+    query_with_options, status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions,
+    EmbeddingProvider, FeedbackEvent, FreshnessMode, IndexOptions, QueryOptions, QueryResponse,
+    SearchIndexResponse, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -49,6 +50,7 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
 
     let cmd = args.remove(0);
     let _json = take_flag(&mut args, "--json");
+    let json_lines = take_flag(&mut args, "--json-lines");
     match cmd.as_str() {
         "init" => {
             let db = take_path(&mut args, "--db")?;
@@ -77,18 +79,24 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
                 "--vector-backend",
                 "sqlite_vec".to_string(),
             )?)?;
+            let chunk_max_chars = take_usize(&mut args, "--chunk-max-chars", 1200)?;
+            let chunk_overlap_chars = take_usize(&mut args, "--chunk-overlap", 0)?;
             let provider = provider_from_name(
                 &embedding_provider,
                 embedding_dim,
                 Some(embedding_model.clone()),
             )?;
-            let summary = index_vault(
+            let summary = index_vault_with_options(
                 &vault,
                 &db,
                 provider.as_ref(),
                 embedding_dim,
                 &embedding_model,
                 vector_backend,
+                &IndexOptions {
+                    chunk_max_chars,
+                    chunk_overlap_chars,
+                },
             )?;
             print_json(&summary)?;
         }
@@ -116,6 +124,8 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let retrieval_depth = take_usize(&mut args, "--retrieval-depth", 0)?;
             let explain = take_flag(&mut args, "--explain");
             let rerank = !take_flag(&mut args, "--no-rerank");
+            let query_expansion = take_flag(&mut args, "--query-expansion") || take_flag(&mut args, "--expand-query");
+            let external_reranker = parse_reranker_flag(&mut args)?;
             let freshness = parse_freshness(&take_string(
                 &mut args,
                 "--freshness",
@@ -144,14 +154,20 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
                     freshness,
                     as_of,
                     include_stale,
+                    query_expansion,
+                    external_reranker,
                 },
                 provider.as_ref(),
                 vector_backend,
             )?;
-            match view.as_str() {
-                "full" => print_json(&resp)?,
-                "index" => print_json(&SearchIndexResponse::from(resp))?,
-                other => return Err(anyhow!("unknown search view: {other}")),
+            if json_lines {
+                print_search_json_lines(resp, &view)?;
+            } else {
+                match view.as_str() {
+                    "full" => print_json(&resp)?,
+                    "index" => print_json(&SearchIndexResponse::from(resp))?,
+                    other => return Err(anyhow!("unknown search view: {other}")),
+                }
             }
         }
         "get" => {
@@ -330,6 +346,8 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let db = take_path(args, "--db")?;
     let queries_path = take_path(args, "--queries")?;
     let limit = take_usize(args, "--limit", 10)?;
+    let ab_chunk_overlap = take_optional_usize(args, "--ab-chunk-overlap")?;
+    let ab_vault = take_optional_string(args, "--vault")?.map(PathBuf::from);
     let embedding_provider = take_string(args, "--embedding-provider", "siliconflow".to_string())?;
     let embedding_dim = take_usize(args, "--embedding-dim", 1024)?;
     let embedding_model = take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?;
@@ -344,7 +362,7 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         Some(embedding_model.clone()),
     )?;
 
-    let raw = fs::read_to_string(queries_path)?;
+    let raw = fs::read_to_string(&queries_path)?;
     let spec: EvalFile = serde_json::from_str(&raw)?;
     if let Some(schema_version) = spec.schema_version.as_deref() {
         if schema_version != "orderk.eval_queries.v1" {
@@ -478,13 +496,71 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         ndcg_at_k: ndcg_sum / total as f32,
         mrr,
         mean_took_ms,
-        embedding_provider,
-        embedding_model,
+        embedding_provider: embedding_provider.clone(),
+        embedding_model: embedding_model.clone(),
         embedding_dim,
         vector_backend: vector_backend.as_str().to_string(),
         outcomes,
     };
-    Ok(serde_json::to_value(response)?)
+    let baseline = serde_json::to_value(&response)?;
+    if let Some(overlap) = ab_chunk_overlap {
+        let vault = ab_vault
+            .as_deref()
+            .ok_or_else(|| anyhow!("eval --ab-chunk-overlap requires --vault"))?;
+        let scratch = env::temp_dir().join(format!(
+            "orderk-eval-ab-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir_all(&scratch)?;
+        let candidate_db = scratch.join("candidate.sqlite");
+        let candidate_index = index_vault_with_options(
+            vault,
+            &candidate_db,
+            provider.as_ref(),
+            embedding_dim,
+            &embedding_model,
+            vector_backend.clone(),
+            &IndexOptions {
+                chunk_max_chars: 1200,
+                chunk_overlap_chars: overlap,
+            },
+        )?;
+        let mut candidate_args = vec![
+            "--db".to_string(),
+            candidate_db.to_string_lossy().to_string(),
+            "--queries".to_string(),
+            queries_path.to_string_lossy().to_string(),
+            "--limit".to_string(),
+            limit.to_string(),
+            "--embedding-provider".to_string(),
+            embedding_provider.clone(),
+            "--embedding-dim".to_string(),
+            embedding_dim.to_string(),
+            "--embedding-model".to_string(),
+            embedding_model.clone(),
+            "--vector-backend".to_string(),
+            vector_backend.as_str().to_string(),
+        ];
+        let candidate = eval_command(&mut candidate_args)?;
+        let candidate_mrr = candidate.get("mrr").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let baseline_mrr = baseline.get("mrr").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        return Ok(json!({
+            "schema_version": "orderk.eval_ab.v1",
+            "ok": baseline.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+                && candidate.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+            "baseline": baseline,
+            "candidate": candidate,
+            "candidate_index": candidate_index,
+            "delta": {
+                "mrr": candidate_mrr - baseline_mrr,
+                "chunk_overlap_chars": overlap,
+                "chunk_strategy": "heading_overlap"
+            },
+            "scratch_dir": scratch.to_string_lossy().to_string()
+        }));
+    }
+    Ok(baseline)
 }
 
 fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
@@ -919,6 +995,8 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
             freshness,
             as_of,
             include_stale,
+            query_expansion: false,
+            external_reranker: false,
         },
         provider.as_ref(),
         config.vector_backend.clone(),
@@ -1133,6 +1211,29 @@ fn take_usize(args: &mut Vec<String>, name: &str, default: usize) -> Result<usiz
         .map_err(|_| anyhow!("{} must be a positive integer", name))
 }
 
+fn take_optional_usize(args: &mut Vec<String>, name: &str) -> Result<Option<usize>> {
+    let Some(raw) = take_optional_string(args, name)? else {
+        return Ok(None);
+    };
+    raw.parse()
+        .map(Some)
+        .map_err(|_| anyhow!("{} must be a positive integer", name))
+}
+
+fn parse_reranker_flag(args: &mut Vec<String>) -> Result<bool> {
+    if take_flag(args, "--lexical-reranker") {
+        return Ok(true);
+    }
+    let Some(raw) = take_optional_string(args, "--reranker")? else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "none" | "off" | "false" => Ok(false),
+        "lexical" => Ok(true),
+        other => Err(anyhow!("unknown reranker: {other} (expected lexical|none)")),
+    }
+}
+
 fn take_optional_f32(args: &mut Vec<String>, name: &str) -> Result<Option<f32>> {
     let Some(raw) = take_optional_string(args, name)? else {
         return Ok(None);
@@ -1164,6 +1265,64 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+fn print_search_json_lines(response: QueryResponse, view: &str) -> Result<()> {
+    for line in search_json_lines(response, view)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn search_json_lines(response: QueryResponse, view: &str) -> Result<Vec<String>> {
+    match view {
+        "full" => {
+            let query = response.query.clone();
+            let query_id = response.query_id.clone();
+            let took_ms = response.took_ms;
+            response
+                .results
+                .into_iter()
+                .enumerate()
+                .map(|(idx, result)| {
+                    serde_json::to_string(&json!({
+                        "schema_version": "orderk.search_result_line.v1",
+                        "view": "full",
+                        "query": query,
+                        "query_id": query_id,
+                        "rank": idx + 1,
+                        "took_ms": took_ms,
+                        "result": result,
+                    }))
+                    .map_err(Into::into)
+                })
+                .collect()
+        }
+        "index" => {
+            let index = SearchIndexResponse::from(response);
+            let query = index.query.clone();
+            let query_id = index.query_id.clone();
+            let took_ms = index.took_ms;
+            index
+                .results
+                .into_iter()
+                .enumerate()
+                .map(|(idx, result)| {
+                    serde_json::to_string(&json!({
+                        "schema_version": "orderk.search_result_line.v1",
+                        "view": "index",
+                        "query": query,
+                        "query_id": query_id,
+                        "rank": idx + 1,
+                        "took_ms": took_ms,
+                        "result": result,
+                    }))
+                    .map_err(Into::into)
+                })
+                .collect()
+        }
+        other => Err(anyhow!("unknown search view: {other}")),
+    }
+}
+
 #[cfg(test)]
 fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
     if args.is_empty() {
@@ -1187,18 +1346,24 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                 "--vector-backend",
                 "exact".to_string(),
             )?)?;
+            let chunk_max_chars = take_usize(&mut args, "--chunk-max-chars", 1200)?;
+            let chunk_overlap_chars = take_usize(&mut args, "--chunk-overlap", 0)?;
             let provider = provider_from_name(
                 &embedding_provider,
                 embedding_dim,
                 Some(embedding_model.clone()),
             )?;
-            Ok(serde_json::to_value(index_vault(
+            Ok(serde_json::to_value(index_vault_with_options(
                 &vault,
                 &db,
                 provider.as_ref(),
                 embedding_dim,
                 &embedding_model,
                 vector_backend,
+                &IndexOptions {
+                    chunk_max_chars,
+                    chunk_overlap_chars,
+                },
             )?)?)
         }
         "search" => {
@@ -1220,6 +1385,8 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                 "exact".to_string(),
             )?)?;
             let explain = take_flag(&mut args, "--explain");
+            let query_expansion = take_flag(&mut args, "--query-expansion") || take_flag(&mut args, "--expand-query");
+            let external_reranker = parse_reranker_flag(&mut args)?;
             let freshness = parse_freshness(&take_string(
                 &mut args,
                 "--freshness",
@@ -1248,6 +1415,8 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                     freshness,
                     as_of,
                     include_stale,
+                    query_expansion,
+                    external_reranker,
                 },
                 provider.as_ref(),
                 vector_backend,
@@ -1299,9 +1468,10 @@ fn print_usage() {
         "orderk <init|index|search|get|status|health|doctor|eval|maintain|capsule|mcp|feedback> [--flags]"
     );
     eprintln!(
-        "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--explain] [--no-rerank]"
+        "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--query-expansion] [--reranker lexical|none] [--json-lines] [--explain] [--no-rerank]"
     );
-    eprintln!("get flags: --db <orderk.sqlite> (--chunk-id <id> | --ids <id,id>) [--detail full|summary] [--context-chunks <n>]");
+    eprintln!("index flags: --vault <path> --db <orderk.sqlite> [--chunk-max-chars <n>] [--chunk-overlap <n>]");
+    eprintln!("eval flags: --db <orderk.sqlite> --queries <queries.json> [--ab-chunk-overlap <n>] [--vault <path>]");
     eprintln!(
         "capsule export flags: --db <orderk.sqlite> [--vault <vault>] [--out <capsule.json>]"
     );
@@ -1878,6 +2048,104 @@ Temporal quality summary needle keeps evidence readable.
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .starts_with("orderk://chunk/"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_json_lines_contract_emits_one_json_object_per_result() {
+        let response = QueryResponse {
+            query: "rag".to_string(),
+            query_id: "q_test".to_string(),
+            took_ms: 7,
+            mode: "exact".to_string(),
+            route: "short".to_string(),
+            routing: Default::default(),
+            vector_backend: "exact".to_string(),
+            explain: None,
+            results: vec![orderk_core::SearchResult {
+                chunk_id: "chk_test".to_string(),
+                file_path: "rag.md".to_string(),
+                path: "rag.md".to_string(),
+                title: Some("RAG".to_string()),
+                heading: Some("RAG".to_string()),
+                line_start: 1,
+                line_end: 2,
+                evidence_uri: "orderk://chunk/chk_test".to_string(),
+                open_uri: "obsidian://open?path=rag.md&line=1".to_string(),
+                snippet: "retrieval augmented generation".to_string(),
+                score: 1.0,
+                score_breakdown: Default::default(),
+                evidence: Default::default(),
+                quality: Default::default(),
+                evidence_summary: Default::default(),
+                context_chunks: Vec::new(),
+                tags: Vec::new(),
+                confidence: None,
+                status: None,
+                source_type: None,
+                validity: Default::default(),
+                valid_from: None,
+                valid_until: None,
+                supersedes: None,
+                superseded_by: None,
+                updated: None,
+                mtime: None,
+            }],
+        };
+        let lines = search_json_lines(response, "index").unwrap();
+        assert_eq!(lines.len(), 1);
+        let line: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(
+            line.get("schema_version").and_then(|v| v.as_str()),
+            Some("orderk.search_result_line.v1")
+        );
+        assert_eq!(line.get("rank").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            line.pointer("/result/path").and_then(|v| v.as_str()),
+            Some("rag.md")
+        );
+    }
+
+    #[test]
+    fn index_cli_contract_exposes_chunk_overlap_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-overlap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("overlap.md"),
+            "# RAG
+Retrieval augmented generation uses embeddings and bm25.
+",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        let indexed = run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+            "--chunk-overlap".into(),
+            "80".into(),
+        ])
+        .unwrap();
+        assert_eq!(indexed.get("chunk_overlap_chars").and_then(|v| v.as_u64()), Some(80));
+        assert_eq!(indexed.get("chunk_strategy").and_then(|v| v.as_str()), Some("heading_overlap"));
         let _ = fs::remove_dir_all(root);
     }
 

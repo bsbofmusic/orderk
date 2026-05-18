@@ -1,4 +1,4 @@
-use crate::chunker::{chunk_document, has_code, has_incomplete_tasks, has_link, has_task_list};
+use crate::chunker::{chunk_document_with_options, has_code, has_incomplete_tasks, has_link, has_task_list, ChunkingOptions};
 use crate::embedding::{vector_hash, EmbeddingProvider};
 use crate::filter::{compile_filter, FilterSql};
 use crate::markdown::parse_markdown;
@@ -133,6 +133,7 @@ struct QueryPlan {
     route: QueryRoute,
     normalized: String,
     terms: Vec<String>,
+    expanded_terms: Vec<String>,
     patterns: Vec<String>,
 }
 
@@ -162,18 +163,77 @@ impl QueryPlan {
             route,
             normalized,
             terms,
+            expanded_terms: Vec::new(),
             patterns,
         }
     }
 
+    fn with_expansion(mut self, enabled: bool) -> Self {
+        if !enabled || matches!(self.route, QueryRoute::Path | QueryRoute::Tag) {
+            return self;
+        }
+        let mut expanded = Vec::new();
+        for term in &self.terms {
+            for candidate in query_expansions_for_term(term) {
+                if !self.terms.iter().any(|existing| existing == candidate)
+                    && !expanded.iter().any(|existing| existing == candidate)
+                {
+                    expanded.push(candidate.to_string());
+                }
+            }
+        }
+        if !expanded.is_empty() {
+            for term in &expanded {
+                self.patterns.push(term.clone());
+            }
+            self.patterns.sort();
+            self.patterns.dedup();
+            self.expanded_terms = expanded;
+        }
+        self
+    }
+
+    fn all_terms(&self) -> Vec<String> {
+        let mut terms = self.terms.clone();
+        terms.extend(self.expanded_terms.clone());
+        terms.sort();
+        terms.dedup();
+        terms
+    }
+
+    fn scoring_text(&self) -> String {
+        let terms = self.all_terms();
+        if terms.is_empty() {
+            self.normalized.clone()
+        } else {
+            terms.join(" ")
+        }
+    }
+
     fn keyword_query(&self) -> Option<String> {
-        if self.terms.is_empty() {
+        let terms = self.all_terms();
+        if terms.is_empty() {
             return None;
         }
-        if matches!(self.route, QueryRoute::Short) && self.terms.len() == 1 {
-            return Some(format!("{}*", self.terms[0]));
+        if self.expanded_terms.is_empty() {
+            if matches!(self.route, QueryRoute::Short) && terms.len() == 1 {
+                return Some(format!("{}*", terms[0]));
+            }
+            return Some(terms.join(" "));
         }
-        Some(self.terms.join(" "))
+        Some(
+            terms
+                .iter()
+                .map(|term| {
+                    if matches!(self.route, QueryRoute::Short) && term.chars().count() <= 12 {
+                        format!("{}*", term)
+                    } else {
+                        term.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
     }
 
     fn routes_attempted(&self) -> Vec<String> {
@@ -190,6 +250,24 @@ impl QueryPlan {
         routes.sort();
         routes.dedup();
         routes
+    }
+}
+
+fn query_expansions_for_term(term: &str) -> &'static [&'static str] {
+    match term {
+        "rag" => &["retrieval", "augmented", "generation"],
+        "llm" => &["large", "language", "model"],
+        "mcp" => &["model", "context", "protocol"],
+        "bm25" => &["keyword", "fts", "fts5"],
+        "fts" | "fts5" => &["keyword", "bm25"],
+        "embedding" | "embeddings" => &["vector", "semantic"],
+        "vector" => &["embedding", "semantic"],
+        "eval" => &["evaluation", "benchmark", "quality"],
+        "评测" => &["eval", "evaluation", "benchmark"],
+        "向量" => &["vector", "embedding"],
+        "检索" => &["search", "retrieval"],
+        "记忆" => &["memory", "recall"],
+        _ => &[],
     }
 }
 
@@ -529,6 +607,28 @@ fn upsert_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn setting_value<'a>(settings: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    settings.get(key).map(String::as_str)
+}
+
+fn chunk_profile_matches(settings: &HashMap<String, String>, options: &IndexOptions) -> bool {
+    let options = options.normalized();
+    let existing_max = setting_value(settings, "chunk_max_chars")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(default_chunk_max_chars);
+    let existing_overlap = setting_value(settings, "chunk_overlap_chars")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let existing_strategy = setting_value(settings, "chunk_strategy").unwrap_or(if existing_overlap > 0 {
+        "heading_overlap"
+    } else {
+        "heading"
+    });
+    existing_max == options.chunk_max_chars
+        && existing_overlap == options.chunk_overlap_chars
+        && existing_strategy == options.strategy()
+}
+
 fn load_settings_map(conn: &Connection) -> Result<HashMap<String, String>> {
     let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
     let rows = stmt.query_map([], |row| {
@@ -738,6 +838,26 @@ impl IndexStore {
         embedding_model: &str,
         vector_backend: &VectorBackend,
     ) -> Result<IndexSummary> {
+        Self::index_vault_with_options(
+            conn,
+            vault,
+            provider,
+            embedding_dim,
+            embedding_model,
+            vector_backend,
+            &IndexOptions::default(),
+        )
+    }
+
+    pub fn index_vault_with_options<P: EmbeddingProvider + ?Sized>(
+        conn: &mut Connection,
+        vault: &Path,
+        provider: &P,
+        embedding_dim: usize,
+        embedding_model: &str,
+        vector_backend: &VectorBackend,
+        options: &IndexOptions,
+    ) -> Result<IndexSummary> {
         let started = Instant::now();
         init_schema(conn, embedding_dim, embedding_model, vector_backend)?;
         provider.health()?;
@@ -754,6 +874,8 @@ impl IndexStore {
         )?;
 
         let scanned = scan_vault(vault)?;
+        let chunk_options = options.normalized();
+        let chunk_strategy = chunk_options.strategy().to_string();
         let mut seen_paths = HashSet::new();
         let mut existing: HashMap<String, (i64, String)> = HashMap::new();
         {
@@ -771,6 +893,8 @@ impl IndexStore {
             }
         }
 
+        let settings = load_settings_map(conn)?;
+        let profile_changed = !chunk_profile_matches(&settings, &chunk_options);
         let mut added = 0usize;
         let mut updated = 0usize;
         let mut unchanged = 0usize;
@@ -784,7 +908,7 @@ impl IndexStore {
             let state = existing.get(&file.path).cloned();
             match state {
                 None => added += 1,
-                Some((_, ref hash)) if hash != &file.hash => updated += 1,
+                Some((_, ref hash)) if hash != &file.hash || profile_changed => updated += 1,
                 Some(_) => unchanged += 1,
             }
         }
@@ -804,16 +928,17 @@ impl IndexStore {
                 None => true,
                 Some((_, hash)) => hash != &file.hash,
             };
-            if !needs_reindex {
+            if !needs_reindex && !profile_changed {
                 continue;
             }
-            let file_summary = reindex_file(
+            let file_summary = reindex_file_with_options(
                 conn,
                 file,
                 provider,
                 embedding_dim,
                 embedding_model,
                 vector_backend,
+                &chunk_options,
             )?;
             total_chunks += file_summary.chunks;
             embedded += file_summary.embedded;
@@ -824,6 +949,9 @@ impl IndexStore {
         upsert_setting(conn, "embedding_model", embedding_model)?;
         upsert_setting(conn, "embedding_dim", &embedding_dim.to_string())?;
         upsert_setting(conn, "vector_backend", vector_backend.as_str())?;
+        upsert_setting(conn, "chunk_strategy", &chunk_strategy)?;
+        upsert_setting(conn, "chunk_max_chars", &chunk_options.chunk_max_chars.to_string())?;
+        upsert_setting(conn, "chunk_overlap_chars", &chunk_options.chunk_overlap_chars.to_string())?;
 
         Ok(IndexSummary {
             ok: true,
@@ -840,6 +968,9 @@ impl IndexStore {
             embedding_provider: provider.provider_id().to_string(),
             embedding_model: provider.model_id().to_string(),
             vector_backend: vector_backend.as_str().to_string(),
+            chunk_strategy,
+            chunk_max_chars: chunk_options.chunk_max_chars,
+            chunk_overlap_chars: chunk_options.chunk_overlap_chars,
             took_ms: started.elapsed().as_millis(),
         })
     }
@@ -895,7 +1026,7 @@ impl IndexStore {
             chrono::Utc::now().timestamp_micros(),
             std::process::id()
         );
-        let plan = QueryPlan::analyze(query);
+        let plan = QueryPlan::analyze(query).with_expansion(options.query_expansion);
         let filter_text = options
             .filter
             .as_deref()
@@ -932,6 +1063,9 @@ impl IndexStore {
                 options.rerank,
             )?,
         };
+        routing.query_expansion = options.query_expansion;
+        routing.query_expansion_terms = plan.expanded_terms.clone();
+        routing.external_reranker = options.external_reranker;
         if retrieval_depth > 0 {
             let expansion_started = Instant::now();
             routing.link_candidates = expand_link_candidates(
@@ -947,6 +1081,9 @@ impl IndexStore {
             routing.merged_candidates = results.len();
         }
         apply_temporal_quality(&mut results, options, query)?;
+        if options.external_reranker {
+            apply_lexical_reranker(&mut results, &plan, query);
+        }
         let filtered_candidates = results.len();
         if let Some(min_score) = options.min_score {
             let before_threshold = results.len();
@@ -1104,18 +1241,26 @@ fn delete_file_in_tx(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
     Ok(())
 }
 
-fn reindex_file<P: EmbeddingProvider + ?Sized>(
+fn reindex_file_with_options<P: EmbeddingProvider + ?Sized>(
     conn: &mut Connection,
     file: &ScannedFile,
     provider: &P,
     embedding_dim: usize,
     embedding_model: &str,
     vector_backend: &VectorBackend,
+    chunk_options: &IndexOptions,
 ) -> Result<ReindexFileSummary> {
     let body = fs::read_to_string(&file.abs_path)
         .with_context(|| format!("read {}", file.abs_path.display()))?;
     let parsed = parse_markdown(&file.path, &body)?;
-    let chunks = chunk_document(&parsed, 1200);
+    let chunk_options = chunk_options.normalized();
+    let chunks = chunk_document_with_options(
+        &parsed,
+        ChunkingOptions {
+            max_chars: chunk_options.chunk_max_chars,
+            overlap_chars: chunk_options.chunk_overlap_chars,
+        },
+    );
     let mut records: Vec<Option<EmbeddingRecord>> = vec![None; chunks.len()];
     let mut reused = 0usize;
     let mut missing_inputs = Vec::new();
@@ -1490,6 +1635,7 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
     rerank: bool,
 ) -> Result<(Vec<SearchResult>, QueryRoutingEvidence)> {
     let mut timings = QueryTimings::default();
+    let scoring_query = plan.scoring_text();
     let keyword_started = Instant::now();
     let mut keyword_scores: HashMap<i64, (usize, f32)> = HashMap::new();
     if let Some(keyword_query) = plan.keyword_query() {
@@ -1543,7 +1689,7 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
             vector_scores.get(&rowid),
             route_scores.get(&rowid),
             plan,
-            query,
+            &scoring_query,
             filter,
             rerank,
         )? {
@@ -1566,6 +1712,9 @@ fn query_hybrid<P: EmbeddingProvider + ?Sized>(
         include_links: false,
         expand_links: 0,
         retrieval_depth: 0,
+        query_expansion: false,
+        query_expansion_terms: Vec::new(),
+        external_reranker: false,
         keyword_candidates: keyword_scores.len(),
         vector_candidates: vector_scores.len(),
         route_candidates: route_scores.len(),
@@ -1587,6 +1736,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
     rerank: bool,
 ) -> Result<(Vec<SearchResult>, QueryRoutingEvidence)> {
     let mut timings = QueryTimings::default();
+    let scoring_query = plan.scoring_text();
     let vector_started = Instant::now();
     let qvec = provider.embed_query(query)?;
     let mut sql = String::from(
@@ -1661,7 +1811,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
         ) = row?;
         let distance = l2_distance(&qvec, &vec);
         let vector_score = distance_to_score(distance);
-        let keyword_score = keyword_overlap_score(&plan.normalized, &text, &tags_json);
+        let keyword_score = keyword_overlap_score(&scoring_query, &text, &tags_json);
         let route_hit = score_route_hit(
             plan,
             &path,
@@ -1689,7 +1839,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             vector_score,
             route_hit.as_ref(),
             plan,
-            query,
+            &scoring_query,
             has_code,
             has_link,
             has_task_list,
@@ -1733,6 +1883,9 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
         include_links: false,
         expand_links: 0,
         retrieval_depth: 0,
+        query_expansion: false,
+        query_expansion_terms: Vec::new(),
+        external_reranker: false,
         keyword_candidates: 0,
         vector_candidates: total_candidates,
         route_candidates: route_matches,
@@ -2202,6 +2355,56 @@ fn sort_search_results(results: &mut [SearchResult]) {
             .then_with(|| a.line_start.cmp(&b.line_start))
             .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
+}
+
+fn apply_lexical_reranker(results: &mut [SearchResult], plan: &QueryPlan, query: &str) {
+    let mut terms = plan.all_terms();
+    terms.extend(normalize_query(query).split_whitespace().map(ToString::to_string));
+    terms.retain(|term| term.chars().count() >= 2);
+    terms.sort();
+    terms.dedup();
+    if terms.is_empty() {
+        return;
+    }
+    let normalized_query = normalize_query(query).to_lowercase();
+    for result in results.iter_mut() {
+        let haystack = format!(
+            "{} {} {} {} {}",
+            result.path,
+            result.title.as_deref().unwrap_or(""),
+            result.heading.as_deref().unwrap_or(""),
+            result.snippet,
+            result.tags.join(" ")
+        )
+        .to_lowercase();
+        let matched = terms.iter().filter(|term| haystack.contains(term.as_str())).count();
+        if matched == 0 {
+            continue;
+        }
+        let coverage = matched as f32 / terms.len() as f32;
+        let phrase_boost = if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
+            0.02
+        } else {
+            0.0
+        };
+        let boost = (coverage * 0.06 + phrase_boost).min(0.08);
+        if boost <= 0.0 {
+            continue;
+        }
+        result.score += boost;
+        result.score_breakdown.reranker_boost = boost;
+        if !result
+            .evidence
+            .sources
+            .iter()
+            .any(|source| source == "lexical_reranker")
+        {
+            result.evidence.sources.push("lexical_reranker".to_string());
+        }
+        refresh_evidence_count(result);
+        refresh_result_summaries(result);
+    }
+    sort_search_results(results);
 }
 
 fn expand_link_candidates(
@@ -2732,6 +2935,7 @@ fn build_result(
         confidence_boost: 0.0,
         status_boost: 0.0,
         evidence_count_boost: 0.0,
+        reranker_boost: 0.0,
     };
     let score = (keyword_score * 0.35)
         + (vector_score * 0.35)

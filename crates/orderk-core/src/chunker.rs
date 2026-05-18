@@ -2,8 +2,44 @@ use crate::models::{Chunk, ParsedDocument};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkingOptions {
+    pub max_chars: usize,
+    pub overlap_chars: usize,
+}
+
+impl Default for ChunkingOptions {
+    fn default() -> Self {
+        Self {
+            max_chars: 1200,
+            overlap_chars: 0,
+        }
+    }
+}
+
+impl ChunkingOptions {
+    pub fn normalized(self) -> Self {
+        let max_chars = self.max_chars.max(200);
+        Self {
+            max_chars,
+            overlap_chars: self.overlap_chars.min(max_chars / 2),
+        }
+    }
+}
+
 pub fn chunk_document(doc: &ParsedDocument, max_chars: usize) -> Vec<Chunk> {
-    let max_chars = max_chars.max(200);
+    chunk_document_with_options(
+        doc,
+        ChunkingOptions {
+            max_chars,
+            overlap_chars: 0,
+        },
+    )
+}
+
+pub fn chunk_document_with_options(doc: &ParsedDocument, options: ChunkingOptions) -> Vec<Chunk> {
+    let options = options.normalized();
+    let max_chars = options.max_chars;
     let mut chunks = Vec::new();
     let mut id_counts: HashMap<String, usize> = HashMap::new();
     let mut heading_stack: Vec<(usize, String)> = Vec::new();
@@ -58,8 +94,18 @@ pub fn chunk_document(doc: &ParsedDocument, max_chars: usize) -> Vec<Chunk> {
                 current_end,
                 &current_text,
             );
-            current_text.clear();
-            current_start = line_no;
+            if let Some((overlap_start, overlap_text)) = trailing_overlap(
+                &current_text,
+                current_start,
+                current_end,
+                options.overlap_chars,
+            ) {
+                current_text = overlap_text;
+                current_start = overlap_start;
+            } else {
+                current_text.clear();
+                current_start = line_no;
+            }
         }
 
         current_text.push_str(line);
@@ -149,6 +195,45 @@ fn current_heading(stack: &[(usize, String)]) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" > "),
     )
+}
+
+fn trailing_overlap(
+    text: &str,
+    start_line: usize,
+    end_line: usize,
+    overlap_chars: usize,
+) -> Option<(usize, String)> {
+    if overlap_chars == 0 || text.trim().is_empty() || end_line < start_line {
+        return None;
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut selected = Vec::new();
+    let mut chars = 0usize;
+    for line in lines.iter().rev() {
+        let line_chars = line.chars().count() + 1;
+        if !selected.is_empty() && chars + line_chars > overlap_chars {
+            break;
+        }
+        selected.push(*line);
+        chars += line_chars;
+        if chars >= overlap_chars {
+            break;
+        }
+    }
+    if selected.is_empty() {
+        return None;
+    }
+    selected.reverse();
+    let overlap_start = end_line.saturating_sub(selected.len()).saturating_add(1);
+    if overlap_start <= start_line && selected.len() == lines.len() {
+        return None;
+    }
+    let mut overlap_text = selected.join("\n");
+    overlap_text.push('\n');
+    Some((overlap_start, overlap_text))
 }
 
 fn parse_heading(line: &str) -> Option<(usize, String)> {
@@ -257,6 +342,38 @@ mod tests {
                 .all(|chunk| !chunk.text.contains("fn main() {") || chunk.text.contains("```rust")),
             "code block should stay intact"
         );
+    }
+
+    #[test]
+    fn chunker_can_overlap_size_splits_without_crossing_headings() {
+        let alpha_lines = (0..12)
+            .map(|idx| format!("alpha boundary line {idx} carries enough repeated retrieval context for splitting"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!(
+            "# Alpha\n{alpha_lines}\n## Beta\nsix six six\nseven seven seven\n"
+        );
+        let doc = parse_markdown("notes/overlap.md", &body).unwrap();
+        let chunks = chunk_document_with_options(
+            &doc,
+            ChunkingOptions {
+                max_chars: 200,
+                overlap_chars: 80,
+            },
+        );
+        assert!(chunks.len() >= 3, "{chunks:#?}");
+        assert!(chunks[0].line_end >= chunks[1].line_start, "{chunks:#?}");
+        let overlapped_line = chunks[0]
+            .text
+            .lines()
+            .last()
+            .expect("first chunk has trailing overlap seed");
+        assert!(chunks[1].text.contains(overlapped_line), "{chunks:#?}");
+        let beta = chunks
+            .iter()
+            .find(|chunk| chunk.heading.as_deref() == Some("Alpha > Beta"))
+            .expect("heading split still creates beta chunk");
+        assert!(!beta.text.contains("alpha boundary"), "{chunks:#?}");
     }
 
     #[test]
