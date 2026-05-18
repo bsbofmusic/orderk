@@ -1,10 +1,41 @@
 {
-  "schema_version": "orderk.resource_baseline.v1",
-  "captured_for": "orderk v0.1.5 productization gate",
+  "schema_version": "orderk.resource_baseline.v2",
+  "captured_for": "orderk v0.1.8 runtime baseline",
   "binary_max_bytes": 31457280,
   "daemon_count_max": 0,
+  "rss_max_mb": 15.0,
+  "mock_query_ms_p50_max": 150.0,
+  "mock_query_ms_p95_max": 200.0,
+  "live_search_took_ms_ceiling": 5000,
+  "measurements": {
+    "binary_bytes": 23716616,
+    "binary_mb": 22.6,
+    "db_bytes": 225599488,
+    "db_mb": 215.1,
+    "rss_kb": 9440,
+    "rss_mb": 9.2,
+    "vm_peak_kb": 12644,
+    "vm_peak_mb": 12.3,
+    "live_took_ms": 1628,
+    "mock_p50_ms": 75.58,
+    "mock_p95_ms": 89.96,
+    "mock_max_ms": 121.74,
+    "mock_index_ms": 1907,
+    "daemon_count": 0,
+    "vault_notes": 2306,
+    "vault_chunks": 19081,
+    "provider": "siliconflow",
+    "model": "BAAI/bge-m3",
+    "dim": 1024,
+    "backend": "sqlite_vec"
+  },
   "notes": {
-    "binary_max_bytes": "30 MiB ceiling for the release binary in target/release/orderk; v0.1.5 local unstripped binary was about 23 MiB and GitHub release asset about 8.1 MiB.",
-    "daemon_count_max": "orderk is a one-shot headless CLI; normal runtime should not leave resident orderk processes."
+    "binary_max_bytes": "30 MiB ceiling; v0.1.8 binary is 22.6 MiB unstripped, GitHub release asset about 8.1 MiB.",
+    "daemon_count_max": "orderk is a one-shot headless CLI; normal runtime leaves 0 resident processes.",
+    "rss_max_mb": "15 MiB ceiling; measured VmRSS 9.2 MiB during live search against 19K-chunk vault. VmPeak 12.3 MiB.",
+    "mock_query_ms_p50_max": "150ms ceiling for mock-provider stress p50; measured 75.6ms with 1000 notes / 300 queries / 12 concurrency.",
+    "mock_query_ms_p95_max": "200ms ceiling for mock-provider stress p95; measured 90.0ms.",
+    "live_search_took_ms_ceiling": "5000ms ceiling for real provider (siliconflow) search; measured 1628ms. This includes embedding API round-trip and is provider-dependent.",
+    "mock_stress": "Reproducible deterministic baseline using mock embedding provider. Run: python3 scripts/stress.py. Real provider latency depends on API endpoint speed."
   }
 }

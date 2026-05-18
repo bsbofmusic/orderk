@@ -1,0 +1,36 @@
+{
+  "schema_version": "orderk.eval_queries.v1",
+  "description": "Live eval queries for real vault quality monitoring. These queries target stable, well-known knowledge files in the user's Obsidian vault and are designed to verify that orderk's hybrid retrieval returns correct results.",
+  "queries": [
+    {
+      "id": "orderk-design",
+      "query": "orderk design architecture retrieval blade headless",
+      "expected_paths": ["brain/systems/orderk-设计决策与定位.md"],
+      "expected_phrases": ["检索刀片", "headless"]
+    },
+    {
+      "id": "obsidian-graph",
+      "query": "Obsidian graph rules knowledge mapping wikilink backlink",
+      "expected_paths": ["brain/concepts/Obsidian图谱规则.md"],
+      "expected_phrases": ["wikilink", "图谱"]
+    },
+    {
+      "id": "user-preferences",
+      "query": "user preference config hermes agent memory routing",
+      "expected_paths": ["brain/identity/茶老板偏好配置.md"],
+      "expected_phrases": ["偏好", "配置"]
+    },
+    {
+      "id": "second-brain-protocol",
+      "query": "second brain operation protocol knowledge management",
+      "expected_paths": ["brain/systems/第二大脑操作协议.md"],
+      "expected_phrases": ["第二大脑", "协议"]
+    },
+    {
+      "id": "skill-version",
+      "query": "Hermes skill version maintenance rules update patch",
+      "expected_paths": ["brain/systems/HermesSkill版本维护规则.md"],
+      "expected_phrases": ["版本", "维护"]
+    }
+  ]
+}
