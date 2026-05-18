@@ -297,6 +297,38 @@ pub struct ValidityEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QualitySummary {
+    pub schema_version: String,
+    pub freshness_boost: f32,
+    pub confidence_boost: f32,
+    pub status_boost: f32,
+    pub evidence_count_boost: f32,
+    pub total_boost: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceSummary {
+    pub schema_version: String,
+    pub validity_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_days: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    pub evidence_count: usize,
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub evidence_uri: String,
+    #[serde(default)]
+    pub open_uri: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LinkEvidence {
     pub outgoing: Vec<OutgoingLinkEvidence>,
     pub backlinks: Vec<BacklinkEvidence>,
@@ -499,6 +531,10 @@ pub struct SearchResult {
     pub score: f32,
     pub score_breakdown: ScoreBreakdown,
     pub evidence: SearchResultEvidence,
+    #[serde(default)]
+    pub quality: QualitySummary,
+    #[serde(default)]
+    pub evidence_summary: EvidenceSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_chunks: Vec<SearchContextChunk>,
     pub tags: Vec<String>,
@@ -547,6 +583,12 @@ pub struct SearchIndexEntry {
     pub evidence_uri: String,
     #[serde(default)]
     pub open_uri: String,
+    #[serde(default)]
+    pub validity: ValidityEvidence,
+    #[serde(default)]
+    pub quality: QualitySummary,
+    #[serde(default)]
+    pub evidence_summary: EvidenceSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -583,6 +625,9 @@ impl From<QueryResponse> for SearchIndexResponse {
                 line_end: result.line_end,
                 evidence_uri: result.evidence_uri,
                 open_uri: result.open_uri,
+                validity: result.validity,
+                quality: result.quality,
+                evidence_summary: result.evidence_summary,
             })
             .collect();
         let explain = response.explain;

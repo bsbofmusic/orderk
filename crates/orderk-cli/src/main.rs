@@ -1012,7 +1012,7 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
                 "properties": {
                     "query": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
-                    "filter": {"type": "string", "description": "Optional mini filter DSL, e.g. tag == 'rust' && has_code == true && confidence == 'high'"},
+                    "filter": {"type": "string", "description": "Optional mini filter DSL, e.g. tag == 'rust' && has_code == true && confidence == 'high' && valid_from == '2026-05-01' && updated contains '2026-05'"},
                     "min_score": {"type": "number", "description": "Drop results below this fused score"},
                     "threshold": {"type": "number", "description": "Alias for min_score"},
                     "context_chunks": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
@@ -1417,6 +1417,27 @@ mod tests {
             .pointer("/inputSchema/properties/view")
             .expect("search tool schema must expose compact view selector");
         assert_eq!(view.get("default").and_then(|v| v.as_str()), Some("full"));
+        let filter_description = search_tool
+            .pointer("/inputSchema/properties/filter/description")
+            .and_then(|value| value.as_str())
+            .expect("search filter schema must describe the mini DSL");
+        assert!(
+            filter_description.contains("valid_from"),
+            "{filter_description}"
+        );
+        assert!(
+            filter_description.contains("updated"),
+            "{filter_description}"
+        );
+        assert!(search_tool
+            .pointer("/inputSchema/properties/freshness/enum")
+            .and_then(|value| value.as_array())
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("recent"))));
+        assert!(search_tool
+            .pointer("/inputSchema/properties/as_of/description")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .contains("YYYY-MM-DD"));
     }
 
     #[test]
@@ -1621,6 +1642,12 @@ mod tests {
             assert!(entry.get("path").and_then(|v| v.as_str()).is_some());
             assert!(entry.get("line_start").and_then(|v| v.as_u64()).is_some());
             assert!(entry.get("line_end").and_then(|v| v.as_u64()).is_some());
+            assert!(entry.get("validity").and_then(|v| v.as_object()).is_some());
+            assert!(entry.get("quality").and_then(|v| v.as_object()).is_some());
+            assert!(entry
+                .get("evidence_summary")
+                .and_then(|v| v.as_object())
+                .is_some());
             assert!(
                 entry.get("snippet").is_none(),
                 "index view must not leak snippets"
@@ -1750,6 +1777,107 @@ mod tests {
             "decoy-only phrase must not satisfy expected path evidence: {outcome}"
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_search_results_include_quality_and_evidence_summary() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-quality-summary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("quality.md"),
+            "---
+confidence: high
+status: active
+source_type: audit
+updated: 2026-05-18
+valid_from: 2026-05-01
+---
+# Quality
+Temporal quality summary needle keeps evidence readable.
+",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let full = run_with_args(vec![
+            "search".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--query".into(),
+            "Temporal quality summary needle".into(),
+            "--freshness".into(),
+            "recent".into(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let result = full["results"]
+            .as_array()
+            .and_then(|results| results.first())
+            .expect("full search returns result");
+        assert_eq!(
+            result
+                .pointer("/quality/schema_version")
+                .and_then(|v| v.as_str()),
+            Some("orderk.quality_summary.v1")
+        );
+        assert!(result
+            .pointer("/quality/total_boost")
+            .and_then(|v| v.as_f64())
+            .is_some_and(|value| value > 0.0));
+        assert_eq!(
+            result
+                .pointer("/evidence_summary/schema_version")
+                .and_then(|v| v.as_str()),
+            Some("orderk.evidence_summary.v1")
+        );
+        assert_eq!(
+            result
+                .pointer("/evidence_summary/validity_state")
+                .and_then(|v| v.as_str()),
+            Some("current")
+        );
+        assert_eq!(
+            result
+                .pointer("/evidence_summary/confidence")
+                .and_then(|v| v.as_str()),
+            Some("high")
+        );
+        assert!(result
+            .pointer("/evidence_summary/evidence_uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .starts_with("orderk://chunk/"));
         let _ = fs::remove_dir_all(root);
     }
 

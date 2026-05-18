@@ -961,6 +961,7 @@ impl IndexStore {
         routing.timings.enrich_ms = enrich_started.elapsed().as_millis();
         for result in &mut results {
             refresh_evidence_count(result);
+            refresh_result_summaries(result);
         }
         routing.returned = results.len();
         routing.min_score = options.min_score;
@@ -2140,6 +2141,8 @@ fn apply_temporal_quality(
         {
             result.evidence.sources.push("temporal".to_string());
         }
+        refresh_evidence_count(result);
+        refresh_result_summaries(result);
     }
 
     if !options.include_stale {
@@ -2147,6 +2150,42 @@ fn apply_temporal_quality(
     }
     sort_search_results(results);
     Ok(())
+}
+
+fn quality_summary(breakdown: &ScoreBreakdown) -> QualitySummary {
+    let total_boost = breakdown.freshness_boost
+        + breakdown.confidence_boost
+        + breakdown.status_boost
+        + breakdown.evidence_count_boost;
+    QualitySummary {
+        schema_version: "orderk.quality_summary.v1".to_string(),
+        freshness_boost: breakdown.freshness_boost,
+        confidence_boost: breakdown.confidence_boost,
+        status_boost: breakdown.status_boost,
+        evidence_count_boost: breakdown.evidence_count_boost,
+        total_boost,
+    }
+}
+
+fn evidence_summary(result: &SearchResult) -> EvidenceSummary {
+    EvidenceSummary {
+        schema_version: "orderk.evidence_summary.v1".to_string(),
+        validity_state: result.validity.state.clone(),
+        stale_reason: result.validity.stale_reason.clone(),
+        age_days: result.validity.age_days,
+        confidence: result.confidence.clone(),
+        status: result.status.clone(),
+        source_type: result.source_type.clone(),
+        evidence_count: result.evidence.evidence_count,
+        sources: result.evidence.sources.clone(),
+        evidence_uri: result.evidence_uri.clone(),
+        open_uri: result.open_uri.clone(),
+    }
+}
+
+fn refresh_result_summaries(result: &mut SearchResult) {
+    result.quality = quality_summary(&result.score_breakdown);
+    result.evidence_summary = evidence_summary(result);
 }
 
 fn sort_search_results(results: &mut [SearchResult]) {
@@ -2736,6 +2775,8 @@ fn build_result(
             retrieval_depth: 0,
             links: None,
         },
+        quality: QualitySummary::default(),
+        evidence_summary: EvidenceSummary::default(),
         context_chunks: Vec::new(),
         tags,
         confidence,
@@ -3783,6 +3824,106 @@ mod tests {
         assert_eq!(
             filtered.routing.filter_mode.as_deref(),
             Some("sql_pushdown")
+        );
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn temporal_filter_fields_apply_before_result_truncation() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!(
+            "orderk-temporal-filter-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("current.md"),
+            "---
+valid_from: 2026-05-01
+updated: 2026-05-18
+status: active
+confidence: high
+---
+# Current
+shared temporal filter needle current evidence
+",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("old.md"),
+            "---
+valid_from: 2026-04-01
+updated: 2026-04-15
+superseded_by: current.md
+status: stale
+confidence: low
+---
+# Old
+shared temporal filter needle old evidence
+",
+        )
+        .unwrap();
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-temporal-filter-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+
+        let current = IndexStore::query_with_filter(
+            &conn,
+            "shared temporal filter needle old current",
+            1,
+            &provider,
+            &VectorBackend::Exact,
+            Some("valid_from == '2026-05-01' && updated contains '2026-05'"),
+        )
+        .unwrap();
+        assert_eq!(
+            current
+                .results
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current.md"]
+        );
+
+        let mut old_options = QueryOptions::new(1);
+        old_options.filter = Some("superseded_by == 'current.md'".to_string());
+        old_options.include_stale = true;
+        let old = IndexStore::query_with_options(
+            &conn,
+            "shared temporal filter needle old current",
+            &old_options,
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        assert_eq!(
+            old.results
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old.md"]
         );
 
         let _ = fs::remove_dir_all(&vault);
