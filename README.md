@@ -30,7 +30,7 @@ It is built for people who want better recall without giving another app permiss
 |---|---|
 | Single Rust binary | Small surface area and fast startup. The installed Linux x64 binary for v0.1.8 is 23,716,616 bytes, about 22.6 MiB, under a 30 MiB release-gate ceiling. |
 | On-demand CLI | No always-on orderk daemon. Normal runtime is one command, one result, then exit. |
-| Low runtime memory | A status probe on the maintainer machine uses about 6.4 MiB max RSS; historical normal CLI probes sit around 6-8 MiB. |
+| Low runtime memory | A live search probe on the maintainer machine used about 9.2 MiB VmRSS and 12.3 MiB VmPeak, under a 15 MiB baseline ceiling. |
 | Disposable SQLite index | Files, chunks, embeddings, FTS, vector rows, settings, and feedback live in one rebuildable DB. Delete the index and your Markdown vault is still intact. |
 | Hybrid retrieval | Keyword search, vector search, query-aware routing, path/tag/recency signals, and RRF-style fusion work together instead of pretending one score explains everything. |
 | Metadata-aware reranking | Paths, headings, tags, frontmatter, confidence, status, source type, and link evidence can influence rank without an LLM rewrite step. |
@@ -41,22 +41,55 @@ It is built for people who want better recall without giving another app permiss
 
 ### Benchmark snapshot
 
-These are maintainer-machine examples, not universal promises. They exist to make the "lightweight" claim falsifiable.
+These are maintainer-machine examples, not universal promises. They exist to make the "lightweight" claim falsifiable. Full reports live in [`benchmarks/`](benchmarks/).
 
 | Metric | Example result |
 |---|---:|
-| Installed binary | 23,323,368 bytes (~22.2 MiB) |
+| Installed binary | 23,716,616 bytes (~22.6 MiB) |
 | Release binary budget | <= 30 MiB |
-| Status command max RSS | 6,400 KB |
+| Status / live-search RSS | ~9.2 MiB measured VmRSS |
 | Resident orderk daemon count | 0 |
-| Live vault notes | 1,117 |
-| Live vault chunks / embeddings | 6,164 / 6,164 |
-| Live SQLite index size | ~72 MiB |
-| Offline eval mean query time | 1-3 ms in local fixture runs |
-| Offline eval quality gate | 4/4 top-1 hits; recall@k, nDCG, and MRR all 1.0 |
-| Live semantic search example | 5 results in 1,575 ms, including the remote SiliconFlow embedding call |
+| Live vault notes | 2,306 |
+| Live vault chunks / embeddings | 19,081 / 19,081 |
+| Live SQLite index size | ~215 MiB |
+| Offline fixture eval | 4/4 top-1 hits; recall@k, nDCG, and MRR all 1.0 |
+| Live eval gate | 5/5 hits; MRR 0.68 |
+| Mock stress p50 / p95 | 72.4ms / 96.2ms |
+| Live semantic search example | ~1.6s including the remote SiliconFlow embedding call |
 
 The local index path is millisecond-level. Live semantic search also asks the embedding provider for a fresh query vector, so network/provider latency can dominate. The point is simple: use cheap embeddings for recall, save expensive LLM calls for reasoning.
+
+### Token savings: compact recall before full evidence
+
+orderk does not ask agents to swallow the whole vault. It uses progressive disclosure:
+
+```text
+search --view index -> inspect candidate cards -> get selected chunks
+```
+
+| Query | Full search bytes | `--view index` bytes | Selected `get` bytes | Top file preserved? |
+|---|---:|---:|---:|---|
+| `orderk retrieval blade` | 22,830 | 13,400 | 2,996 | yes |
+| `Obsidian graph rules` | 22,364 | 12,757 | 2,285 | yes |
+
+In representative live-vault queries, compact recall cut output size by **41–46%** while preserving the same top file. See [`benchmarks/TOKEN_SAVINGS.md`](benchmarks/TOKEN_SAVINGS.md).
+
+### vs alternatives
+
+orderk is not a memory OS. It is the small retrieval layer beside your existing Markdown vault.
+
+| Dimension | orderk | agentmemory / mem0 / Letta class tools | Built-in note search |
+|---|---|---|---|
+| Type | Local retrieval blade | Memory engine / API / agent runtime | App search |
+| Source of truth | Markdown vault | Memory DB / service-runtime layer | Markdown vault |
+| Writes notes | No | memory writes / API state | manual only |
+| Daemon/server | No | common | app runtime only |
+| Search | BM25 + vector + metadata + links | vector / graph varies | keyword / app index |
+| Agent surface | CLI + read-only MCP | MCP / REST / hooks / runtime | none or manual |
+| Token control | `--view index` + `get --ids` | memory budget / integration-dependent | manual / context-heavy |
+| Best for | Grounded evidence retrieval | Persistent memory lifecycle | Human note search |
+
+If you want a memory operating system, use a memory system. If you want a small, local, read-only retrieval blade for your Markdown vault, use orderk. See [`benchmarks/COMPARISON.md`](benchmarks/COMPARISON.md).
 
 ### Fast, precise, sharp, stable
 
