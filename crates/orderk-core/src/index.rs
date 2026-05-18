@@ -5,7 +5,7 @@ use crate::markdown::parse_markdown;
 use crate::models::*;
 use crate::scanner::scan_vault;
 use anyhow::{anyhow, Context, Result};
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use sqlite_vec::sqlite3_vec_init;
@@ -18,6 +18,96 @@ use std::time::Instant;
 static SQLITE_VEC_REGISTER: Once = Once::new();
 const LINK_EXPANSION_BOOST: f32 = 0.03;
 const LINK_EXPANSION_SEED_LIMIT: usize = 10;
+
+fn encode_uri_component(input: &str) -> String {
+    let mut out = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn evidence_uri(chunk_id: &str) -> String {
+    format!("orderk://chunk/{}", encode_uri_component(chunk_id))
+}
+
+fn open_uri(path: &str, line_start: usize) -> String {
+    format!(
+        "obsidian://open?path={}&line={}",
+        encode_uri_component(path),
+        line_start
+    )
+}
+
+fn build_query_explain_trace(
+    routing: &QueryRoutingEvidence,
+    results: &[SearchResult],
+    vector_backend: &str,
+    limit: usize,
+) -> QueryExplainTrace {
+    QueryExplainTrace {
+        schema_version: "orderk.explain_trace.v1".to_string(),
+        route: routing.route.clone(),
+        strategy: routing.strategy.clone(),
+        vector_backend: vector_backend.to_string(),
+        limit,
+        returned: results.len(),
+        filter: routing.filter.clone(),
+        min_score: routing.min_score,
+        retrieval_depth: routing.retrieval_depth,
+        timings: routing.timings.clone(),
+        stages: vec![
+            QueryExplainStage {
+                name: "keyword".to_string(),
+                candidates: routing.keyword_candidates,
+                took_ms: routing.timings.keyword_ms,
+            },
+            QueryExplainStage {
+                name: "vector".to_string(),
+                candidates: routing.vector_candidates,
+                took_ms: routing.timings.vector_ms,
+            },
+            QueryExplainStage {
+                name: "route".to_string(),
+                candidates: routing.route_candidates,
+                took_ms: routing.timings.route_ms,
+            },
+            QueryExplainStage {
+                name: "link_expansion".to_string(),
+                candidates: routing.link_candidates,
+                took_ms: routing.timings.link_expansion_ms,
+            },
+            QueryExplainStage {
+                name: "merge".to_string(),
+                candidates: routing.merged_candidates,
+                took_ms: routing.timings.merge_ms,
+            },
+            QueryExplainStage {
+                name: "enrich".to_string(),
+                candidates: results.len(),
+                took_ms: routing.timings.enrich_ms,
+            },
+        ],
+        result_ranks: results
+            .iter()
+            .enumerate()
+            .map(|(idx, result)| QueryExplainResult {
+                rank: idx + 1,
+                chunk_id: result.chunk_id.clone(),
+                path: result.path.clone(),
+                score: result.score,
+                sources: result.evidence.sources.clone(),
+                keyword_rank: result.evidence.keyword_rank,
+                vector_rank: result.evidence.vector_rank,
+            })
+            .collect(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryRoute {
@@ -124,9 +214,14 @@ struct ReindexFileSummary {
 
 pub(crate) fn register_sqlite_vec() {
     SQLITE_VEC_REGISTER.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite3_vec_init as *const (),
-        )));
+        type SqliteAutoExtension = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *const i8,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> i32;
+        let extension =
+            std::mem::transmute::<*const (), SqliteAutoExtension>(sqlite3_vec_init as *const ());
+        rusqlite::ffi::sqlite3_auto_extension(Some(extension));
     });
 }
 
@@ -188,6 +283,11 @@ pub fn init_schema(
             confidence TEXT,
             status TEXT,
             source_type TEXT,
+            valid_from TEXT,
+            valid_until TEXT,
+            supersedes TEXT,
+            superseded_by TEXT,
+            updated TEXT,
             chunk_hash TEXT NOT NULL,
             mtime INTEGER NOT NULL
         );
@@ -230,7 +330,7 @@ pub fn init_schema(
     upsert_setting(conn, "embedding_model", embedding_model)?;
     upsert_setting(conn, "vector_backend", vector_backend.as_str())?;
     upsert_setting(conn, "vector_backend_mode", vector_backend.as_str())?;
-    upsert_setting(conn, "schema_version", "4")?;
+    upsert_setting(conn, "schema_version", "5")?;
     Ok(())
 }
 
@@ -278,6 +378,23 @@ pub(crate) fn migrate_chunk_metadata_columns(conn: &Connection) -> Result<()> {
             "source_type",
             "ALTER TABLE chunks ADD COLUMN source_type TEXT",
         ),
+        (
+            "valid_from",
+            "ALTER TABLE chunks ADD COLUMN valid_from TEXT",
+        ),
+        (
+            "valid_until",
+            "ALTER TABLE chunks ADD COLUMN valid_until TEXT",
+        ),
+        (
+            "supersedes",
+            "ALTER TABLE chunks ADD COLUMN supersedes TEXT",
+        ),
+        (
+            "superseded_by",
+            "ALTER TABLE chunks ADD COLUMN superseded_by TEXT",
+        ),
+        ("updated", "ALTER TABLE chunks ADD COLUMN updated TEXT"),
     ];
     let mut added_any = false;
     for (column, sql) in migrations {
@@ -286,10 +403,10 @@ pub(crate) fn migrate_chunk_metadata_columns(conn: &Connection) -> Result<()> {
             added_any = true;
         }
     }
-    if added_any || schema_version.as_deref() != Some("4") {
+    if added_any || schema_version.as_deref() != Some("5") {
         backfill_chunk_metadata(conn)?;
     }
-    upsert_setting(conn, "schema_version", "4")?;
+    upsert_setting(conn, "schema_version", "5")?;
     Ok(())
 }
 
@@ -829,6 +946,7 @@ impl IndexStore {
             routing.timings.link_expansion_ms = expansion_started.elapsed().as_millis();
             routing.merged_candidates = results.len();
         }
+        apply_temporal_quality(&mut results, options, query)?;
         let filtered_candidates = results.len();
         if let Some(min_score) = options.min_score {
             let before_threshold = results.len();
@@ -848,6 +966,7 @@ impl IndexStore {
         routing.timings.enrich_ms = enrich_started.elapsed().as_millis();
         for result in &mut results {
             refresh_evidence_count(result);
+            refresh_result_summaries(result);
         }
         routing.returned = results.len();
         routing.min_score = options.min_score;
@@ -864,6 +983,16 @@ impl IndexStore {
         }
         routing.filter = filter_text;
         routing.timings.total_ms = started.elapsed().as_millis();
+        let explain = if options.explain {
+            Some(build_query_explain_trace(
+                &routing,
+                &results,
+                vector_backend.as_str(),
+                limit,
+            ))
+        } else {
+            None
+        };
         Ok(QueryResponse {
             query: query.to_string(),
             query_id,
@@ -872,6 +1001,7 @@ impl IndexStore {
             route: plan.route.as_str().to_string(),
             routing,
             vector_backend: vector_backend.as_str().to_string(),
+            explain,
             results,
         })
     }
@@ -891,6 +1021,45 @@ impl IndexStore {
         Ok(FeedbackResponse {
             ok: true,
             event_id: id as i64,
+        })
+    }
+
+    pub fn get_chunks(conn: &Connection, options: &ChunkGetOptions) -> Result<ChunkGetResponse> {
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        for raw in &options.chunk_ids {
+            let id = raw.trim();
+            if id.is_empty() || !seen.insert(id.to_string()) {
+                continue;
+            }
+            ids.push(id.to_string());
+            if ids.len() >= 50 {
+                break;
+            }
+        }
+
+        let mut results = Vec::new();
+        for id in ids {
+            if let Some(mut result) = load_chunk_by_chunk_id(conn, &id, &options.detail)? {
+                let radius = options.context_chunks.min(3);
+                if radius > 0 {
+                    result.context_chunks = load_context_chunks_for_chunk(
+                        conn,
+                        &result.path,
+                        result.line_start,
+                        result.line_end,
+                        radius,
+                    )?;
+                }
+                results.push(result);
+            }
+        }
+
+        Ok(ChunkGetResponse {
+            schema_version: "orderk.get.v1".to_string(),
+            total: results.len(),
+            detail: options.detail.clone(),
+            results,
         })
     }
 }
@@ -988,13 +1157,13 @@ fn reindex_file<P: EmbeddingProvider + ?Sized>(
          ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size, hash=excluded.hash, indexed_at=excluded.indexed_at",
         params![file.path, file.mtime, file.size as i64, file.hash, Utc::now().to_rfc3339()],
     )?;
-    for (chunk, record) in chunks.iter().zip(records.into_iter()) {
+    for (chunk, record) in chunks.iter().zip(records) {
         let record =
             record.ok_or_else(|| anyhow!("missing embedding record for chunk {}", chunk.id))?;
         let tags = serde_json::to_string(&chunk.tags)?;
         tx.execute(
-            "INSERT INTO chunks(chunk_id, file_path, file_hash, title, heading, line_start, line_end, text, tags_json, links_json, has_code, has_link, has_task_list, has_incomplete_tasks, confidence, status, source_type, chunk_hash, mtime)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            "INSERT INTO chunks(chunk_id, file_path, file_hash, title, heading, line_start, line_end, text, tags_json, links_json, has_code, has_link, has_task_list, has_incomplete_tasks, confidence, status, source_type, valid_from, valid_until, supersedes, superseded_by, updated, chunk_hash, mtime)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 chunk.id,
                 chunk.file_path,
@@ -1013,6 +1182,11 @@ fn reindex_file<P: EmbeddingProvider + ?Sized>(
                 chunk.confidence,
                 chunk.status,
                 chunk.source_type,
+                chunk.valid_from,
+                chunk.valid_until,
+                chunk.supersedes,
+                chunk.superseded_by,
+                chunk.updated,
                 chunk.hash,
                 file.mtime,
             ],
@@ -1407,7 +1581,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
     conn: &Connection,
     query: &str,
     plan: &QueryPlan,
-    limit: usize,
+    _limit: usize,
     provider: &P,
     filter: Option<&FilterSql>,
     rerank: bool,
@@ -1416,7 +1590,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
     let vector_started = Instant::now();
     let qvec = provider.embed_query(query)?;
     let mut sql = String::from(
-        "SELECT c.id, c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, e.embedding, f.mtime, f.hash, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type
+        "SELECT c.id, c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, e.embedding, f.mtime, f.hash, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type, c.valid_from, c.valid_until, c.supersedes, c.superseded_by, c.updated
          FROM chunks c
          JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id
          LEFT JOIN files f ON f.path = c.file_path
@@ -1449,6 +1623,11 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             row.get::<_, Option<String>>(17)?,
             row.get::<_, Option<String>>(18)?,
             row.get::<_, Option<String>>(19)?,
+            row.get::<_, Option<String>>(20)?,
+            row.get::<_, Option<String>>(21)?,
+            row.get::<_, Option<String>>(22)?,
+            row.get::<_, Option<String>>(23)?,
+            row.get::<_, Option<String>>(24)?,
         ))
     })?;
     let mut scored = Vec::new();
@@ -1474,6 +1653,11 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             confidence,
             status,
             source_type,
+            valid_from,
+            valid_until,
+            supersedes,
+            superseded_by,
+            updated,
         ) = row?;
         let distance = l2_distance(&qvec, &vec);
         let vector_score = distance_to_score(distance);
@@ -1513,6 +1697,11 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             confidence,
             status,
             source_type,
+            valid_from,
+            valid_until,
+            supersedes,
+            superseded_by,
+            updated,
             rerank,
         )?;
         scored.push(result);
@@ -1531,7 +1720,6 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             result.evidence.sources.push("vector".to_string());
         }
     }
-    scored.truncate(limit);
     let routing = QueryRoutingEvidence {
         strategy: "exact".to_string(),
         route: plan.route.as_str().to_string(),
@@ -1569,7 +1757,7 @@ fn load_chunk_result(
     rerank: bool,
 ) -> Result<Option<SearchResult>> {
     let mut sql = String::from(
-        "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, f.mtime, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type
+        "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, f.mtime, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type, c.valid_from, c.valid_until, c.supersedes, c.superseded_by, c.updated
          FROM chunks c
          LEFT JOIN files f ON f.path = c.file_path
          WHERE c.id = ?",
@@ -1598,6 +1786,11 @@ fn load_chunk_result(
                 row.get::<_, Option<String>>(14)?,
                 row.get::<_, Option<String>>(15)?,
                 row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
+                row.get::<_, Option<String>>(19)?,
+                row.get::<_, Option<String>>(20)?,
+                row.get::<_, Option<String>>(21)?,
             ))
         })
         .optional()?;
@@ -1619,6 +1812,11 @@ fn load_chunk_result(
         confidence,
         status,
         source_type,
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
     )) = row
     else {
         return Ok(None);
@@ -1648,9 +1846,351 @@ fn load_chunk_result(
         confidence,
         status,
         source_type,
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
         rerank,
     )
     .map(Some)
+}
+
+fn parse_orderk_date(value: Option<&str>) -> Option<NaiveDate> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    NaiveDate::parse_from_str(value.get(..10).unwrap_or(value), "%Y-%m-%d").ok()
+}
+
+fn query_has_recent_cue(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "recent", "recently", "latest", "current", "today", "现在", "最新", "当前",
+    ]
+    .iter()
+    .any(|cue| q.contains(cue))
+}
+
+fn query_has_oldest_cue(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "first",
+        "earliest",
+        "originally",
+        "oldest",
+        "最早",
+        "原始",
+        "历史",
+    ]
+    .iter()
+    .any(|cue| q.contains(cue))
+}
+
+fn confidence_boost_value(confidence: Option<&str>) -> f32 {
+    match confidence.unwrap_or("").trim().to_lowercase().as_str() {
+        "verified" | "high" => 0.025,
+        "observed" | "medium" => 0.012,
+        "inferred" | "low" => -0.01,
+        "stale" => -0.03,
+        _ => 0.0,
+    }
+}
+
+fn status_boost_value(status: Option<&str>, state: &str) -> f32 {
+    if state == "stale" {
+        return -0.04;
+    }
+    match status.unwrap_or("").trim().to_lowercase().as_str() {
+        "active" | "current" | "valid" => 0.025,
+        "draft" | "review" => 0.005,
+        "stale" | "superseded" | "archived" | "deprecated" => -0.04,
+        _ => 0.0,
+    }
+}
+
+fn evidence_count_boost_value(result: &SearchResult) -> f32 {
+    let count = result.evidence.sources.len().min(4) as f32;
+    if count > 0.0 {
+        0.005 * count
+    } else {
+        0.0
+    }
+}
+
+fn freshness_boost_value(
+    mode: &FreshnessMode,
+    query: &str,
+    age_days: Option<i64>,
+    state: &str,
+) -> f32 {
+    if state == "stale" {
+        return -0.02;
+    }
+    let Some(age_days) = age_days else {
+        return 0.0;
+    };
+    match mode {
+        FreshnessMode::Off => 0.0,
+        FreshnessMode::Balanced => {
+            if query_has_recent_cue(query) && age_days <= 30 {
+                0.03
+            } else if age_days <= 30 {
+                0.01
+            } else {
+                0.0
+            }
+        }
+        FreshnessMode::Recent => {
+            if age_days <= 30 {
+                0.05
+            } else if age_days <= 180 {
+                0.02
+            } else {
+                0.0
+            }
+        }
+        FreshnessMode::Oldest => {
+            if query_has_oldest_cue(query) || age_days >= 180 {
+                0.03
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
+fn build_validity(result: &SearchResult, as_of: Option<NaiveDate>) -> ValidityEvidence {
+    let reference_date = as_of.unwrap_or_else(|| Utc::now().date_naive());
+    let valid_from = parse_orderk_date(result.valid_from.as_deref());
+    let valid_until = parse_orderk_date(result.valid_until.as_deref());
+    let updated = parse_orderk_date(result.updated.as_deref())
+        .or_else(|| result.mtime.map(|mtime| mtime.date_naive()));
+    let age_days = updated.map(|updated| (reference_date - updated).num_days().max(0));
+
+    if let Some(start) = valid_from {
+        if start > reference_date {
+            return ValidityEvidence {
+                state: "stale".to_string(),
+                stale_reason: Some("not_yet_valid".to_string()),
+                age_days,
+                valid_from: result.valid_from.clone(),
+                valid_until: result.valid_until.clone(),
+                supersedes: result.supersedes.clone(),
+                superseded_by: result.superseded_by.clone(),
+                updated: result.updated.clone(),
+            };
+        }
+    }
+    let status_l = result.status.as_deref().unwrap_or("").trim().to_lowercase();
+    if as_of.is_none()
+        && matches!(
+            status_l.as_str(),
+            "stale" | "superseded" | "archived" | "deprecated"
+        )
+    {
+        return ValidityEvidence {
+            state: "stale".to_string(),
+            stale_reason: Some(format!("status:{status_l}")),
+            age_days,
+            valid_from: result.valid_from.clone(),
+            valid_until: result.valid_until.clone(),
+            supersedes: result.supersedes.clone(),
+            superseded_by: result.superseded_by.clone(),
+            updated: result.updated.clone(),
+        };
+    }
+
+    if let Some(end) = valid_until {
+        if end < reference_date {
+            return ValidityEvidence {
+                state: "stale".to_string(),
+                stale_reason: Some("valid_until".to_string()),
+                age_days,
+                valid_from: result.valid_from.clone(),
+                valid_until: result.valid_until.clone(),
+                supersedes: result.supersedes.clone(),
+                superseded_by: result.superseded_by.clone(),
+                updated: result.updated.clone(),
+            };
+        }
+    }
+
+    if as_of.is_some() {
+        return ValidityEvidence {
+            state: "historical".to_string(),
+            stale_reason: None,
+            age_days,
+            valid_from: result.valid_from.clone(),
+            valid_until: result.valid_until.clone(),
+            supersedes: result.supersedes.clone(),
+            superseded_by: result.superseded_by.clone(),
+            updated: result.updated.clone(),
+        };
+    }
+    if result
+        .superseded_by
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        return ValidityEvidence {
+            state: "stale".to_string(),
+            stale_reason: Some("superseded_by".to_string()),
+            age_days,
+            valid_from: result.valid_from.clone(),
+            valid_until: result.valid_until.clone(),
+            supersedes: result.supersedes.clone(),
+            superseded_by: result.superseded_by.clone(),
+            updated: result.updated.clone(),
+        };
+    }
+
+    ValidityEvidence {
+        state: "current".to_string(),
+        stale_reason: None,
+        age_days,
+        valid_from: result.valid_from.clone(),
+        valid_until: result.valid_until.clone(),
+        supersedes: result.supersedes.clone(),
+        superseded_by: result.superseded_by.clone(),
+        updated: result.updated.clone(),
+    }
+}
+
+fn result_has_temporal_quality_metadata(result: &SearchResult) -> bool {
+    result
+        .confidence
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .status
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .source_type
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .valid_from
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .valid_until
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .supersedes
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .superseded_by
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .updated
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+}
+
+fn apply_temporal_quality(
+    results: &mut Vec<SearchResult>,
+    options: &QueryOptions,
+    query: &str,
+) -> Result<()> {
+    let as_of = match options
+        .as_of
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(raw) => Some(
+            parse_orderk_date(Some(raw))
+                .ok_or_else(|| anyhow!("--as-of must use YYYY-MM-DD or RFC3339 date prefix"))?,
+        ),
+        None => None,
+    };
+
+    for result in results.iter_mut() {
+        result.validity = build_validity(result, as_of);
+        let has_temporal_quality = result_has_temporal_quality_metadata(result)
+            || as_of.is_some()
+            || query_has_recent_cue(query)
+            || query_has_oldest_cue(query)
+            || matches!(
+                options.freshness,
+                FreshnessMode::Recent | FreshnessMode::Oldest
+            );
+        if options.rerank && has_temporal_quality {
+            let freshness = freshness_boost_value(
+                &options.freshness,
+                query,
+                result.validity.age_days,
+                &result.validity.state,
+            );
+            let confidence = confidence_boost_value(result.confidence.as_deref());
+            let status = status_boost_value(result.status.as_deref(), &result.validity.state);
+            let evidence = evidence_count_boost_value(result);
+            result.score_breakdown.freshness_boost = freshness;
+            result.score_breakdown.confidence_boost = confidence;
+            result.score_breakdown.status_boost = status;
+            result.score_breakdown.evidence_count_boost = evidence;
+            result.score += freshness + confidence + status + evidence;
+        }
+        if has_temporal_quality
+            && !result
+                .evidence
+                .sources
+                .iter()
+                .any(|source| source == "temporal")
+        {
+            result.evidence.sources.push("temporal".to_string());
+        }
+        refresh_evidence_count(result);
+        refresh_result_summaries(result);
+    }
+
+    if !options.include_stale {
+        results.retain(|result| result.validity.state != "stale");
+    }
+    sort_search_results(results);
+    Ok(())
+}
+
+fn quality_summary(breakdown: &ScoreBreakdown) -> QualitySummary {
+    let total_boost = breakdown.freshness_boost
+        + breakdown.confidence_boost
+        + breakdown.status_boost
+        + breakdown.evidence_count_boost;
+    QualitySummary {
+        schema_version: "orderk.quality_summary.v1".to_string(),
+        freshness_boost: breakdown.freshness_boost,
+        confidence_boost: breakdown.confidence_boost,
+        status_boost: breakdown.status_boost,
+        evidence_count_boost: breakdown.evidence_count_boost,
+        total_boost,
+    }
+}
+
+fn evidence_summary(result: &SearchResult) -> EvidenceSummary {
+    EvidenceSummary {
+        schema_version: "orderk.evidence_summary.v1".to_string(),
+        validity_state: result.validity.state.clone(),
+        stale_reason: result.validity.stale_reason.clone(),
+        age_days: result.validity.age_days,
+        confidence: result.confidence.clone(),
+        status: result.status.clone(),
+        source_type: result.source_type.clone(),
+        evidence_count: result.evidence.evidence_count,
+        sources: result.evidence.sources.clone(),
+        evidence_uri: result.evidence_uri.clone(),
+        open_uri: result.open_uri.clone(),
+    }
+}
+
+fn refresh_result_summaries(result: &mut SearchResult) {
+    result.quality = quality_summary(&result.score_breakdown);
+    result.evidence_summary = evidence_summary(result);
 }
 
 fn sort_search_results(results: &mut [SearchResult]) {
@@ -1855,6 +2395,158 @@ fn enrich_results(
     Ok(())
 }
 
+fn load_chunk_by_chunk_id(
+    conn: &Connection,
+    chunk_id: &str,
+    detail: &ChunkGetDetail,
+) -> Result<Option<ChunkGetResult>> {
+    let row = conn
+        .query_row(
+            "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, c.confidence, c.status, c.source_type, c.valid_from, c.valid_until, c.supersedes, c.superseded_by, c.updated, f.mtime
+             FROM chunks c
+             LEFT JOIN files f ON f.path = c.file_path
+             WHERE c.chunk_id = ?1
+             LIMIT 1",
+            params![chunk_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)? as usize,
+                    row.get::<_, i64>(5)? as usize,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<i64>>(17)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((
+        chunk_id,
+        path,
+        title,
+        heading,
+        line_start,
+        line_end,
+        text,
+        tags_json,
+        mtime,
+        confidence,
+        status,
+        source_type,
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
+        file_mtime,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    let text = match detail {
+        ChunkGetDetail::Full => text,
+        ChunkGetDetail::Summary => snippet(&text, ""),
+    };
+    let evidence_uri = evidence_uri(&chunk_id);
+    let open_uri = open_uri(&path, line_start);
+    Ok(Some(ChunkGetResult {
+        chunk_id,
+        path,
+        title,
+        heading,
+        line_start,
+        line_end,
+        evidence_uri,
+        open_uri,
+        text,
+        tags,
+        confidence,
+        status,
+        source_type,
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
+        mtime: file_mtime
+            .or(Some(mtime))
+            .and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+        context_chunks: Vec::new(),
+    }))
+}
+
+fn load_context_chunks_for_chunk(
+    conn: &Connection,
+    path: &str,
+    line_start: usize,
+    line_end: usize,
+    radius: usize,
+) -> Result<Vec<SearchContextChunk>> {
+    let mut before_stmt = conn.prepare(
+        "SELECT chunk_id, file_path, heading, line_start, line_end, text
+         FROM chunks
+         WHERE file_path = ?1 AND line_end < ?2
+         ORDER BY line_end DESC
+         LIMIT ?3",
+    )?;
+    let before_rows =
+        before_stmt.query_map(params![path, line_start as i64, radius as i64], |row| {
+            Ok(SearchContextChunk {
+                relation: "before".to_string(),
+                chunk_id: row.get(0)?,
+                path: row.get(1)?,
+                heading: row.get(2)?,
+                line_start: row.get::<_, i64>(3)? as usize,
+                line_end: row.get::<_, i64>(4)? as usize,
+                text: row.get(5)?,
+            })
+        })?;
+    let mut before = Vec::new();
+    for row in before_rows {
+        before.push(row?);
+    }
+    before.reverse();
+
+    let mut after_stmt = conn.prepare(
+        "SELECT chunk_id, file_path, heading, line_start, line_end, text
+         FROM chunks
+         WHERE file_path = ?1 AND line_start > ?2
+         ORDER BY line_start ASC
+         LIMIT ?3",
+    )?;
+    let after_rows =
+        after_stmt.query_map(params![path, line_end as i64, radius as i64], |row| {
+            Ok(SearchContextChunk {
+                relation: "after".to_string(),
+                chunk_id: row.get(0)?,
+                path: row.get(1)?,
+                heading: row.get(2)?,
+                line_start: row.get::<_, i64>(3)? as usize,
+                line_end: row.get::<_, i64>(4)? as usize,
+                text: row.get(5)?,
+            })
+        })?;
+    let mut context = before;
+    for row in after_rows {
+        context.push(row?);
+    }
+    Ok(context)
+}
+
 fn load_context_chunks(
     conn: &Connection,
     result: &SearchResult,
@@ -2003,6 +2695,11 @@ fn build_result(
     confidence: Option<String>,
     status: Option<String>,
     source_type: Option<String>,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+    supersedes: Option<String>,
+    superseded_by: Option<String>,
+    updated: Option<String>,
     rerank: bool,
 ) -> Result<SearchResult> {
     let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
@@ -2031,6 +2728,10 @@ fn build_result(
         recency_boost: recency_boost(mtime),
         metadata_boost,
         link_boost: 0.0,
+        freshness_boost: 0.0,
+        confidence_boost: 0.0,
+        status_boost: 0.0,
+        evidence_count_boost: 0.0,
     };
     let score = (keyword_score * 0.35)
         + (vector_score * 0.35)
@@ -2064,6 +2765,8 @@ fn build_result(
         heading,
         line_start,
         line_end,
+        evidence_uri: evidence_uri(chunk_id),
+        open_uri: open_uri(path, line_start),
         snippet,
         score,
         score_breakdown: breakdown,
@@ -2077,11 +2780,19 @@ fn build_result(
             retrieval_depth: 0,
             links: None,
         },
+        quality: QualitySummary::default(),
+        evidence_summary: EvidenceSummary::default(),
         context_chunks: Vec::new(),
         tags,
         confidence,
         status,
         source_type,
+        validity: ValidityEvidence::default(),
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
         mtime: mtime.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
     })
 }
@@ -2322,6 +3033,14 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn open_uri_percent_encodes_path_query_component() {
+        assert_eq!(
+            open_uri("dir/a b&c?.md", 12),
+            "obsidian://open?path=dir%2Fa%20b%26c%3F.md&line=12"
+        );
+    }
+
     #[derive(Debug, Clone)]
     struct CountingMockEmbeddingProvider {
         inner: MockEmbeddingProvider,
@@ -2407,6 +3126,172 @@ mod tests {
         .unwrap();
         assert!(!res.results.is_empty());
         assert_eq!(res.results[0].path, "alpha.md");
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn get_chunks_preserves_order_dedupes_skips_missing_and_caps_batches() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!(
+            "orderk-get-bounds-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&vault).unwrap();
+        for idx in 0..55 {
+            fs::write(
+                vault.join(format!("note-{idx:02}.md")),
+                format!("# Note {idx:02}\nCompact recall get boundary text {idx:02}.\n"),
+            )
+            .unwrap();
+        }
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-get-bounds-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT chunk_id FROM chunks ORDER BY file_path ASC")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        let ids = rows.map(|row| row.unwrap()).collect::<Vec<_>>();
+        assert!(ids.len() >= 55);
+
+        let mut requested = vec![ids[2].clone(), ids[0].clone(), ids[2].clone()];
+        requested.extend(ids.iter().cloned());
+        let response = IndexStore::get_chunks(
+            &conn,
+            &ChunkGetOptions {
+                chunk_ids: requested,
+                detail: ChunkGetDetail::Full,
+                context_chunks: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.schema_version, "orderk.get.v1");
+        assert_eq!(response.total, 50);
+        assert_eq!(response.results[0].chunk_id, ids[2]);
+        assert_eq!(response.results[1].chunk_id, ids[0]);
+        assert_eq!(
+            response
+                .results
+                .iter()
+                .filter(|result| result.chunk_id == ids[2])
+                .count(),
+            1
+        );
+        assert!(response.results[0]
+            .text
+            .contains("Compact recall get boundary text"));
+        assert!(response.results[0]
+            .evidence_uri
+            .starts_with("orderk://chunk/"));
+        assert_eq!(
+            response.results[0].open_uri,
+            open_uri(&response.results[0].path, response.results[0].line_start)
+        );
+
+        let missing = IndexStore::get_chunks(
+            &conn,
+            &ChunkGetOptions {
+                chunk_ids: vec!["missing".to_string(), ids[1].clone()],
+                detail: ChunkGetDetail::Full,
+                context_chunks: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(missing.total, 1);
+        assert_eq!(missing.results[0].chunk_id, ids[1]);
+
+        let summary = IndexStore::get_chunks(
+            &conn,
+            &ChunkGetOptions {
+                chunk_ids: vec![ids[0].clone()],
+                detail: ChunkGetDetail::Summary,
+                context_chunks: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.results.len(), 1);
+        assert!(summary.results[0].text.len() <= 180);
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn query_explain_trace_is_opt_in_and_mechanical() {
+        let vault = sample_vault();
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-explain-trace-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+
+        let mut options = QueryOptions::new(5);
+        let without_explain = IndexStore::query_with_options(
+            &conn,
+            "sqlite vec semantic search",
+            &options,
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        assert!(without_explain.explain.is_none());
+
+        options.explain = true;
+        let with_explain = IndexStore::query_with_options(
+            &conn,
+            "sqlite vec semantic search",
+            &options,
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        let explain = with_explain
+            .explain
+            .expect("--explain should include a trace");
+        assert_eq!(explain.schema_version, "orderk.explain_trace.v1");
+        assert!(explain.stages.iter().any(|stage| stage.name == "vector"));
+        assert!(explain.stages.iter().any(|stage| stage.name == "merge"));
+        assert_eq!(explain.returned, with_explain.results.len());
+        assert_eq!(explain.route, with_explain.route);
+
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);
     }
@@ -2568,12 +3453,12 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "4");
+        assert_eq!(schema_version, "5");
         let _ = fs::remove_file(&db_path);
     }
 
     #[test]
-    fn public_query_migrates_old_schema_before_searching() {
+    fn public_query_refuses_old_schema_without_migrating_read_only_surface() {
         let db_path = std::env::temp_dir().join(format!(
             "orderk-public-query-old-schema-{}-{}.sqlite",
             std::process::id(),
@@ -2666,19 +3551,22 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let response = crate::api::query_with_options(
+        let err = crate::api::query_with_options(
             &db_path,
             "orderk migration",
             &QueryOptions::new(5),
             &provider,
             VectorBackend::Exact,
         )
-        .unwrap();
-        assert_eq!(response.results.len(), 1);
-        assert_eq!(response.results[0].file_path, "legacy.md");
+        .expect_err("public search must not mutate legacy DBs to migrate schema");
         assert!(
-            chunk_column_exists(&rusqlite::Connection::open(&db_path).unwrap(), "confidence")
-                .unwrap()
+            err.to_string().contains("schema") || err.to_string().contains("confidence"),
+            "unexpected read-only schema error: {err:#}"
+        );
+        assert!(
+            !chunk_column_exists(&rusqlite::Connection::open(&db_path).unwrap(), "confidence")
+                .unwrap(),
+            "read-only search must not add missing columns"
         );
         let _ = fs::remove_file(&db_path);
     }
@@ -2941,6 +3829,106 @@ mod tests {
         assert_eq!(
             filtered.routing.filter_mode.as_deref(),
             Some("sql_pushdown")
+        );
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn temporal_filter_fields_apply_before_result_truncation() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!(
+            "orderk-temporal-filter-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("current.md"),
+            "---
+valid_from: 2026-05-01
+updated: 2026-05-18
+status: active
+confidence: high
+---
+# Current
+shared temporal filter needle current evidence
+",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("old.md"),
+            "---
+valid_from: 2026-04-01
+updated: 2026-04-15
+superseded_by: current.md
+status: stale
+confidence: low
+---
+# Old
+shared temporal filter needle old evidence
+",
+        )
+        .unwrap();
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-temporal-filter-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+
+        let current = IndexStore::query_with_filter(
+            &conn,
+            "shared temporal filter needle old current",
+            1,
+            &provider,
+            &VectorBackend::Exact,
+            Some("valid_from == '2026-05-01' && updated contains '2026-05'"),
+        )
+        .unwrap();
+        assert_eq!(
+            current
+                .results
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current.md"]
+        );
+
+        let mut old_options = QueryOptions::new(1);
+        old_options.filter = Some("superseded_by == 'current.md'".to_string());
+        old_options.include_stale = true;
+        let old = IndexStore::query_with_options(
+            &conn,
+            "shared temporal filter needle old current",
+            &old_options,
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        assert_eq!(
+            old.results
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old.md"]
         );
 
         let _ = fs::remove_dir_all(&vault);
@@ -3445,6 +4433,189 @@ mod tests {
 
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn query_options_apply_temporal_validity_and_quality_breakdown() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!(
+            "orderk-temporal-quality-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("current.md"),
+            "---\ntags: [temporal]\nstatus: active\nconfidence: high\nvalid_from: 2026-05-01\nupdated: 2026-05-18\nsource_type: decision\n---\n# Current\ntemporal-quality needle says use the current active policy.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("stale.md"),
+            "---\ntags: [temporal]\nstatus: stale\nconfidence: low\nvalid_from: 2026-04-01\nvalid_until: 2026-05-01\nsuperseded_by: current.md\nupdated: 2026-04-15\nsource_type: decision\n---\n# Stale\ntemporal-quality needle says use the old superseded policy.\n",
+        )
+        .unwrap();
+
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-temporal-quality-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        let default = IndexStore::query_with_options(
+            &conn,
+            "temporal-quality needle current",
+            &QueryOptions::new(10),
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert_eq!(
+            default
+                .results
+                .iter()
+                .map(|result| result.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current.md"]
+        );
+        let exact_db_path = std::env::temp_dir().join(format!(
+            "orderk-temporal-quality-exact-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut exact_conn = open_db(
+            &exact_db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut exact_conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        let limited_default = IndexStore::query_with_options(
+            &exact_conn,
+            "temporal-quality needle old superseded",
+            &QueryOptions {
+                limit: 1,
+                ..QueryOptions::new(1)
+            },
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        assert_eq!(
+            limited_default
+                .results
+                .first()
+                .map(|result| result.path.as_str()),
+            Some("current.md"),
+            "temporal filtering must run before final limit truncation: {:#?}",
+            limited_default.results
+        );
+        let current = &default.results[0];
+        assert_eq!(current.validity.state.as_str(), "current");
+        assert!(current.validity.stale_reason.is_none(), "{current:#?}");
+        assert!(current.score_breakdown.confidence_boost > 0.0);
+        assert!(current.score_breakdown.status_boost > 0.0);
+        assert!(current.score_breakdown.evidence_count_boost > 0.0);
+        assert!(current.score_breakdown.freshness_boost >= 0.0);
+
+        let include_stale = IndexStore::query_with_options(
+            &conn,
+            "temporal-quality needle old superseded",
+            &QueryOptions {
+                limit: 10,
+                include_stale: true,
+                ..QueryOptions::new(10)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert!(
+            include_stale.results.iter().any(|result| {
+                result.path == "stale.md"
+                    && result.validity.state == "stale"
+                    && result.validity.stale_reason.as_deref() == Some("status:stale")
+            }),
+            "{:#?}",
+            include_stale.results
+        );
+
+        let historical = IndexStore::query_with_options(
+            &conn,
+            "temporal-quality needle old superseded",
+            &QueryOptions {
+                limit: 10,
+                as_of: Some("2026-04-15".to_string()),
+                freshness: FreshnessMode::Off,
+                ..QueryOptions::new(10)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert_eq!(
+            historical
+                .results
+                .first()
+                .map(|result| result.path.as_str()),
+            Some("stale.md"),
+            "{:#?}",
+            historical.results
+        );
+        assert_eq!(historical.results[0].validity.state.as_str(), "historical");
+
+        let recent = IndexStore::query_with_options(
+            &conn,
+            "latest temporal-quality needle policy",
+            &QueryOptions {
+                limit: 10,
+                freshness: FreshnessMode::Recent,
+                include_stale: true,
+                ..QueryOptions::new(10)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert_eq!(
+            recent.results.first().map(|result| result.path.as_str()),
+            Some("current.md"),
+            "{:#?}",
+            recent.results
+        );
+        assert!(
+            recent.results[0].score_breakdown.freshness_boost
+                >= recent.results[0].score_breakdown.recency_boost
+        );
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&exact_db_path);
     }
 
     #[test]

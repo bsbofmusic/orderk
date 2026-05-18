@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
 use orderk_core::{
-    classify_error_message, export_capsule_manifest, feedback, health_report, index_vault, init,
-    inspect_capsule_manifest, provider_from_name, query, query_with_options, status,
-    write_capsule_manifest, EmbeddingProvider, FeedbackEvent, QueryOptions, VectorBackend,
+    classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
+    index_vault, init, inspect_capsule_manifest, provider_from_name, query, query_with_options,
+    status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider,
+    FeedbackEvent, FreshnessMode, QueryOptions, SearchIndexResponse, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -95,6 +96,7 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let db = take_path(&mut args, "--db")?;
             let query_text = take_required_string(&mut args, "--query")?;
             let limit = take_usize(&mut args, "--limit", 10)?;
+            let view = take_string(&mut args, "--view", "full".to_string())?;
             let embedding_provider =
                 take_string(&mut args, "--embedding-provider", "siliconflow".to_string())?;
             let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024)?;
@@ -112,7 +114,15 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let include_links = take_flag(&mut args, "--include-links");
             let expand_links = take_usize(&mut args, "--expand-links", 0)?;
             let retrieval_depth = take_usize(&mut args, "--retrieval-depth", 0)?;
+            let explain = take_flag(&mut args, "--explain");
             let rerank = !take_flag(&mut args, "--no-rerank");
+            let freshness = parse_freshness(&take_string(
+                &mut args,
+                "--freshness",
+                "balanced".to_string(),
+            )?)?;
+            let as_of = take_optional_string(&mut args, "--as-of")?;
+            let include_stale = take_flag(&mut args, "--include-stale");
             let provider = provider_from_name(
                 &embedding_provider,
                 embedding_dim,
@@ -130,9 +140,49 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
                     rerank,
                     expand_links,
                     retrieval_depth,
+                    explain,
+                    freshness,
+                    as_of,
+                    include_stale,
                 },
                 provider.as_ref(),
                 vector_backend,
+            )?;
+            match view.as_str() {
+                "full" => print_json(&resp)?,
+                "index" => print_json(&SearchIndexResponse::from(resp))?,
+                other => return Err(anyhow!("unknown search view: {other}")),
+            }
+        }
+        "get" => {
+            let db = take_path(&mut args, "--db")?;
+            let chunk_id = take_optional_string(&mut args, "--chunk-id")?;
+            let ids = take_optional_string(&mut args, "--ids")?;
+            let detail =
+                parse_get_detail(&take_string(&mut args, "--detail", "full".to_string())?)?;
+            let context_chunks = take_usize(&mut args, "--context-chunks", 0)?.min(3);
+            let mut chunk_ids = Vec::new();
+            if let Some(id) = chunk_id {
+                chunk_ids.push(id);
+            }
+            if let Some(ids) = ids {
+                chunk_ids.extend(
+                    ids.split(',')
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(ToString::to_string),
+                );
+            }
+            if chunk_ids.is_empty() {
+                return Err(anyhow!("get requires --chunk-id or --ids"));
+            }
+            let resp = get_chunks(
+                &db,
+                &ChunkGetOptions {
+                    chunk_ids,
+                    detail,
+                    context_chunks,
+                },
             )?;
             print_json(&resp)?;
         }
@@ -355,6 +405,20 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                 }
             }
         }
+        let mut matched_expected_phrases = Vec::new();
+        for phrase in &case.expected_phrases {
+            let needle = phrase.trim();
+            if needle.is_empty() {
+                continue;
+            }
+            let needle_lower = needle.to_lowercase();
+            if resp.results.iter().any(|result| {
+                expected_seen.contains(&result.path)
+                    && result.snippet.to_lowercase().contains(&needle_lower)
+            }) {
+                matched_expected_phrases.push(phrase.clone());
+            }
+        }
         if top_rank_hit {
             top1_hits += 1;
         }
@@ -385,6 +449,8 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             id: case.id.clone(),
             query: case.query.clone(),
             expected_paths: case.expected_paths.clone(),
+            expected_phrases: case.expected_phrases.clone(),
+            matched_expected_phrases,
             hit: found_rank.is_some(),
             rank: found_rank,
             top_path: resp.results.first().map(|r| r.path.clone()),
@@ -754,6 +820,7 @@ fn handle_mcp_tool_call(
         .unwrap_or_else(|| json!({}));
     let value = match name {
         "search" => mcp_search(config, &arguments)?,
+        "get" => mcp_get(config, &arguments)?,
         "status" => serde_json::to_value(status(&config.db)?)?,
         "health" => mcp_health(config, &arguments)?,
         other => return Err(anyhow!("unknown orderk MCP tool: {other}")),
@@ -809,6 +876,28 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
         .get("rerank")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let explain = arguments
+        .get("explain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let freshness = parse_freshness(
+        arguments
+            .get("freshness")
+            .and_then(|v| v.as_str())
+            .unwrap_or("balanced"),
+    )?;
+    let as_of = arguments
+        .get("as_of")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let include_stale = arguments
+        .get("include_stale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let view = arguments
+        .get("view")
+        .and_then(|v| v.as_str())
+        .unwrap_or("full");
     let provider = provider_from_name(
         &config.embedding_provider,
         config.embedding_dim,
@@ -826,9 +915,65 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
             rerank,
             expand_links,
             retrieval_depth,
+            explain,
+            freshness,
+            as_of,
+            include_stale,
         },
         provider.as_ref(),
         config.vector_backend.clone(),
+    )?;
+    match view {
+        "full" => Ok(serde_json::to_value(response)?),
+        "index" => Ok(serde_json::to_value(SearchIndexResponse::from(response))?),
+        other => Err(anyhow!("unknown search view: {other}")),
+    }
+}
+
+fn mcp_get(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut chunk_ids = Vec::new();
+    if let Some(id) = arguments.get("chunk_id").and_then(|v| v.as_str()) {
+        chunk_ids.push(id.to_string());
+    }
+    if let Some(id) = arguments.get("id").and_then(|v| v.as_str()) {
+        chunk_ids.push(id.to_string());
+    }
+    if let Some(ids) = arguments.get("ids").and_then(|v| v.as_array()) {
+        chunk_ids.extend(
+            ids.iter()
+                .filter_map(|v| v.as_str())
+                .map(ToString::to_string),
+        );
+    }
+    if let Some(ids) = arguments.get("ids").and_then(|v| v.as_str()) {
+        chunk_ids.extend(
+            ids.split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToString::to_string),
+        );
+    }
+    if chunk_ids.is_empty() {
+        return Err(anyhow!("get.ids or get.chunk_id is required"));
+    }
+    let detail = parse_get_detail(
+        arguments
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("full"),
+    )?;
+    let context_chunks = arguments
+        .get("context_chunks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(3) as usize;
+    let response = get_chunks(
+        &config.db,
+        &ChunkGetOptions {
+            chunk_ids,
+            detail,
+            context_chunks,
+        },
     )?;
     Ok(serde_json::to_value(response)?)
 }
@@ -867,16 +1012,34 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
                 "properties": {
                     "query": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
-                    "filter": {"type": "string", "description": "Optional mini filter DSL, e.g. tag == 'rust' && has_code == true && confidence == 'high'"},
+                    "filter": {"type": "string", "description": "Optional mini filter DSL, e.g. tag == 'rust' && has_code == true && confidence == 'high' && valid_from == '2026-05-01' && updated contains '2026-05'"},
                     "min_score": {"type": "number", "description": "Drop results below this fused score"},
                     "threshold": {"type": "number", "description": "Alias for min_score"},
                     "context_chunks": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
+                    "view": {"type": "string", "enum": ["full", "index"], "default": "full", "description": "Use index for compact id/title/score/path cards, then call get for selected chunk IDs"},
                     "include_links": {"type": "boolean", "default": false},
                     "retrieval_depth": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Retrieval depth over authored Obsidian wikilinks/backlinks: 0 direct only, 1 one-hop expansion; deterministic and off by default"},
                     "expand_links": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Compatibility alias for retrieval_depth=1; expands recall one hop along indexed Obsidian wikilinks/backlinks"},
-                    "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, etc.)"}
+                    "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, temporal validity/quality metadata, etc.)"},
+                    "freshness": {"type": "string", "enum": ["off", "balanced", "recent", "oldest"], "default": "balanced", "description": "Temporal rerank mode: off disables freshness boost, recent favors newly updated valid evidence, oldest favors earliest valid evidence"},
+                    "as_of": {"type": "string", "description": "Optional YYYY-MM-DD historical validity date; returns evidence valid at that date instead of only current evidence"},
+                    "include_stale": {"type": "boolean", "default": false, "description": "Include stale/superseded/archived evidence instead of hiding it by default"},
+                    "explain": {"type": "boolean", "default": false, "description": "Include deterministic retrieval trace metadata; off by default"}
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "get",
+            "description": "Read-only explicit chunk fetch by chunk_id after a compact search index pass. Preserves caller order, caps batches at 50, and never writes notes or reindexes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                    "chunk_id": {"type": "string", "description": "Single chunk ID shortcut"},
+                    "detail": {"type": "string", "enum": ["full", "summary"], "default": "full"},
+                    "context_chunks": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0}
+                }
             }
         }),
         json!({
@@ -916,11 +1079,31 @@ fn resolve_provider(
     }
 }
 
+fn parse_get_detail(s: &str) -> Result<ChunkGetDetail> {
+    match s {
+        "full" => Ok(ChunkGetDetail::Full),
+        "summary" => Ok(ChunkGetDetail::Summary),
+        other => Err(anyhow!("unknown get detail: {other}")),
+    }
+}
+
 fn parse_backend(s: &str) -> Result<VectorBackend> {
     match s {
         "sqlite_vec" => Ok(VectorBackend::SqliteVec),
         "exact" => Ok(VectorBackend::Exact),
         other => Err(anyhow!("unknown vector backend: {}", other)),
+    }
+}
+
+fn parse_freshness(s: &str) -> Result<FreshnessMode> {
+    match s {
+        "off" => Ok(FreshnessMode::Off),
+        "balanced" => Ok(FreshnessMode::Balanced),
+        "recent" => Ok(FreshnessMode::Recent),
+        "oldest" => Ok(FreshnessMode::Oldest),
+        other => Err(anyhow!(
+            "unknown freshness mode: {other} (expected off|balanced|recent|oldest)"
+        )),
     }
 }
 
@@ -1018,6 +1201,94 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                 vector_backend,
             )?)?)
         }
+        "search" => {
+            let db = take_path(&mut args, "--db")?;
+            let query_text = take_required_string(&mut args, "--query")?;
+            let limit = take_usize(&mut args, "--limit", 10)?;
+            let view = take_string(&mut args, "--view", "full".to_string())?;
+            let embedding_provider =
+                take_string(&mut args, "--embedding-provider", "mock".to_string())?;
+            let embedding_dim = take_usize(&mut args, "--embedding-dim", 8)?;
+            let embedding_model = take_string(
+                &mut args,
+                "--embedding-model",
+                format!("mock-{embedding_dim}"),
+            )?;
+            let vector_backend = parse_backend(&take_string(
+                &mut args,
+                "--vector-backend",
+                "exact".to_string(),
+            )?)?;
+            let explain = take_flag(&mut args, "--explain");
+            let freshness = parse_freshness(&take_string(
+                &mut args,
+                "--freshness",
+                "balanced".to_string(),
+            )?)?;
+            let as_of = take_optional_string(&mut args, "--as-of")?;
+            let include_stale = take_flag(&mut args, "--include-stale");
+            let provider = provider_from_name(
+                &embedding_provider,
+                embedding_dim,
+                Some(embedding_model.clone()),
+            )?;
+            let response = query_with_options(
+                &db,
+                &query_text,
+                &QueryOptions {
+                    limit,
+                    filter: take_optional_string(&mut args, "--filter")?,
+                    min_score: take_optional_f32(&mut args, "--min-score")?,
+                    context_chunks: take_usize(&mut args, "--context-chunks", 0)?,
+                    include_links: take_flag(&mut args, "--include-links"),
+                    rerank: !take_flag(&mut args, "--no-rerank"),
+                    expand_links: take_usize(&mut args, "--expand-links", 0)?,
+                    retrieval_depth: take_usize(&mut args, "--retrieval-depth", 0)?,
+                    explain,
+                    freshness,
+                    as_of,
+                    include_stale,
+                },
+                provider.as_ref(),
+                vector_backend,
+            )?;
+            match view.as_str() {
+                "full" => Ok(serde_json::to_value(response)?),
+                "index" => Ok(serde_json::to_value(SearchIndexResponse::from(response))?),
+                other => Err(anyhow!("unknown search view: {other}")),
+            }
+        }
+        "get" => {
+            let db = take_path(&mut args, "--db")?;
+            let chunk_id = take_optional_string(&mut args, "--chunk-id")?;
+            let ids = take_optional_string(&mut args, "--ids")?;
+            let detail =
+                parse_get_detail(&take_string(&mut args, "--detail", "full".to_string())?)?;
+            let context_chunks = take_usize(&mut args, "--context-chunks", 0)?.min(3);
+            let mut chunk_ids = Vec::new();
+            if let Some(id) = chunk_id {
+                chunk_ids.push(id);
+            }
+            if let Some(ids) = ids {
+                chunk_ids.extend(
+                    ids.split(',')
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(ToString::to_string),
+                );
+            }
+            if chunk_ids.is_empty() {
+                return Err(anyhow!("get requires --chunk-id or --ids"));
+            }
+            Ok(serde_json::to_value(get_chunks(
+                &db,
+                &ChunkGetOptions {
+                    chunk_ids,
+                    detail,
+                    context_chunks,
+                },
+            )?)?)
+        }
         "capsule" => capsule_command(&mut args),
         other => Err(anyhow!("unsupported test command: {other}")),
     }
@@ -1025,11 +1296,12 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
 
 fn print_usage() {
     eprintln!(
-        "orderk <init|index|search|status|health|doctor|eval|maintain|capsule|mcp|feedback> [--flags]"
+        "orderk <init|index|search|get|status|health|doctor|eval|maintain|capsule|mcp|feedback> [--flags]"
     );
     eprintln!(
-        "search flags include: --query <text> [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--no-rerank]"
+        "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--explain] [--no-rerank]"
     );
+    eprintln!("get flags: --db <orderk.sqlite> (--chunk-id <id> | --ids <id,id>) [--detail full|summary] [--context-chunks <n>]");
     eprintln!(
         "capsule export flags: --db <orderk.sqlite> [--vault <vault>] [--out <capsule.json>]"
     );
@@ -1049,6 +1321,8 @@ struct EvalCase {
     id: String,
     query: String,
     expected_paths: Vec<String>,
+    #[serde(default)]
+    expected_phrases: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1056,6 +1330,10 @@ struct EvalCaseResult {
     id: String,
     query: String,
     expected_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expected_phrases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    matched_expected_phrases: Vec<String>,
     hit: bool,
     rank: Option<usize>,
     top_path: Option<String>,
@@ -1108,10 +1386,13 @@ mod tests {
                     .map(str::to_string)
             })
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["search", "status", "health"]);
-        assert!(!names
-            .iter()
-            .any(|name| matches!(name.as_str(), "index" | "maintain" | "feedback")));
+        assert_eq!(names, vec!["search", "get", "status", "health"]);
+        assert!(!names.iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "index" | "maintain" | "feedback" | "save" | "forget" | "delete" | "chat"
+            )
+        }));
 
         let search_tool = tools
             .iter()
@@ -1132,6 +1413,472 @@ mod tests {
             retrieval_depth.get("default").and_then(|v| v.as_i64()),
             Some(0)
         );
+        let view = search_tool
+            .pointer("/inputSchema/properties/view")
+            .expect("search tool schema must expose compact view selector");
+        assert_eq!(view.get("default").and_then(|v| v.as_str()), Some("full"));
+        let filter_description = search_tool
+            .pointer("/inputSchema/properties/filter/description")
+            .and_then(|value| value.as_str())
+            .expect("search filter schema must describe the mini DSL");
+        assert!(
+            filter_description.contains("valid_from"),
+            "{filter_description}"
+        );
+        assert!(
+            filter_description.contains("updated"),
+            "{filter_description}"
+        );
+        assert!(search_tool
+            .pointer("/inputSchema/properties/freshness/enum")
+            .and_then(|value| value.as_array())
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("recent"))));
+        assert!(search_tool
+            .pointer("/inputSchema/properties/as_of/description")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .contains("YYYY-MM-DD"));
+    }
+
+    #[test]
+    fn mcp_get_tool_call_fetches_selected_chunks_by_id() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-mcp-get-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("memory.md"),
+            "# Memory\nExplicit chunk get should return selected compact recall evidence.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("other.md"),
+            "# Other\nA separate chunk keeps ordering checks meaningful.\n",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let index = run_with_args(vec![
+            "search".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--query".into(),
+            "compact recall evidence".into(),
+            "--view".into(),
+            "index".into(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let chunk_id = index["results"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("chunk_id"))
+            .and_then(|value| value.as_str())
+            .expect("index search returns a chunk_id")
+            .to_string();
+        let config = McpConfig {
+            db,
+            embedding_provider: "mock".to_string(),
+            embedding_dim: 8,
+            embedding_model: "mock-8".to_string(),
+            vector_backend: VectorBackend::Exact,
+        };
+        let response = handle_mcp_message(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {
+                    "name": "get",
+                    "arguments": {
+                        "ids": ["missing", chunk_id.clone(), chunk_id.clone()],
+                        "detail": "summary"
+                    }
+                }
+            }),
+            &config,
+        )
+        .expect("MCP tools/call must return a response");
+        assert!(
+            response.get("error").is_none(),
+            "unexpected MCP error: {response}"
+        );
+        assert_eq!(
+            response.get("id").and_then(|value| value.as_i64()),
+            Some(42)
+        );
+        let structured = response
+            .pointer("/result/structuredContent")
+            .expect("MCP response must include structuredContent");
+        assert_eq!(
+            structured
+                .get("schema_version")
+                .and_then(|value| value.as_str()),
+            Some("orderk.get.v1")
+        );
+        assert_eq!(
+            structured.get("total").and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        let got = structured["results"]
+            .as_array()
+            .and_then(|results| results.first())
+            .expect("MCP get returns selected chunk");
+        assert_eq!(
+            got.get("chunk_id").and_then(|value| value.as_str()),
+            Some(chunk_id.as_str())
+        );
+        assert!(got
+            .get("text")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .contains("compact recall evidence"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compact_recall_flow_search_index_then_get_exact_chunks() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-compact-recall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("auth.md"),
+            "# Auth\nJWT refresh token rotation prevents replay.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("db.md"),
+            "# Database\nUse BRIN indexes for append-only logs.\n",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+
+        let index = run_with_args(vec![
+            "search".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--query".into(),
+            "refresh token".into(),
+            "--limit".into(),
+            "5".into(),
+            "--view".into(),
+            "index".into(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            index.get("schema_version").and_then(|v| v.as_str()),
+            Some("orderk.search_index.v1")
+        );
+        assert_eq!(index.get("view").and_then(|v| v.as_str()), Some("index"));
+        let entries = index
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("compact index returns results array");
+        assert!(!entries.is_empty());
+        for entry in entries {
+            assert!(entry.get("chunk_id").and_then(|v| v.as_str()).is_some());
+            assert!(entry.get("score").and_then(|v| v.as_f64()).is_some());
+            assert!(entry.get("path").and_then(|v| v.as_str()).is_some());
+            assert!(entry.get("line_start").and_then(|v| v.as_u64()).is_some());
+            assert!(entry.get("line_end").and_then(|v| v.as_u64()).is_some());
+            assert!(entry.get("validity").and_then(|v| v.as_object()).is_some());
+            assert!(entry.get("quality").and_then(|v| v.as_object()).is_some());
+            assert!(entry
+                .get("evidence_summary")
+                .and_then(|v| v.as_object())
+                .is_some());
+            assert!(
+                entry.get("snippet").is_none(),
+                "index view must not leak snippets"
+            );
+            assert!(
+                entry.get("text").is_none(),
+                "index view must not leak full text"
+            );
+            assert!(
+                entry.get("context_chunks").is_none(),
+                "index view must not include thick context"
+            );
+        }
+        let chosen_id = entries[0]
+            .get("chunk_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let fetched = run_with_args(vec![
+            "get".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--chunk-id".into(),
+            chosen_id.clone(),
+        ])
+        .unwrap();
+        assert_eq!(
+            fetched.get("schema_version").and_then(|v| v.as_str()),
+            Some("orderk.get.v1")
+        );
+        assert_eq!(fetched.get("total").and_then(|v| v.as_u64()), Some(1));
+        let got = fetched
+            .get("results")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .expect("get returns selected chunk");
+        assert_eq!(
+            got.get("chunk_id").and_then(|v| v.as_str()),
+            Some(chosen_id.as_str())
+        );
+        assert!(got
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("refresh token"));
+    }
+
+    #[test]
+    fn eval_expected_phrases_must_match_expected_path_snippets_only() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-eval-phrase-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("expected.md"),
+            "# Expected\nalpha unique expected path has local evidence only.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("decoy.md"),
+            "# Decoy\nborrowed phrase lives only in the decoy result.\n",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let queries = root.join("queries.json");
+        fs::write(
+            &queries,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "orderk.eval_queries.v1",
+                "queries": [{
+                    "id": "phrase-path-binding",
+                    "query": "alpha unique expected path",
+                    "expected_paths": ["expected.md"],
+                    "expected_phrases": ["borrowed phrase"]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let report = eval_command(&mut vec![
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--queries".into(),
+            queries.to_string_lossy().to_string(),
+            "--limit".into(),
+            "5".into(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let outcome = report["outcomes"]
+            .as_array()
+            .and_then(|outcomes| outcomes.first())
+            .expect("eval returns the test case outcome");
+        assert_eq!(outcome.get("hit").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            outcome.get("matched_expected_phrases").is_none(),
+            "decoy-only phrase must not satisfy expected path evidence: {outcome}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_search_results_include_quality_and_evidence_summary() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-quality-summary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("quality.md"),
+            "---
+confidence: high
+status: active
+source_type: audit
+updated: 2026-05-18
+valid_from: 2026-05-01
+---
+# Quality
+Temporal quality summary needle keeps evidence readable.
+",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let full = run_with_args(vec![
+            "search".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--query".into(),
+            "Temporal quality summary needle".into(),
+            "--freshness".into(),
+            "recent".into(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let result = full["results"]
+            .as_array()
+            .and_then(|results| results.first())
+            .expect("full search returns result");
+        assert_eq!(
+            result
+                .pointer("/quality/schema_version")
+                .and_then(|v| v.as_str()),
+            Some("orderk.quality_summary.v1")
+        );
+        assert!(result
+            .pointer("/quality/total_boost")
+            .and_then(|v| v.as_f64())
+            .is_some_and(|value| value > 0.0));
+        assert_eq!(
+            result
+                .pointer("/evidence_summary/schema_version")
+                .and_then(|v| v.as_str()),
+            Some("orderk.evidence_summary.v1")
+        );
+        assert_eq!(
+            result
+                .pointer("/evidence_summary/validity_state")
+                .and_then(|v| v.as_str()),
+            Some("current")
+        );
+        assert_eq!(
+            result
+                .pointer("/evidence_summary/confidence")
+                .and_then(|v| v.as_str()),
+            Some("high")
+        );
+        assert!(result
+            .pointer("/evidence_summary/evidence_uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .starts_with("orderk://chunk/"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

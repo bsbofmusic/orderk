@@ -46,6 +46,11 @@ pub struct ParsedDocument {
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub source_type: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub supersedes: Option<String>,
+    pub superseded_by: Option<String>,
+    pub updated: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +71,11 @@ pub struct Chunk {
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub source_type: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub supersedes: Option<String>,
+    pub superseded_by: Option<String>,
+    pub updated: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +252,75 @@ pub struct ScoreBreakdown {
     pub metadata_boost: f32,
     #[serde(default)]
     pub link_boost: f32,
+    #[serde(default)]
+    pub freshness_boost: f32,
+    #[serde(default)]
+    pub confidence_boost: f32,
+    #[serde(default)]
+    pub status_boost: f32,
+    #[serde(default)]
+    pub evidence_count_boost: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessMode {
+    Off,
+    #[default]
+    Balanced,
+    Recent,
+    Oldest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ValidityEvidence {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_days: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QualitySummary {
+    pub schema_version: String,
+    pub freshness_boost: f32,
+    pub confidence_boost: f32,
+    pub status_boost: f32,
+    pub evidence_count_boost: f32,
+    pub total_boost: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceSummary {
+    pub schema_version: String,
+    pub validity_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_days: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    pub evidence_count: usize,
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub evidence_uri: String,
+    #[serde(default)]
+    pub open_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -307,6 +386,14 @@ pub struct QueryOptions {
     pub expand_links: usize,
     #[serde(default)]
     pub retrieval_depth: usize,
+    #[serde(default)]
+    pub explain: bool,
+    #[serde(default)]
+    pub freshness: FreshnessMode,
+    #[serde(default)]
+    pub as_of: Option<String>,
+    #[serde(default)]
+    pub include_stale: bool,
 }
 
 fn default_rerank() -> bool {
@@ -324,6 +411,10 @@ impl QueryOptions {
             rerank: default_rerank(),
             expand_links: 0,
             retrieval_depth: 0,
+            explain: false,
+            freshness: FreshnessMode::default(),
+            as_of: None,
+            include_stale: false,
         }
     }
 
@@ -335,6 +426,17 @@ impl QueryOptions {
             return Err("--retrieval-depth currently supports 0 or 1".to_string());
         }
         Ok(self.expand_links.max(self.retrieval_depth))
+    }
+}
+
+#[cfg(test)]
+mod model_contract_tests {
+    use super::*;
+
+    #[test]
+    fn query_options_default_keeps_explain_trace_off() {
+        let options = QueryOptions::new(3);
+        assert!(!options.explain);
     }
 }
 
@@ -374,6 +476,40 @@ pub struct QueryRoutingEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryExplainStage {
+    pub name: String,
+    pub candidates: usize,
+    pub took_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryExplainResult {
+    pub rank: usize,
+    pub chunk_id: String,
+    pub path: String,
+    pub score: f32,
+    pub sources: Vec<String>,
+    pub keyword_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryExplainTrace {
+    pub schema_version: String,
+    pub route: String,
+    pub strategy: String,
+    pub vector_backend: String,
+    pub limit: usize,
+    pub returned: usize,
+    pub filter: Option<String>,
+    pub min_score: Option<f32>,
+    pub retrieval_depth: usize,
+    pub timings: QueryTimings,
+    pub stages: Vec<QueryExplainStage>,
+    pub result_ranks: Vec<QueryExplainResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub chunk_id: String,
     pub file_path: String,
@@ -382,16 +518,36 @@ pub struct SearchResult {
     pub heading: Option<String>,
     pub line_start: usize,
     pub line_end: usize,
+    #[serde(default)]
+    pub evidence_uri: String,
+    #[serde(default)]
+    pub open_uri: String,
     pub snippet: String,
     pub score: f32,
     pub score_breakdown: ScoreBreakdown,
     pub evidence: SearchResultEvidence,
+    #[serde(default)]
+    pub quality: QualitySummary,
+    #[serde(default)]
+    pub evidence_summary: EvidenceSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_chunks: Vec<SearchContextChunk>,
     pub tags: Vec<String>,
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub source_type: Option<String>,
+    #[serde(default)]
+    pub validity: ValidityEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
     pub mtime: Option<DateTime<Utc>>,
 }
 
@@ -404,7 +560,155 @@ pub struct QueryResponse {
     pub route: String,
     pub routing: QueryRoutingEvidence,
     pub vector_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<QueryExplainTrace>,
     pub results: Vec<SearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchIndexEntry {
+    pub chunk_id: String,
+    pub title: Option<String>,
+    pub score: f32,
+    pub path: String,
+    pub heading: Option<String>,
+    pub line_start: usize,
+    pub line_end: usize,
+    #[serde(default)]
+    pub evidence_uri: String,
+    #[serde(default)]
+    pub open_uri: String,
+    #[serde(default)]
+    pub validity: ValidityEvidence,
+    #[serde(default)]
+    pub quality: QualitySummary,
+    #[serde(default)]
+    pub evidence_summary: EvidenceSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchIndexResponse {
+    pub schema_version: String,
+    pub query: String,
+    pub query_id: String,
+    pub took_ms: u128,
+    pub view: String,
+    pub mode: String,
+    pub route: String,
+    pub routing: QueryRoutingEvidence,
+    pub vector_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<QueryExplainTrace>,
+    pub results: Vec<SearchIndexEntry>,
+}
+
+impl From<QueryResponse> for SearchIndexResponse {
+    fn from(response: QueryResponse) -> Self {
+        let results = response
+            .results
+            .into_iter()
+            .map(|result| SearchIndexEntry {
+                chunk_id: result.chunk_id,
+                title: result
+                    .title
+                    .or_else(|| result.heading.clone())
+                    .or(Some(result.path.clone())),
+                score: result.score,
+                path: result.path,
+                heading: result.heading,
+                line_start: result.line_start,
+                line_end: result.line_end,
+                evidence_uri: result.evidence_uri,
+                open_uri: result.open_uri,
+                validity: result.validity,
+                quality: result.quality,
+                evidence_summary: result.evidence_summary,
+            })
+            .collect();
+        let explain = response.explain;
+        Self {
+            schema_version: "orderk.search_index.v1".to_string(),
+            query: response.query,
+            query_id: response.query_id,
+            took_ms: response.took_ms,
+            view: "index".to_string(),
+            mode: response.mode,
+            route: response.route,
+            routing: response.routing,
+            vector_backend: response.vector_backend,
+            explain,
+            results,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkGetDetail {
+    Summary,
+    Full,
+}
+
+impl ChunkGetDetail {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkGetOptions {
+    pub chunk_ids: Vec<String>,
+    #[serde(default = "default_chunk_get_detail")]
+    pub detail: ChunkGetDetail,
+    #[serde(default)]
+    pub context_chunks: usize,
+}
+
+fn default_chunk_get_detail() -> ChunkGetDetail {
+    ChunkGetDetail::Full
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkGetResult {
+    pub chunk_id: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub heading: Option<String>,
+    pub line_start: usize,
+    pub line_end: usize,
+    #[serde(default)]
+    pub evidence_uri: String,
+    #[serde(default)]
+    pub open_uri: String,
+    pub text: String,
+    pub tags: Vec<String>,
+    pub confidence: Option<String>,
+    pub status: Option<String>,
+    pub source_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+    pub mtime: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_chunks: Vec<SearchContextChunk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkGetResponse {
+    pub schema_version: String,
+    pub total: usize,
+    pub detail: ChunkGetDetail,
+    pub results: Vec<ChunkGetResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

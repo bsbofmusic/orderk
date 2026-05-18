@@ -75,6 +75,19 @@ class EvalQualityGateTest(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn("missing required case id: missing", "\n".join(result["failures"]))
 
+    def test_eval_quality_gate_rejects_missing_expected_phrase_evidence(self) -> None:
+        report = self.perfect_report()
+        report["outcomes"][0].update(
+            {
+                "expected_phrases": ["sqlite vec semantic search"],
+                "matched_expected_phrases": [],
+            }
+        )
+        result = orderk_eval.validate_eval_quality(report, self.baseline())
+        self.assertFalse(result["ok"], result)
+        joined = "\n".join(result["failures"])
+        self.assertIn("case alpha missing expected phrase", joined)
+
     def test_fixture_files_must_exist(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orderk-eval-fixture-test-") as tmp:
             root = pathlib.Path(tmp)

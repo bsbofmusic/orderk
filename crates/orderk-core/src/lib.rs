@@ -10,8 +10,8 @@ pub mod models;
 pub mod scanner;
 
 pub use api::{
-    feedback, index_vault, init, provider_from_env, provider_from_name, query, query_with_filter,
-    query_with_options, status,
+    feedback, get_chunks, index_vault, init, provider_from_env, provider_from_name, query,
+    query_with_filter, query_with_options, status,
 };
 pub use capsule::{export_capsule_manifest, inspect_capsule_manifest, write_capsule_manifest};
 pub use embedding::{EmbeddingProvider, MockEmbeddingProvider, SiliconFlowM3Provider};
@@ -75,7 +75,7 @@ mod capsule_contract_tests {
             .files
             .iter()
             .any(|file| file.role == "main"));
-        assert_eq!(manifest.profile.schema_version, "4");
+        assert_eq!(manifest.profile.schema_version, "5");
         assert_eq!(manifest.profile.embedding_provider, "mock");
         assert_eq!(manifest.profile.embedding_model, "mock-8");
         assert_eq!(manifest.profile.embedding_dim, 8);

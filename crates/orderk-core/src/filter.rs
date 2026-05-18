@@ -28,6 +28,11 @@ pub enum FilterField {
     Confidence,
     Status,
     SourceType,
+    ValidFrom,
+    ValidUntil,
+    Updated,
+    Supersedes,
+    SupersededBy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +116,12 @@ fn condition_to_sql(condition: &FilterCondition, alias: &str) -> Result<FilterSq
         | FilterField::Heading
         | FilterField::Confidence
         | FilterField::Status
-        | FilterField::SourceType => compile_string_condition(condition, alias),
+        | FilterField::SourceType
+        | FilterField::ValidFrom
+        | FilterField::ValidUntil
+        | FilterField::Updated
+        | FilterField::Supersedes
+        | FilterField::SupersededBy => compile_string_condition(condition, alias),
     }
 }
 
@@ -184,6 +194,11 @@ fn string_column(field: FilterField, alias: &str) -> Result<String> {
         FilterField::Confidence => "confidence",
         FilterField::Status => "status",
         FilterField::SourceType => "source_type",
+        FilterField::ValidFrom => "valid_from",
+        FilterField::ValidUntil => "valid_until",
+        FilterField::Updated => "updated",
+        FilterField::Supersedes => "supersedes",
+        FilterField::SupersededBy => "superseded_by",
         _ => return Err(anyhow!("invalid filter: field is not a string field")),
     };
     Ok(format!("{alias}.{name}"))
@@ -252,7 +267,12 @@ fn validate_operator_value(field: FilterField, op: FilterOp, value: &FilterValue
         | FilterField::Heading
         | FilterField::Confidence
         | FilterField::Status
-        | FilterField::SourceType => {
+        | FilterField::SourceType
+        | FilterField::ValidFrom
+        | FilterField::ValidUntil
+        | FilterField::Updated
+        | FilterField::Supersedes
+        | FilterField::SupersededBy => {
             if matches!(value, FilterValue::String(_)) {
                 Ok(())
             } else {
@@ -304,6 +324,11 @@ fn parse_field(raw: &str) -> Result<FilterField> {
         "confidence" => Ok(FilterField::Confidence),
         "status" => Ok(FilterField::Status),
         "source_type" => Ok(FilterField::SourceType),
+        "valid_from" => Ok(FilterField::ValidFrom),
+        "valid_until" => Ok(FilterField::ValidUntil),
+        "updated" => Ok(FilterField::Updated),
+        "supersedes" => Ok(FilterField::Supersedes),
+        "superseded_by" => Ok(FilterField::SupersededBy),
         _ => Err(anyhow!("invalid filter: unknown field `{raw}`")),
     }
 }
@@ -500,6 +525,28 @@ mod tests {
             sql.sql
         );
         assert_eq!(sql.args.len(), 4);
+    }
+
+    #[test]
+    fn temporal_fields_are_whitelisted_and_parameterized() {
+        let sql = compile_filter(
+            Some("valid_from == '2026-05-01' && updated contains '2026-05' && superseded_by != 'old.md'"),
+            "c",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(sql.sql.contains("c.valid_from"), "{}", sql.sql);
+        assert!(sql.sql.contains("c.updated"), "{}", sql.sql);
+        assert!(sql.sql.contains("c.superseded_by"), "{}", sql.sql);
+        assert!(!sql.sql.contains("2026-05-01"), "{}", sql.sql);
+        assert_eq!(
+            sql.args,
+            vec![
+                Value::Text("2026-05-01".to_string()),
+                Value::Text("2026-05".to_string()),
+                Value::Text("old.md".to_string()),
+            ]
+        );
     }
 
     #[test]
