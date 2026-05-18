@@ -214,9 +214,14 @@ struct ReindexFileSummary {
 
 pub(crate) fn register_sqlite_vec() {
     SQLITE_VEC_REGISTER.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite3_vec_init as *const (),
-        )));
+        type SqliteAutoExtension = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *const i8,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> i32;
+        let extension =
+            std::mem::transmute::<*const (), SqliteAutoExtension>(sqlite3_vec_init as *const ());
+        rusqlite::ffi::sqlite3_auto_extension(Some(extension));
     });
 }
 
@@ -1152,7 +1157,7 @@ fn reindex_file<P: EmbeddingProvider + ?Sized>(
          ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size, hash=excluded.hash, indexed_at=excluded.indexed_at",
         params![file.path, file.mtime, file.size as i64, file.hash, Utc::now().to_rfc3339()],
     )?;
-    for (chunk, record) in chunks.iter().zip(records.into_iter()) {
+    for (chunk, record) in chunks.iter().zip(records) {
         let record =
             record.ok_or_else(|| anyhow!("missing embedding record for chunk {}", chunk.id))?;
         let tags = serde_json::to_string(&chunk.tags)?;

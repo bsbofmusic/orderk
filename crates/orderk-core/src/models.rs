@@ -262,19 +262,14 @@ pub struct ScoreBreakdown {
     pub evidence_count_boost: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FreshnessMode {
     Off,
+    #[default]
     Balanced,
     Recent,
     Oldest,
-}
-
-impl Default for FreshnessMode {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
