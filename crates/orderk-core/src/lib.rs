@@ -75,7 +75,7 @@ mod capsule_contract_tests {
             .files
             .iter()
             .any(|file| file.role == "main"));
-        assert_eq!(manifest.profile.schema_version, "4");
+        assert_eq!(manifest.profile.schema_version, "5");
         assert_eq!(manifest.profile.embedding_provider, "mock");
         assert_eq!(manifest.profile.embedding_model, "mock-8");
         assert_eq!(manifest.profile.embedding_dim, 8);

@@ -3,7 +3,7 @@ use orderk_core::{
     classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
     index_vault, init, inspect_capsule_manifest, provider_from_name, query, query_with_options,
     status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider,
-    FeedbackEvent, QueryOptions, SearchIndexResponse, VectorBackend,
+    FeedbackEvent, FreshnessMode, QueryOptions, SearchIndexResponse, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -116,6 +116,13 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let retrieval_depth = take_usize(&mut args, "--retrieval-depth", 0)?;
             let explain = take_flag(&mut args, "--explain");
             let rerank = !take_flag(&mut args, "--no-rerank");
+            let freshness = parse_freshness(&take_string(
+                &mut args,
+                "--freshness",
+                "balanced".to_string(),
+            )?)?;
+            let as_of = take_optional_string(&mut args, "--as-of")?;
+            let include_stale = take_flag(&mut args, "--include-stale");
             let provider = provider_from_name(
                 &embedding_provider,
                 embedding_dim,
@@ -134,6 +141,9 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
                     expand_links,
                     retrieval_depth,
                     explain,
+                    freshness,
+                    as_of,
+                    include_stale,
                 },
                 provider.as_ref(),
                 vector_backend,
@@ -870,6 +880,20 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
         .get("explain")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let freshness = parse_freshness(
+        arguments
+            .get("freshness")
+            .and_then(|v| v.as_str())
+            .unwrap_or("balanced"),
+    )?;
+    let as_of = arguments
+        .get("as_of")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let include_stale = arguments
+        .get("include_stale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let view = arguments
         .get("view")
         .and_then(|v| v.as_str())
@@ -892,6 +916,9 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
             expand_links,
             retrieval_depth,
             explain,
+            freshness,
+            as_of,
+            include_stale,
         },
         provider.as_ref(),
         config.vector_backend.clone(),
@@ -993,7 +1020,10 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
                     "include_links": {"type": "boolean", "default": false},
                     "retrieval_depth": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Retrieval depth over authored Obsidian wikilinks/backlinks: 0 direct only, 1 one-hop expansion; deterministic and off by default"},
                     "expand_links": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Compatibility alias for retrieval_depth=1; expands recall one hop along indexed Obsidian wikilinks/backlinks"},
-                    "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, etc.)"},
+                    "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, temporal validity/quality metadata, etc.)"},
+                    "freshness": {"type": "string", "enum": ["off", "balanced", "recent", "oldest"], "default": "balanced", "description": "Temporal rerank mode: off disables freshness boost, recent favors newly updated valid evidence, oldest favors earliest valid evidence"},
+                    "as_of": {"type": "string", "description": "Optional YYYY-MM-DD historical validity date; returns evidence valid at that date instead of only current evidence"},
+                    "include_stale": {"type": "boolean", "default": false, "description": "Include stale/superseded/archived evidence instead of hiding it by default"},
                     "explain": {"type": "boolean", "default": false, "description": "Include deterministic retrieval trace metadata; off by default"}
                 },
                 "required": ["query"]
@@ -1062,6 +1092,18 @@ fn parse_backend(s: &str) -> Result<VectorBackend> {
         "sqlite_vec" => Ok(VectorBackend::SqliteVec),
         "exact" => Ok(VectorBackend::Exact),
         other => Err(anyhow!("unknown vector backend: {}", other)),
+    }
+}
+
+fn parse_freshness(s: &str) -> Result<FreshnessMode> {
+    match s {
+        "off" => Ok(FreshnessMode::Off),
+        "balanced" => Ok(FreshnessMode::Balanced),
+        "recent" => Ok(FreshnessMode::Recent),
+        "oldest" => Ok(FreshnessMode::Oldest),
+        other => Err(anyhow!(
+            "unknown freshness mode: {other} (expected off|balanced|recent|oldest)"
+        )),
     }
 }
 
@@ -1178,6 +1220,13 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                 "exact".to_string(),
             )?)?;
             let explain = take_flag(&mut args, "--explain");
+            let freshness = parse_freshness(&take_string(
+                &mut args,
+                "--freshness",
+                "balanced".to_string(),
+            )?)?;
+            let as_of = take_optional_string(&mut args, "--as-of")?;
+            let include_stale = take_flag(&mut args, "--include-stale");
             let provider = provider_from_name(
                 &embedding_provider,
                 embedding_dim,
@@ -1196,6 +1245,9 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                     expand_links: take_usize(&mut args, "--expand-links", 0)?,
                     retrieval_depth: take_usize(&mut args, "--retrieval-depth", 0)?,
                     explain,
+                    freshness,
+                    as_of,
+                    include_stale,
                 },
                 provider.as_ref(),
                 vector_backend,

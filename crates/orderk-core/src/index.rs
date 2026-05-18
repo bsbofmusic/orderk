@@ -5,7 +5,7 @@ use crate::markdown::parse_markdown;
 use crate::models::*;
 use crate::scanner::scan_vault;
 use anyhow::{anyhow, Context, Result};
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use sqlite_vec::sqlite3_vec_init;
@@ -278,6 +278,11 @@ pub fn init_schema(
             confidence TEXT,
             status TEXT,
             source_type TEXT,
+            valid_from TEXT,
+            valid_until TEXT,
+            supersedes TEXT,
+            superseded_by TEXT,
+            updated TEXT,
             chunk_hash TEXT NOT NULL,
             mtime INTEGER NOT NULL
         );
@@ -320,7 +325,7 @@ pub fn init_schema(
     upsert_setting(conn, "embedding_model", embedding_model)?;
     upsert_setting(conn, "vector_backend", vector_backend.as_str())?;
     upsert_setting(conn, "vector_backend_mode", vector_backend.as_str())?;
-    upsert_setting(conn, "schema_version", "4")?;
+    upsert_setting(conn, "schema_version", "5")?;
     Ok(())
 }
 
@@ -368,6 +373,23 @@ pub(crate) fn migrate_chunk_metadata_columns(conn: &Connection) -> Result<()> {
             "source_type",
             "ALTER TABLE chunks ADD COLUMN source_type TEXT",
         ),
+        (
+            "valid_from",
+            "ALTER TABLE chunks ADD COLUMN valid_from TEXT",
+        ),
+        (
+            "valid_until",
+            "ALTER TABLE chunks ADD COLUMN valid_until TEXT",
+        ),
+        (
+            "supersedes",
+            "ALTER TABLE chunks ADD COLUMN supersedes TEXT",
+        ),
+        (
+            "superseded_by",
+            "ALTER TABLE chunks ADD COLUMN superseded_by TEXT",
+        ),
+        ("updated", "ALTER TABLE chunks ADD COLUMN updated TEXT"),
     ];
     let mut added_any = false;
     for (column, sql) in migrations {
@@ -376,10 +398,10 @@ pub(crate) fn migrate_chunk_metadata_columns(conn: &Connection) -> Result<()> {
             added_any = true;
         }
     }
-    if added_any || schema_version.as_deref() != Some("4") {
+    if added_any || schema_version.as_deref() != Some("5") {
         backfill_chunk_metadata(conn)?;
     }
-    upsert_setting(conn, "schema_version", "4")?;
+    upsert_setting(conn, "schema_version", "5")?;
     Ok(())
 }
 
@@ -919,6 +941,7 @@ impl IndexStore {
             routing.timings.link_expansion_ms = expansion_started.elapsed().as_millis();
             routing.merged_candidates = results.len();
         }
+        apply_temporal_quality(&mut results, options, query)?;
         let filtered_candidates = results.len();
         if let Some(min_score) = options.min_score {
             let before_threshold = results.len();
@@ -1133,8 +1156,8 @@ fn reindex_file<P: EmbeddingProvider + ?Sized>(
             record.ok_or_else(|| anyhow!("missing embedding record for chunk {}", chunk.id))?;
         let tags = serde_json::to_string(&chunk.tags)?;
         tx.execute(
-            "INSERT INTO chunks(chunk_id, file_path, file_hash, title, heading, line_start, line_end, text, tags_json, links_json, has_code, has_link, has_task_list, has_incomplete_tasks, confidence, status, source_type, chunk_hash, mtime)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            "INSERT INTO chunks(chunk_id, file_path, file_hash, title, heading, line_start, line_end, text, tags_json, links_json, has_code, has_link, has_task_list, has_incomplete_tasks, confidence, status, source_type, valid_from, valid_until, supersedes, superseded_by, updated, chunk_hash, mtime)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 chunk.id,
                 chunk.file_path,
@@ -1153,6 +1176,11 @@ fn reindex_file<P: EmbeddingProvider + ?Sized>(
                 chunk.confidence,
                 chunk.status,
                 chunk.source_type,
+                chunk.valid_from,
+                chunk.valid_until,
+                chunk.supersedes,
+                chunk.superseded_by,
+                chunk.updated,
                 chunk.hash,
                 file.mtime,
             ],
@@ -1547,7 +1575,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
     conn: &Connection,
     query: &str,
     plan: &QueryPlan,
-    limit: usize,
+    _limit: usize,
     provider: &P,
     filter: Option<&FilterSql>,
     rerank: bool,
@@ -1556,7 +1584,7 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
     let vector_started = Instant::now();
     let qvec = provider.embed_query(query)?;
     let mut sql = String::from(
-        "SELECT c.id, c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, e.embedding, f.mtime, f.hash, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type
+        "SELECT c.id, c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, e.embedding, f.mtime, f.hash, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type, c.valid_from, c.valid_until, c.supersedes, c.superseded_by, c.updated
          FROM chunks c
          JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id
          LEFT JOIN files f ON f.path = c.file_path
@@ -1589,6 +1617,11 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             row.get::<_, Option<String>>(17)?,
             row.get::<_, Option<String>>(18)?,
             row.get::<_, Option<String>>(19)?,
+            row.get::<_, Option<String>>(20)?,
+            row.get::<_, Option<String>>(21)?,
+            row.get::<_, Option<String>>(22)?,
+            row.get::<_, Option<String>>(23)?,
+            row.get::<_, Option<String>>(24)?,
         ))
     })?;
     let mut scored = Vec::new();
@@ -1614,6 +1647,11 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             confidence,
             status,
             source_type,
+            valid_from,
+            valid_until,
+            supersedes,
+            superseded_by,
+            updated,
         ) = row?;
         let distance = l2_distance(&qvec, &vec);
         let vector_score = distance_to_score(distance);
@@ -1653,6 +1691,11 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             confidence,
             status,
             source_type,
+            valid_from,
+            valid_until,
+            supersedes,
+            superseded_by,
+            updated,
             rerank,
         )?;
         scored.push(result);
@@ -1671,7 +1714,6 @@ fn query_exact<P: EmbeddingProvider + ?Sized>(
             result.evidence.sources.push("vector".to_string());
         }
     }
-    scored.truncate(limit);
     let routing = QueryRoutingEvidence {
         strategy: "exact".to_string(),
         route: plan.route.as_str().to_string(),
@@ -1709,7 +1751,7 @@ fn load_chunk_result(
     rerank: bool,
 ) -> Result<Option<SearchResult>> {
     let mut sql = String::from(
-        "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, f.mtime, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type
+        "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, f.mtime, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type, c.valid_from, c.valid_until, c.supersedes, c.superseded_by, c.updated
          FROM chunks c
          LEFT JOIN files f ON f.path = c.file_path
          WHERE c.id = ?",
@@ -1738,6 +1780,11 @@ fn load_chunk_result(
                 row.get::<_, Option<String>>(14)?,
                 row.get::<_, Option<String>>(15)?,
                 row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
+                row.get::<_, Option<String>>(19)?,
+                row.get::<_, Option<String>>(20)?,
+                row.get::<_, Option<String>>(21)?,
             ))
         })
         .optional()?;
@@ -1759,6 +1806,11 @@ fn load_chunk_result(
         confidence,
         status,
         source_type,
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
     )) = row
     else {
         return Ok(None);
@@ -1788,9 +1840,313 @@ fn load_chunk_result(
         confidence,
         status,
         source_type,
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
         rerank,
     )
     .map(Some)
+}
+
+fn parse_orderk_date(value: Option<&str>) -> Option<NaiveDate> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    NaiveDate::parse_from_str(value.get(..10).unwrap_or(value), "%Y-%m-%d").ok()
+}
+
+fn query_has_recent_cue(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "recent", "recently", "latest", "current", "today", "现在", "最新", "当前",
+    ]
+    .iter()
+    .any(|cue| q.contains(cue))
+}
+
+fn query_has_oldest_cue(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "first",
+        "earliest",
+        "originally",
+        "oldest",
+        "最早",
+        "原始",
+        "历史",
+    ]
+    .iter()
+    .any(|cue| q.contains(cue))
+}
+
+fn confidence_boost_value(confidence: Option<&str>) -> f32 {
+    match confidence.unwrap_or("").trim().to_lowercase().as_str() {
+        "verified" | "high" => 0.025,
+        "observed" | "medium" => 0.012,
+        "inferred" | "low" => -0.01,
+        "stale" => -0.03,
+        _ => 0.0,
+    }
+}
+
+fn status_boost_value(status: Option<&str>, state: &str) -> f32 {
+    if state == "stale" {
+        return -0.04;
+    }
+    match status.unwrap_or("").trim().to_lowercase().as_str() {
+        "active" | "current" | "valid" => 0.025,
+        "draft" | "review" => 0.005,
+        "stale" | "superseded" | "archived" | "deprecated" => -0.04,
+        _ => 0.0,
+    }
+}
+
+fn evidence_count_boost_value(result: &SearchResult) -> f32 {
+    let count = result.evidence.sources.len().min(4) as f32;
+    if count > 0.0 {
+        0.005 * count
+    } else {
+        0.0
+    }
+}
+
+fn freshness_boost_value(
+    mode: &FreshnessMode,
+    query: &str,
+    age_days: Option<i64>,
+    state: &str,
+) -> f32 {
+    if state == "stale" {
+        return -0.02;
+    }
+    let Some(age_days) = age_days else {
+        return 0.0;
+    };
+    match mode {
+        FreshnessMode::Off => 0.0,
+        FreshnessMode::Balanced => {
+            if query_has_recent_cue(query) && age_days <= 30 {
+                0.03
+            } else if age_days <= 30 {
+                0.01
+            } else {
+                0.0
+            }
+        }
+        FreshnessMode::Recent => {
+            if age_days <= 30 {
+                0.05
+            } else if age_days <= 180 {
+                0.02
+            } else {
+                0.0
+            }
+        }
+        FreshnessMode::Oldest => {
+            if query_has_oldest_cue(query) || age_days >= 180 {
+                0.03
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
+fn build_validity(result: &SearchResult, as_of: Option<NaiveDate>) -> ValidityEvidence {
+    let reference_date = as_of.unwrap_or_else(|| Utc::now().date_naive());
+    let valid_from = parse_orderk_date(result.valid_from.as_deref());
+    let valid_until = parse_orderk_date(result.valid_until.as_deref());
+    let updated = parse_orderk_date(result.updated.as_deref())
+        .or_else(|| result.mtime.map(|mtime| mtime.date_naive()));
+    let age_days = updated.map(|updated| (reference_date - updated).num_days().max(0));
+
+    if let Some(start) = valid_from {
+        if start > reference_date {
+            return ValidityEvidence {
+                state: "stale".to_string(),
+                stale_reason: Some("not_yet_valid".to_string()),
+                age_days,
+                valid_from: result.valid_from.clone(),
+                valid_until: result.valid_until.clone(),
+                supersedes: result.supersedes.clone(),
+                superseded_by: result.superseded_by.clone(),
+                updated: result.updated.clone(),
+            };
+        }
+    }
+    let status_l = result.status.as_deref().unwrap_or("").trim().to_lowercase();
+    if as_of.is_none()
+        && matches!(
+            status_l.as_str(),
+            "stale" | "superseded" | "archived" | "deprecated"
+        )
+    {
+        return ValidityEvidence {
+            state: "stale".to_string(),
+            stale_reason: Some(format!("status:{status_l}")),
+            age_days,
+            valid_from: result.valid_from.clone(),
+            valid_until: result.valid_until.clone(),
+            supersedes: result.supersedes.clone(),
+            superseded_by: result.superseded_by.clone(),
+            updated: result.updated.clone(),
+        };
+    }
+
+    if let Some(end) = valid_until {
+        if end < reference_date {
+            return ValidityEvidence {
+                state: "stale".to_string(),
+                stale_reason: Some("valid_until".to_string()),
+                age_days,
+                valid_from: result.valid_from.clone(),
+                valid_until: result.valid_until.clone(),
+                supersedes: result.supersedes.clone(),
+                superseded_by: result.superseded_by.clone(),
+                updated: result.updated.clone(),
+            };
+        }
+    }
+
+    if as_of.is_some() {
+        return ValidityEvidence {
+            state: "historical".to_string(),
+            stale_reason: None,
+            age_days,
+            valid_from: result.valid_from.clone(),
+            valid_until: result.valid_until.clone(),
+            supersedes: result.supersedes.clone(),
+            superseded_by: result.superseded_by.clone(),
+            updated: result.updated.clone(),
+        };
+    }
+    if result
+        .superseded_by
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        return ValidityEvidence {
+            state: "stale".to_string(),
+            stale_reason: Some("superseded_by".to_string()),
+            age_days,
+            valid_from: result.valid_from.clone(),
+            valid_until: result.valid_until.clone(),
+            supersedes: result.supersedes.clone(),
+            superseded_by: result.superseded_by.clone(),
+            updated: result.updated.clone(),
+        };
+    }
+
+    ValidityEvidence {
+        state: "current".to_string(),
+        stale_reason: None,
+        age_days,
+        valid_from: result.valid_from.clone(),
+        valid_until: result.valid_until.clone(),
+        supersedes: result.supersedes.clone(),
+        superseded_by: result.superseded_by.clone(),
+        updated: result.updated.clone(),
+    }
+}
+
+fn result_has_temporal_quality_metadata(result: &SearchResult) -> bool {
+    result
+        .confidence
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .status
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .source_type
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .valid_from
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .valid_until
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .supersedes
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .superseded_by
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || result
+            .updated
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+}
+
+fn apply_temporal_quality(
+    results: &mut Vec<SearchResult>,
+    options: &QueryOptions,
+    query: &str,
+) -> Result<()> {
+    let as_of = match options
+        .as_of
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(raw) => Some(
+            parse_orderk_date(Some(raw))
+                .ok_or_else(|| anyhow!("--as-of must use YYYY-MM-DD or RFC3339 date prefix"))?,
+        ),
+        None => None,
+    };
+
+    for result in results.iter_mut() {
+        result.validity = build_validity(result, as_of);
+        let has_temporal_quality = result_has_temporal_quality_metadata(result)
+            || as_of.is_some()
+            || query_has_recent_cue(query)
+            || query_has_oldest_cue(query)
+            || matches!(
+                options.freshness,
+                FreshnessMode::Recent | FreshnessMode::Oldest
+            );
+        if options.rerank && has_temporal_quality {
+            let freshness = freshness_boost_value(
+                &options.freshness,
+                query,
+                result.validity.age_days,
+                &result.validity.state,
+            );
+            let confidence = confidence_boost_value(result.confidence.as_deref());
+            let status = status_boost_value(result.status.as_deref(), &result.validity.state);
+            let evidence = evidence_count_boost_value(result);
+            result.score_breakdown.freshness_boost = freshness;
+            result.score_breakdown.confidence_boost = confidence;
+            result.score_breakdown.status_boost = status;
+            result.score_breakdown.evidence_count_boost = evidence;
+            result.score += freshness + confidence + status + evidence;
+        }
+        if has_temporal_quality
+            && !result
+                .evidence
+                .sources
+                .iter()
+                .any(|source| source == "temporal")
+        {
+            result.evidence.sources.push("temporal".to_string());
+        }
+    }
+
+    if !options.include_stale {
+        results.retain(|result| result.validity.state != "stale");
+    }
+    sort_search_results(results);
+    Ok(())
 }
 
 fn sort_search_results(results: &mut [SearchResult]) {
@@ -2002,7 +2358,7 @@ fn load_chunk_by_chunk_id(
 ) -> Result<Option<ChunkGetResult>> {
     let row = conn
         .query_row(
-            "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, c.confidence, c.status, c.source_type, f.mtime
+            "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, c.confidence, c.status, c.source_type, c.valid_from, c.valid_until, c.supersedes, c.superseded_by, c.updated, f.mtime
              FROM chunks c
              LEFT JOIN files f ON f.path = c.file_path
              WHERE c.chunk_id = ?1
@@ -2022,7 +2378,12 @@ fn load_chunk_by_chunk_id(
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, Option<String>>(11)?,
-                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<i64>>(17)?,
                 ))
             },
         )
@@ -2041,6 +2402,11 @@ fn load_chunk_by_chunk_id(
         confidence,
         status,
         source_type,
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
         file_mtime,
     )) = row
     else {
@@ -2067,6 +2433,11 @@ fn load_chunk_by_chunk_id(
         confidence,
         status,
         source_type,
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
         mtime: file_mtime
             .or(Some(mtime))
             .and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
@@ -2280,6 +2651,11 @@ fn build_result(
     confidence: Option<String>,
     status: Option<String>,
     source_type: Option<String>,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+    supersedes: Option<String>,
+    superseded_by: Option<String>,
+    updated: Option<String>,
     rerank: bool,
 ) -> Result<SearchResult> {
     let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
@@ -2308,6 +2684,10 @@ fn build_result(
         recency_boost: recency_boost(mtime),
         metadata_boost,
         link_boost: 0.0,
+        freshness_boost: 0.0,
+        confidence_boost: 0.0,
+        status_boost: 0.0,
+        evidence_count_boost: 0.0,
     };
     let score = (keyword_score * 0.35)
         + (vector_score * 0.35)
@@ -2361,6 +2741,12 @@ fn build_result(
         confidence,
         status,
         source_type,
+        validity: ValidityEvidence::default(),
+        valid_from,
+        valid_until,
+        supersedes,
+        superseded_by,
+        updated,
         mtime: mtime.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
     })
 }
@@ -3021,7 +3407,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "4");
+        assert_eq!(schema_version, "5");
         let _ = fs::remove_file(&db_path);
     }
 
@@ -3901,6 +4287,189 @@ mod tests {
 
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn query_options_apply_temporal_validity_and_quality_breakdown() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!(
+            "orderk-temporal-quality-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("current.md"),
+            "---\ntags: [temporal]\nstatus: active\nconfidence: high\nvalid_from: 2026-05-01\nupdated: 2026-05-18\nsource_type: decision\n---\n# Current\ntemporal-quality needle says use the current active policy.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("stale.md"),
+            "---\ntags: [temporal]\nstatus: stale\nconfidence: low\nvalid_from: 2026-04-01\nvalid_until: 2026-05-01\nsuperseded_by: current.md\nupdated: 2026-04-15\nsource_type: decision\n---\n# Stale\ntemporal-quality needle says use the old superseded policy.\n",
+        )
+        .unwrap();
+
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-temporal-quality-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        let default = IndexStore::query_with_options(
+            &conn,
+            "temporal-quality needle current",
+            &QueryOptions::new(10),
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert_eq!(
+            default
+                .results
+                .iter()
+                .map(|result| result.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current.md"]
+        );
+        let exact_db_path = std::env::temp_dir().join(format!(
+            "orderk-temporal-quality-exact-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut exact_conn = open_db(
+            &exact_db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut exact_conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        let limited_default = IndexStore::query_with_options(
+            &exact_conn,
+            "temporal-quality needle old superseded",
+            &QueryOptions {
+                limit: 1,
+                ..QueryOptions::new(1)
+            },
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        assert_eq!(
+            limited_default
+                .results
+                .first()
+                .map(|result| result.path.as_str()),
+            Some("current.md"),
+            "temporal filtering must run before final limit truncation: {:#?}",
+            limited_default.results
+        );
+        let current = &default.results[0];
+        assert_eq!(current.validity.state.as_str(), "current");
+        assert!(current.validity.stale_reason.is_none(), "{current:#?}");
+        assert!(current.score_breakdown.confidence_boost > 0.0);
+        assert!(current.score_breakdown.status_boost > 0.0);
+        assert!(current.score_breakdown.evidence_count_boost > 0.0);
+        assert!(current.score_breakdown.freshness_boost >= 0.0);
+
+        let include_stale = IndexStore::query_with_options(
+            &conn,
+            "temporal-quality needle old superseded",
+            &QueryOptions {
+                limit: 10,
+                include_stale: true,
+                ..QueryOptions::new(10)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert!(
+            include_stale.results.iter().any(|result| {
+                result.path == "stale.md"
+                    && result.validity.state == "stale"
+                    && result.validity.stale_reason.as_deref() == Some("status:stale")
+            }),
+            "{:#?}",
+            include_stale.results
+        );
+
+        let historical = IndexStore::query_with_options(
+            &conn,
+            "temporal-quality needle old superseded",
+            &QueryOptions {
+                limit: 10,
+                as_of: Some("2026-04-15".to_string()),
+                freshness: FreshnessMode::Off,
+                ..QueryOptions::new(10)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert_eq!(
+            historical
+                .results
+                .first()
+                .map(|result| result.path.as_str()),
+            Some("stale.md"),
+            "{:#?}",
+            historical.results
+        );
+        assert_eq!(historical.results[0].validity.state.as_str(), "historical");
+
+        let recent = IndexStore::query_with_options(
+            &conn,
+            "latest temporal-quality needle policy",
+            &QueryOptions {
+                limit: 10,
+                freshness: FreshnessMode::Recent,
+                include_stale: true,
+                ..QueryOptions::new(10)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert_eq!(
+            recent.results.first().map(|result| result.path.as_str()),
+            Some("current.md"),
+            "{:#?}",
+            recent.results
+        );
+        assert!(
+            recent.results[0].score_breakdown.freshness_boost
+                >= recent.results[0].score_breakdown.recency_boost
+        );
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&exact_db_path);
     }
 
     #[test]

@@ -46,6 +46,11 @@ pub struct ParsedDocument {
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub source_type: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub supersedes: Option<String>,
+    pub superseded_by: Option<String>,
+    pub updated: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +71,11 @@ pub struct Chunk {
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub source_type: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub supersedes: Option<String>,
+    pub superseded_by: Option<String>,
+    pub updated: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +252,48 @@ pub struct ScoreBreakdown {
     pub metadata_boost: f32,
     #[serde(default)]
     pub link_boost: f32,
+    #[serde(default)]
+    pub freshness_boost: f32,
+    #[serde(default)]
+    pub confidence_boost: f32,
+    #[serde(default)]
+    pub status_boost: f32,
+    #[serde(default)]
+    pub evidence_count_boost: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessMode {
+    Off,
+    Balanced,
+    Recent,
+    Oldest,
+}
+
+impl Default for FreshnessMode {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ValidityEvidence {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_days: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -309,6 +361,12 @@ pub struct QueryOptions {
     pub retrieval_depth: usize,
     #[serde(default)]
     pub explain: bool,
+    #[serde(default)]
+    pub freshness: FreshnessMode,
+    #[serde(default)]
+    pub as_of: Option<String>,
+    #[serde(default)]
+    pub include_stale: bool,
 }
 
 fn default_rerank() -> bool {
@@ -327,6 +385,9 @@ impl QueryOptions {
             expand_links: 0,
             retrieval_depth: 0,
             explain: false,
+            freshness: FreshnessMode::default(),
+            as_of: None,
+            include_stale: false,
         }
     }
 
@@ -444,6 +505,18 @@ pub struct SearchResult {
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub source_type: Option<String>,
+    #[serde(default)]
+    pub validity: ValidityEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
     pub mtime: Option<DateTime<Utc>>,
 }
 
@@ -575,6 +648,16 @@ pub struct ChunkGetResult {
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub source_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
     pub mtime: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_chunks: Vec<SearchContextChunk>,

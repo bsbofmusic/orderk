@@ -22,6 +22,11 @@ pub fn parse_markdown(path: &str, source: &str) -> Result<ParsedDocument> {
         confidence: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "confidence"),
         status: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "status"),
         source_type: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "source_type"),
+        valid_from: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "valid_from"),
+        valid_until: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "valid_until"),
+        supersedes: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "supersedes"),
+        superseded_by: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "superseded_by"),
+        updated: extract_frontmatter_scalar(frontmatter.unwrap_or(""), "updated"),
     })
 }
 
@@ -111,7 +116,7 @@ mod tests {
     fn parser_extracts_frontmatter_tags_heading_and_wikilinks() {
         let doc = parse_markdown(
             "a.md",
-            "---\ntags: [project, alpha]\nconfidence: high\nstatus: active\nsource_type: audit\n---\n# Alpha\nSee [[Bravo]] #rust",
+            "---\ntags: [project, alpha]\nconfidence: high\nstatus: active\nsource_type: audit\nvalid_from: 2026-05-01\nvalid_until: 2026-06-01\nsupersedes: old.md\nsuperseded_by: next.md\nupdated: 2026-05-18\n---\n# Alpha\nSee [[Bravo]] #rust",
         )
         .unwrap();
         assert_eq!(doc.title.as_deref(), Some("Alpha"));
@@ -121,6 +126,11 @@ mod tests {
         assert_eq!(doc.confidence.as_deref(), Some("high"));
         assert_eq!(doc.status.as_deref(), Some("active"));
         assert_eq!(doc.source_type.as_deref(), Some("audit"));
+        assert_eq!(doc.valid_from.as_deref(), Some("2026-05-01"));
+        assert_eq!(doc.valid_until.as_deref(), Some("2026-06-01"));
+        assert_eq!(doc.supersedes.as_deref(), Some("old.md"));
+        assert_eq!(doc.superseded_by.as_deref(), Some("next.md"));
+        assert_eq!(doc.updated.as_deref(), Some("2026-05-18"));
         assert!(!doc.body.contains("tags:"));
     }
 }
