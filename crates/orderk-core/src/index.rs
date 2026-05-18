@@ -893,6 +893,45 @@ impl IndexStore {
             event_id: id as i64,
         })
     }
+
+    pub fn get_chunks(conn: &Connection, options: &ChunkGetOptions) -> Result<ChunkGetResponse> {
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        for raw in &options.chunk_ids {
+            let id = raw.trim();
+            if id.is_empty() || !seen.insert(id.to_string()) {
+                continue;
+            }
+            ids.push(id.to_string());
+            if ids.len() >= 50 {
+                break;
+            }
+        }
+
+        let mut results = Vec::new();
+        for id in ids {
+            if let Some(mut result) = load_chunk_by_chunk_id(conn, &id, &options.detail)? {
+                let radius = options.context_chunks.min(3);
+                if radius > 0 {
+                    result.context_chunks = load_context_chunks_for_chunk(
+                        conn,
+                        &result.path,
+                        result.line_start,
+                        result.line_end,
+                        radius,
+                    )?;
+                }
+                results.push(result);
+            }
+        }
+
+        Ok(ChunkGetResponse {
+            schema_version: "orderk.get.v1".to_string(),
+            total: results.len(),
+            detail: options.detail.clone(),
+            results,
+        })
+    }
 }
 
 fn delete_file(conn: &Connection, path: &str) -> Result<()> {
@@ -1855,6 +1894,139 @@ fn enrich_results(
     Ok(())
 }
 
+fn load_chunk_by_chunk_id(
+    conn: &Connection,
+    chunk_id: &str,
+    detail: &ChunkGetDetail,
+) -> Result<Option<ChunkGetResult>> {
+    let row = conn
+        .query_row(
+            "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, c.confidence, c.status, c.source_type, f.mtime
+             FROM chunks c
+             LEFT JOIN files f ON f.path = c.file_path
+             WHERE c.chunk_id = ?1
+             LIMIT 1",
+            params![chunk_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)? as usize,
+                    row.get::<_, i64>(5)? as usize,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((
+        chunk_id,
+        path,
+        title,
+        heading,
+        line_start,
+        line_end,
+        text,
+        tags_json,
+        mtime,
+        confidence,
+        status,
+        source_type,
+        file_mtime,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    let text = match detail {
+        ChunkGetDetail::Full => text,
+        ChunkGetDetail::Summary => snippet(&text, ""),
+    };
+    Ok(Some(ChunkGetResult {
+        chunk_id,
+        path,
+        title,
+        heading,
+        line_start,
+        line_end,
+        text,
+        tags,
+        confidence,
+        status,
+        source_type,
+        mtime: file_mtime
+            .or(Some(mtime))
+            .and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+        context_chunks: Vec::new(),
+    }))
+}
+
+fn load_context_chunks_for_chunk(
+    conn: &Connection,
+    path: &str,
+    line_start: usize,
+    line_end: usize,
+    radius: usize,
+) -> Result<Vec<SearchContextChunk>> {
+    let mut before_stmt = conn.prepare(
+        "SELECT chunk_id, file_path, heading, line_start, line_end, text
+         FROM chunks
+         WHERE file_path = ?1 AND line_end < ?2
+         ORDER BY line_end DESC
+         LIMIT ?3",
+    )?;
+    let before_rows =
+        before_stmt.query_map(params![path, line_start as i64, radius as i64], |row| {
+            Ok(SearchContextChunk {
+                relation: "before".to_string(),
+                chunk_id: row.get(0)?,
+                path: row.get(1)?,
+                heading: row.get(2)?,
+                line_start: row.get::<_, i64>(3)? as usize,
+                line_end: row.get::<_, i64>(4)? as usize,
+                text: row.get(5)?,
+            })
+        })?;
+    let mut before = Vec::new();
+    for row in before_rows {
+        before.push(row?);
+    }
+    before.reverse();
+
+    let mut after_stmt = conn.prepare(
+        "SELECT chunk_id, file_path, heading, line_start, line_end, text
+         FROM chunks
+         WHERE file_path = ?1 AND line_start > ?2
+         ORDER BY line_start ASC
+         LIMIT ?3",
+    )?;
+    let after_rows =
+        after_stmt.query_map(params![path, line_end as i64, radius as i64], |row| {
+            Ok(SearchContextChunk {
+                relation: "after".to_string(),
+                chunk_id: row.get(0)?,
+                path: row.get(1)?,
+                heading: row.get(2)?,
+                line_start: row.get::<_, i64>(3)? as usize,
+                line_end: row.get::<_, i64>(4)? as usize,
+                text: row.get(5)?,
+            })
+        })?;
+    let mut context = before;
+    for row in after_rows {
+        context.push(row?);
+    }
+    Ok(context)
+}
+
 fn load_context_chunks(
     conn: &Connection,
     result: &SearchResult,
@@ -2412,6 +2584,106 @@ mod tests {
     }
 
     #[test]
+    fn get_chunks_preserves_order_dedupes_skips_missing_and_caps_batches() {
+        let mut vault = std::env::temp_dir();
+        vault.push(format!(
+            "orderk-get-bounds-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&vault).unwrap();
+        for idx in 0..55 {
+            fs::write(
+                vault.join(format!("note-{idx:02}.md")),
+                format!("# Note {idx:02}\nCompact recall get boundary text {idx:02}.\n"),
+            )
+            .unwrap();
+        }
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-get-bounds-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT chunk_id FROM chunks ORDER BY file_path ASC")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        let ids = rows.map(|row| row.unwrap()).collect::<Vec<_>>();
+        assert!(ids.len() >= 55);
+
+        let mut requested = vec![ids[2].clone(), ids[0].clone(), ids[2].clone()];
+        requested.extend(ids.iter().cloned());
+        let response = IndexStore::get_chunks(
+            &conn,
+            &ChunkGetOptions {
+                chunk_ids: requested,
+                detail: ChunkGetDetail::Full,
+                context_chunks: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.schema_version, "orderk.get.v1");
+        assert_eq!(response.total, 50);
+        assert_eq!(response.results[0].chunk_id, ids[2]);
+        assert_eq!(response.results[1].chunk_id, ids[0]);
+        assert_eq!(
+            response
+                .results
+                .iter()
+                .filter(|result| result.chunk_id == ids[2])
+                .count(),
+            1
+        );
+        assert!(response.results[0]
+            .text
+            .contains("Compact recall get boundary text"));
+
+        let missing = IndexStore::get_chunks(
+            &conn,
+            &ChunkGetOptions {
+                chunk_ids: vec!["missing".to_string(), ids[1].clone()],
+                detail: ChunkGetDetail::Full,
+                context_chunks: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(missing.total, 1);
+        assert_eq!(missing.results[0].chunk_id, ids[1]);
+
+        let summary = IndexStore::get_chunks(
+            &conn,
+            &ChunkGetOptions {
+                chunk_ids: vec![ids[0].clone()],
+                detail: ChunkGetDetail::Summary,
+                context_chunks: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.results.len(), 1);
+        assert!(summary.results[0].text.len() <= 180);
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
     fn index_persists_chunk_structural_metadata() {
         let mut vault = std::env::temp_dir();
         vault.push(format!(
@@ -2573,7 +2845,7 @@ mod tests {
     }
 
     #[test]
-    fn public_query_migrates_old_schema_before_searching() {
+    fn public_query_refuses_old_schema_without_migrating_read_only_surface() {
         let db_path = std::env::temp_dir().join(format!(
             "orderk-public-query-old-schema-{}-{}.sqlite",
             std::process::id(),
@@ -2666,19 +2938,22 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let response = crate::api::query_with_options(
+        let err = crate::api::query_with_options(
             &db_path,
             "orderk migration",
             &QueryOptions::new(5),
             &provider,
             VectorBackend::Exact,
         )
-        .unwrap();
-        assert_eq!(response.results.len(), 1);
-        assert_eq!(response.results[0].file_path, "legacy.md");
+        .expect_err("public search must not mutate legacy DBs to migrate schema");
         assert!(
-            chunk_column_exists(&rusqlite::Connection::open(&db_path).unwrap(), "confidence")
-                .unwrap()
+            err.to_string().contains("schema") || err.to_string().contains("confidence"),
+            "unexpected read-only schema error: {err:#}"
+        );
+        assert!(
+            !chunk_column_exists(&rusqlite::Connection::open(&db_path).unwrap(), "confidence")
+                .unwrap(),
+            "read-only search must not add missing columns"
         );
         let _ = fs::remove_file(&db_path);
     }

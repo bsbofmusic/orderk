@@ -177,6 +177,29 @@ orderk search \
   --vector-backend sqlite_vec
 ```
 
+Agent-facing compact recall, borrowed from the total-agent-memory audit:
+
+```bash
+# First pass: compact cards only, no snippets/full text.
+orderk search \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --query "vector search for knowledge notes" \
+  --view index \
+  --limit 10 \
+  --embedding-provider siliconflow \
+  --embedding-model BAAI/bge-m3 \
+  --embedding-dim 1024 \
+  --vector-backend sqlite_vec
+
+# Second pass: fetch exact chunks chosen by chunk_id.
+orderk get \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --ids chk_abc,chk_def \
+  --detail full
+```
+
+`--view index` returns `orderk.search_index.v1` with `chunk_id`, `title`, `score`, `path`, `heading`, and line range only. It intentionally omits `snippet`, `text`, and neighbor context so agents can choose before spending tokens. Both public `search` and `get` open the existing SQLite index read-only; stale sidecar schemas should be rebuilt or migrated explicitly instead of being mutated during recall. `orderk get` returns `orderk.get.v1`, preserves requested ID order, caps batches at 50, and skips missing IDs.
+
 Agent-facing evidence controls borrowed from the Supermemory audit:
 
 ```bash
@@ -214,7 +237,7 @@ orderk mcp \
   --vector-backend sqlite_vec
 ```
 
-The MCP surface is intentionally thin and read-only: `search`, `status`, and `health`. It supports standard `Content-Length` stdio frames and a JSONL compatibility mode for simple smoke tests. It does not expose index, feedback, maintain, save, forget, note-write, or chat tools.
+The MCP surface is intentionally thin and read-only: `search`, `get`, `status`, and `health`. `search` supports `view: "index"` for compact id/title/score/path cards, and `get` explicitly fetches selected chunk IDs. Search/get open the existing SQLite index in read-only mode and do not run index, feedback, migration, maintenance, or note-write paths. It supports standard `Content-Length` stdio frames and a JSONL compatibility mode for simple smoke tests. It does not expose index, feedback, maintain, save, forget, note-write, or chat tools.
 
 ### 6) Inspect status
 
@@ -297,10 +320,11 @@ This is the shortest path for an agent or automation:
 4. Set `BAAI/bge-m3` + `1024` unless you have a strong reason to change them.
 5. Use `sqlite_vec` as the vector backend.
 6. Consume the JSON output directly. Search responses include `route`, `routing` with per-stage timings, `retrieval_depth`, and link expansion counts, per-result `score_breakdown`, `evidence` with `evidence_count` and per-result `retrieval_depth`, `tags`, `confidence`, `status`, `source_type`, optional neighbor `context_chunks`, and optional Obsidian link evidence.
-7. Use `--min-score`/`--threshold`, `--context-chunks`, `--include-links`, `--retrieval-depth 1`, `--expand-links 1`, `--filter`, and `--no-rerank` when an agent needs thicker evidence, authored one-hop graph recall, or wants deterministic metadata rerank disabled.
-8. If the client supports MCP, use `orderk mcp` for read-only `search`/`status`/`health` tools instead of asking the agent to guess shell flags.
-9. Use `orderk capsule export` / `orderk capsule inspect` when an agent needs to verify that a portable SQLite index artifact still matches its recorded profile, counts, size, and checksum.
-10. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
+7. Use `--view index` plus `orderk get --ids ...` for two-stage compact recall when an agent should inspect candidate IDs before fetching full text.
+8. Use `--min-score`/`--threshold`, `--context-chunks`, `--include-links`, `--retrieval-depth 1`, `--expand-links 1`, `--filter`, and `--no-rerank` when an agent needs thicker evidence, authored one-hop graph recall, or wants deterministic metadata rerank disabled.
+9. If the client supports MCP, use `orderk mcp` for read-only `search`/`get`/`status`/`health` tools instead of asking the agent to guess shell flags.
+10. Use `orderk capsule export` / `orderk capsule inspect` when an agent needs to verify that a portable SQLite index artifact still matches its recorded profile, counts, size, and checksum.
+11. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
 
 ### Obsidian plugin settings
 

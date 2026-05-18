@@ -78,8 +78,13 @@ pub fn query_with_options(
     provider: &dyn EmbeddingProvider,
     vector_backend: VectorBackend,
 ) -> Result<QueryResponse> {
-    let conn = open_writable_existing(db_path)?;
+    let conn = open_existing(db_path)?;
     IndexStore::query_with_options(&conn, query, options, provider, &vector_backend)
+}
+
+pub fn get_chunks(db_path: &Path, options: &ChunkGetOptions) -> Result<ChunkGetResponse> {
+    let conn = open_existing(db_path)?;
+    IndexStore::get_chunks(&conn, options)
 }
 
 pub fn status(db_path: &Path) -> Result<StatusResponse> {

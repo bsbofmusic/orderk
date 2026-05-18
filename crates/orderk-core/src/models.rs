@@ -408,6 +408,119 @@ pub struct QueryResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchIndexEntry {
+    pub chunk_id: String,
+    pub title: Option<String>,
+    pub score: f32,
+    pub path: String,
+    pub heading: Option<String>,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchIndexResponse {
+    pub schema_version: String,
+    pub query: String,
+    pub query_id: String,
+    pub took_ms: u128,
+    pub view: String,
+    pub mode: String,
+    pub route: String,
+    pub routing: QueryRoutingEvidence,
+    pub vector_backend: String,
+    pub results: Vec<SearchIndexEntry>,
+}
+
+impl From<QueryResponse> for SearchIndexResponse {
+    fn from(response: QueryResponse) -> Self {
+        let results = response
+            .results
+            .into_iter()
+            .map(|result| SearchIndexEntry {
+                chunk_id: result.chunk_id,
+                title: result
+                    .title
+                    .or_else(|| result.heading.clone())
+                    .or(Some(result.path.clone())),
+                score: result.score,
+                path: result.path,
+                heading: result.heading,
+                line_start: result.line_start,
+                line_end: result.line_end,
+            })
+            .collect();
+        Self {
+            schema_version: "orderk.search_index.v1".to_string(),
+            query: response.query,
+            query_id: response.query_id,
+            took_ms: response.took_ms,
+            view: "index".to_string(),
+            mode: response.mode,
+            route: response.route,
+            routing: response.routing,
+            vector_backend: response.vector_backend,
+            results,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkGetDetail {
+    Summary,
+    Full,
+}
+
+impl ChunkGetDetail {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkGetOptions {
+    pub chunk_ids: Vec<String>,
+    #[serde(default = "default_chunk_get_detail")]
+    pub detail: ChunkGetDetail,
+    #[serde(default)]
+    pub context_chunks: usize,
+}
+
+fn default_chunk_get_detail() -> ChunkGetDetail {
+    ChunkGetDetail::Full
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkGetResult {
+    pub chunk_id: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub heading: Option<String>,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub text: String,
+    pub tags: Vec<String>,
+    pub confidence: Option<String>,
+    pub status: Option<String>,
+    pub source_type: Option<String>,
+    pub mtime: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_chunks: Vec<SearchContextChunk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkGetResponse {
+    pub schema_version: String,
+    pub total: usize,
+    pub detail: ChunkGetDetail,
+    pub results: Vec<ChunkGetResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedbackEvent {
     pub event: String,
     pub query_id: Option<String>,
