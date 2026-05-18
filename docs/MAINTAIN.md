@@ -54,6 +54,65 @@ orderk maintain \
 
 Output schema: `orderk.maintain.v1`.
 
+### Continuous retrieval quality monitoring
+
+`maintain --queries` can be wired into any monitoring system (cron, systemd timer, CI) to catch retrieval-quality regressions before users notice.
+
+**1. Create eval queries for your vault**
+
+Pick 4–8 stable, well-known files and write queries that should find them. Format (`orderk.eval_queries.v1`):
+
+```json
+{
+  "schema_version": "orderk.eval_queries.v1",
+  "queries": [
+    {
+      "id": "unique-id",
+      "query": "natural language query that should find the target",
+      "expected_paths": ["path/relative/to/vault.md"],
+      "expected_phrases": ["distinctive phrase in target content"]
+    }
+  ]
+}
+```
+
+A good eval query idempotently answers: _would a user searching for X find the right file at rank 1–3?_ The fixture at `fixtures/eval/queries.json` is a reproducible mock-provider baseline. For live vaults, create your own `live_queries.json` targeting real content.
+
+**2. Schedule maintain with queries**
+
+```bash
+orderk maintain --db /path/to/db --queries /path/to/live_queries.json
+```
+
+On success the output includes:
+
+```json
+{
+  "ok": true,
+  "state": "ready",
+  "eval": {
+    "hits_at_k": 5,
+    "mrr": 0.68,
+    "mean_took_ms": 813.2
+  },
+  "checks": [
+    {"component": "eval", "ok": true, "message": "eval gate passed"}
+  ]
+}
+```
+
+The `eval` block exposes `hits_at_k` (how many queries found their target in the top results), `mrr` (mean reciprocal rank), and per-query outcomes with `rank`, `top_path`, and `took_ms`. Set alert thresholds on `hits_at_k` and `mrr` — degradation means the index or ranking pipeline has drifted.
+
+**3. Integration pattern (generic)**
+
+Any scheduler can wrap this:
+
+```text
+run maintain --queries → parse JSON → if ok=false or eval hits < threshold → alert
+```
+
+The tool itself stays headless and one-shot; the scheduler is external (cron, systemd timer, CI pipeline, health-check endpoint). No daemon, no background polling inside orderk.
+
 ### Read-only MCP recall surface
 
 For MCP-capable clients, run a thin stdio server:
