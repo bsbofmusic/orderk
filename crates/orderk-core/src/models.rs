@@ -623,9 +623,9 @@ pub struct QueryResponse {
     pub vector_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<QueryExplainTrace>,
+    pub results: Vec<SearchResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optimizer: Option<OptimizerStatus>,
-    pub results: Vec<SearchResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -729,9 +729,9 @@ pub struct SearchIndexResponse {
     pub vector_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<QueryExplainTrace>,
+    pub results: Vec<SearchIndexEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optimizer: Option<OptimizerStatus>,
-    pub results: Vec<SearchIndexEntry>,
 }
 
 impl From<QueryResponse> for SearchIndexResponse {

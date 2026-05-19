@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use orderk_core::{
     classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
     index_vault_with_options, init, inspect_capsule_manifest, optimize_apply, optimize_dry_run,
-    optimize_reset, optimize_status, provider_from_name, query, query_with_options, status,
+    optimize_reset, optimize_set, optimize_status, provider_from_name, query, query_with_options, status,
     write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider, FeedbackEvent,
     FreshnessMode, IndexOptions, QueryOptions, QueryResponse, SearchIndexResponse, VectorBackend,
 };
@@ -348,22 +348,33 @@ fn health_like_command(args: &mut Vec<String>, _doctor: bool) -> Result<serde_js
 }
 
 fn optimize_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    let set = take_command_token(args, "set");
     let db = take_path(args, "--db")?;
     let min_events = take_usize(args, "--min-events", 20)?;
     let status = take_flag(args, "--status");
     let dry_run = take_flag(args, "--dry-run");
     let apply = take_flag(args, "--apply");
     let reset = take_flag(args, "--reset");
-    let selected = [status, dry_run, apply, reset]
+    let selected = [status, dry_run, apply, reset, set]
         .iter()
         .filter(|flag| **flag)
         .count();
     if selected > 1 {
         return Err(anyhow!(
-            "optimize accepts only one of --status, --dry-run, --apply, --reset"
+            "optimize accepts only one of --status, --dry-run, --apply, --reset, set"
         ));
     }
-    let value = if reset {
+    let value = if set {
+        let text_only_penalty = take_optional_f32(args, "--text-only-penalty")?.map(f64::from);
+        let add_stopwords = take_repeated_string(args, "--add-stopword")?;
+        let remove_stopwords = take_repeated_string(args, "--remove-stopword")?;
+        serde_json::to_value(optimize_set(
+            &db,
+            text_only_penalty,
+            &add_stopwords,
+            &remove_stopwords,
+        )?)?
+    } else if reset {
         serde_json::to_value(optimize_reset(&db)?)?
     } else if dry_run {
         serde_json::to_value(optimize_dry_run(&db, min_events)?)?
@@ -1223,6 +1234,23 @@ fn parse_freshness(s: &str) -> Result<FreshnessMode> {
     }
 }
 
+fn take_command_token(args: &mut Vec<String>, name: &str) -> bool {
+    if let Some(pos) = args.iter().position(|arg| arg == name) {
+        args.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+fn take_repeated_string(args: &mut Vec<String>, name: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    while let Some(value) = take_optional_string(args, name)? {
+        values.push(value);
+    }
+    Ok(values)
+}
+
 fn take_optional_string(args: &mut Vec<String>, name: &str) -> Result<Option<String>> {
     if let Some(pos) = args.iter().position(|a| a == name) {
         if pos + 1 >= args.len() {
@@ -1512,7 +1540,7 @@ fn print_usage() {
     );
     eprintln!("index flags: --vault <path> --db <orderk.sqlite> [--chunk-max-chars <n>] [--chunk-overlap <n>]");
     eprintln!("eval flags: --db <orderk.sqlite> --queries <queries.json> [--ab-chunk-overlap <n>] [--vault <path>]");
-    eprintln!("optimize flags: --db <orderk.sqlite> [--status|--dry-run|--apply|--reset] [--min-events <n>]");
+    eprintln!("optimize flags: --db <orderk.sqlite> [--status|--dry-run|--apply|--reset|set] [--min-events <n>] [--text-only-penalty <0.65-1.0>] [--add-stopword <term>] [--remove-stopword <term>]");
     eprintln!(
         "capsule export flags: --db <orderk.sqlite> [--vault <vault>] [--out <capsule.json>]"
     );
@@ -2223,11 +2251,57 @@ Temporal quality summary needle keeps evidence readable.
             optimizer.get("enabled").and_then(|v| v.as_bool()),
             Some(true)
         );
-        assert!(optimizer
+        let optimizer_message = optimizer
             .get("message")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .contains("自优化"));
+            .unwrap_or("");
+        assert!(optimizer_message.contains("持续优化迭代算法"));
+        assert!(optimizer_message.contains("mock-8"));
+        assert!(optimizer_message.contains("optimize set"));
+        assert!(optimizer_message.contains("--text-only-penalty"));
+        assert!(optimizer_message.contains("--add-stopword"));
+
+        let manual_set = run_with_args(vec![
+            "optimize".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "set".into(),
+            "--text-only-penalty".into(),
+            "0.72".into(),
+            "--add-stopword".into(),
+            "how".into(),
+            "--add-stopword".into(),
+            "what".into(),
+        ])
+        .unwrap();
+        assert_eq!(manual_set.get("mode").and_then(|v| v.as_str()), Some("set"));
+        let penalty = manual_set
+            .pointer("/status/text_only_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap();
+        assert!((penalty - 0.72).abs() < 0.0001);
+        let manual_stopwords = manual_set
+            .pointer("/status/dynamic_stopwords")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(manual_stopwords.iter().any(|v| v.as_str() == Some("how")));
+        assert!(manual_stopwords.iter().any(|v| v.as_str() == Some("what")));
+
+        let manual_remove = run_with_args(vec![
+            "optimize".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "set".into(),
+            "--remove-stopword".into(),
+            "how".into(),
+        ])
+        .unwrap();
+        let remaining_stopwords = manual_remove
+            .pointer("/status/dynamic_stopwords")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(!remaining_stopwords.iter().any(|v| v.as_str() == Some("how")));
+        assert!(remaining_stopwords.iter().any(|v| v.as_str() == Some("what")));
 
         let status = run_with_args(vec![
             "optimize".into(),

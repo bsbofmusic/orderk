@@ -107,11 +107,14 @@ pub fn query_with_options(
     if !optimizer::optimizer_disabled() {
         if let Ok(write_conn) = open_writable_existing(db_path) {
             if let Ok(status) = optimizer::record_query_and_maybe_optimize(&write_conn, &response) {
-                response.optimizer = Some(status);
+                response.optimizer = Some(optimizer::with_model_hint(status, provider.model_id()));
             }
         }
     } else {
-        response.optimizer = Some(optimizer::disabled_optimizer_status());
+        response.optimizer = Some(optimizer::with_model_hint(
+            optimizer::disabled_optimizer_status(),
+            provider.model_id(),
+        ));
     }
     Ok(response)
 }
@@ -134,6 +137,16 @@ pub fn optimize_apply(db_path: &Path, min_events: usize) -> Result<OptimizeRespo
 pub fn optimize_reset(db_path: &Path) -> Result<OptimizeResponse> {
     let conn = open_writable_existing(db_path)?;
     optimizer::reset_optimizer(&conn)
+}
+
+pub fn optimize_set(
+    db_path: &Path,
+    text_only_penalty: Option<f64>,
+    add_stopwords: &[String],
+    remove_stopwords: &[String],
+) -> Result<OptimizeResponse> {
+    let conn = open_writable_existing(db_path)?;
+    optimizer::set_optimizer(&conn, text_only_penalty, add_stopwords, remove_stopwords)
 }
 
 pub fn get_chunks(db_path: &Path, options: &ChunkGetOptions) -> Result<ChunkGetResponse> {

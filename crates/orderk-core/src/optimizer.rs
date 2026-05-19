@@ -2,7 +2,7 @@ use crate::models::{
     OptimizeProposal, OptimizeResponse, OptimizerMetrics, OptimizerRuntimeConfig, OptimizerStatus,
     QueryResponse, SearchResult,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -274,6 +274,57 @@ pub fn reset_optimizer(conn: &Connection) -> Result<OptimizeResponse> {
     })
 }
 
+pub fn set_optimizer(
+    conn: &Connection,
+    text_only_penalty: Option<f64>,
+    add_stopwords: &[String],
+    remove_stopwords: &[String],
+) -> Result<OptimizeResponse> {
+    ensure_optimizer_schema(conn)?;
+    if text_only_penalty.is_none() && add_stopwords.is_empty() && remove_stopwords.is_empty() {
+        return Err(anyhow!(
+            "optimize set requires --text-only-penalty, --add-stopword, or --remove-stopword"
+        ));
+    }
+
+    let mut state = load_state(conn)?;
+    if let Some(penalty) = text_only_penalty {
+        if !penalty.is_finite()
+            || penalty < MIN_TEXT_ONLY_PENALTY as f64
+            || penalty > MAX_TEXT_ONLY_PENALTY as f64
+        {
+            return Err(anyhow!(
+                "--text-only-penalty must be between {:.2} and {:.2}",
+                MIN_TEXT_ONLY_PENALTY,
+                MAX_TEXT_ONLY_PENALTY
+            ));
+        }
+        state.text_only_penalty = penalty as f32;
+    }
+
+    for term in remove_stopwords {
+        let term = normalize_manual_stopword(term)?;
+        state.dynamic_stopwords.retain(|current| current != &term);
+    }
+    for term in add_stopwords {
+        let term = normalize_manual_stopword(term)?;
+        if !state.dynamic_stopwords.iter().any(|current| current == &term) {
+            state.dynamic_stopwords.push(term);
+        }
+    }
+    normalize_state(&mut state);
+    state.last_action = Some("manual_set".to_string());
+    save_state(conn, &state)?;
+
+    Ok(OptimizeResponse {
+        schema_version: "orderk.optimize.v1".to_string(),
+        ok: true,
+        mode: "set".to_string(),
+        status: status_from_state(conn, state)?,
+        proposal: None,
+    })
+}
+
 fn insert_query_event(conn: &Connection, response: &QueryResponse) -> Result<()> {
     let top = response.results.first();
     let top_score = top.map(|result| result.score as f64);
@@ -492,12 +543,12 @@ fn status_from_counts(
     OptimizerStatus {
         schema_version: "orderk.optimizer_status.v1".to_string(),
         enabled: !optimizer_disabled(),
-        message: format!(
-            "⚙️ 自优化引擎运行中：已记录 {} 次查询，待优化事件 {} 个；text_only_penalty={:.2}，动态停用词 {} 个。",
+        message: optimizer_message(
+            None,
             total_events,
             pending_events,
             state.text_only_penalty,
-            state.dynamic_stopwords.len()
+            state.dynamic_stopwords.len(),
         ),
         total_events,
         pending_events,
@@ -534,6 +585,41 @@ fn optimizer_schema_exists(conn: &Connection) -> Result<bool> {
 
 pub fn disabled_optimizer_status() -> OptimizerStatus {
     disabled_status("⚙️ 自优化引擎已由 ORDERK_OPTIMIZER=off 关闭")
+}
+
+pub fn with_model_hint(mut status: OptimizerStatus, embedding_model: &str) -> OptimizerStatus {
+    status.message = optimizer_message(
+        Some(embedding_model),
+        status.total_events,
+        status.pending_events,
+        status.text_only_penalty as f32,
+        status.dynamic_stopwords.len(),
+    );
+    status
+}
+
+fn optimizer_message(
+    embedding_model: Option<&str>,
+    total_events: usize,
+    pending_events: usize,
+    text_only_penalty: f32,
+    dynamic_stopwords: usize,
+) -> String {
+    let model_hint = embedding_model
+        .map(|model| format!("当前模型 `{model}` "))
+        .unwrap_or_default();
+    format!(
+        "⚙️ {model_hint}正在使用持续优化迭代算法优化搜索结果；如结果不满意，可用 `orderk optimize set --db <orderk.sqlite> --text-only-penalty <0.65-1.0> --add-stopword <term> --remove-stopword <term>` 手动调整参数来优化目标结果。已记录 {total_events} 次查询，待优化事件 {pending_events} 个；text_only_penalty={text_only_penalty:.2}，动态停用词 {dynamic_stopwords} 个。"
+    )
+}
+
+fn normalize_manual_stopword(term: &str) -> Result<String> {
+    let term = term.trim().to_lowercase();
+    if term.is_empty() {
+        Err(anyhow!("stopword cannot be empty"))
+    } else {
+        Ok(term)
+    }
 }
 
 fn disabled_status(message: &str) -> OptimizerStatus {
