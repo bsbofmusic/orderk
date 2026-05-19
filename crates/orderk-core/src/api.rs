@@ -1,6 +1,7 @@
 use crate::embedding::{EmbeddingProvider, MockEmbeddingProvider, SiliconFlowM3Provider};
 use crate::index::{open_db, IndexStore};
 use crate::models::*;
+use crate::optimizer;
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
@@ -99,8 +100,40 @@ pub fn query_with_options(
     provider: &dyn EmbeddingProvider,
     vector_backend: VectorBackend,
 ) -> Result<QueryResponse> {
+    let read_conn = open_existing(db_path)?;
+    let mut response =
+        IndexStore::query_with_options(&read_conn, query, options, provider, &vector_backend)?;
+    drop(read_conn);
+    if !optimizer::optimizer_disabled() {
+        if let Ok(write_conn) = open_writable_existing(db_path) {
+            if let Ok(status) = optimizer::record_query_and_maybe_optimize(&write_conn, &response) {
+                response.optimizer = Some(status);
+            }
+        }
+    } else {
+        response.optimizer = Some(optimizer::disabled_optimizer_status());
+    }
+    Ok(response)
+}
+
+pub fn optimize_status(db_path: &Path) -> Result<OptimizerStatus> {
     let conn = open_existing(db_path)?;
-    IndexStore::query_with_options(&conn, query, options, provider, &vector_backend)
+    optimizer::optimizer_status(&conn)
+}
+
+pub fn optimize_dry_run(db_path: &Path, min_events: usize) -> Result<OptimizeResponse> {
+    let conn = open_existing(db_path)?;
+    optimizer::dry_run_optimizer(&conn, min_events)
+}
+
+pub fn optimize_apply(db_path: &Path, min_events: usize) -> Result<OptimizeResponse> {
+    let conn = open_writable_existing(db_path)?;
+    optimizer::apply_optimizer(&conn, min_events)
+}
+
+pub fn optimize_reset(db_path: &Path) -> Result<OptimizeResponse> {
+    let conn = open_writable_existing(db_path)?;
+    optimizer::reset_optimizer(&conn)
 }
 
 pub fn get_chunks(db_path: &Path, options: &ChunkGetOptions) -> Result<ChunkGetResponse> {
@@ -153,7 +186,7 @@ fn open_existing(db_path: &Path) -> Result<Connection> {
 
 fn open_writable_existing(db_path: &Path) -> Result<Connection> {
     crate::index::register_sqlite_vec();
-    let conn = Connection::open(db_path)?;
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
     crate::index::migrate_chunk_metadata_columns(&conn)?;
     Ok(conn)

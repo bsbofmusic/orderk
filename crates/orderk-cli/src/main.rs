@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
 use orderk_core::{
     classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
-    index_vault_with_options, init, inspect_capsule_manifest, provider_from_name, query,
-    query_with_options, status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions,
-    EmbeddingProvider, FeedbackEvent, FreshnessMode, IndexOptions, QueryOptions, QueryResponse,
-    SearchIndexResponse, VectorBackend,
+    index_vault_with_options, init, inspect_capsule_manifest, optimize_apply, optimize_dry_run,
+    optimize_reset, optimize_status, provider_from_name, query, query_with_options, status,
+    write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider, FeedbackEvent,
+    FreshnessMode, IndexOptions, QueryOptions, QueryResponse, SearchIndexResponse, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -124,7 +124,8 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let retrieval_depth = take_usize(&mut args, "--retrieval-depth", 0)?;
             let explain = take_flag(&mut args, "--explain");
             let rerank = !take_flag(&mut args, "--no-rerank");
-            let query_expansion = take_flag(&mut args, "--query-expansion") || take_flag(&mut args, "--expand-query");
+            let query_expansion =
+                take_flag(&mut args, "--query-expansion") || take_flag(&mut args, "--expand-query");
             let external_reranker = parse_reranker_flag(&mut args)?;
             let freshness = parse_freshness(&take_string(
                 &mut args,
@@ -225,6 +226,10 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
         }
         "maintain" => {
             let resp = maintain_command(&mut args)?;
+            print_json(&resp)?;
+        }
+        "optimize" => {
+            let resp = optimize_command(&mut args)?;
             print_json(&resp)?;
         }
         "mcp" => {
@@ -340,6 +345,39 @@ fn health_like_command(args: &mut Vec<String>, _doctor: bool) -> Result<serde_js
         smoke_query.as_deref(),
     );
     Ok(serde_json::to_value(report)?)
+}
+
+fn optimize_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    let db = take_path(args, "--db")?;
+    let min_events = take_usize(args, "--min-events", 20)?;
+    let status = take_flag(args, "--status");
+    let dry_run = take_flag(args, "--dry-run");
+    let apply = take_flag(args, "--apply");
+    let reset = take_flag(args, "--reset");
+    let selected = [status, dry_run, apply, reset]
+        .iter()
+        .filter(|flag| **flag)
+        .count();
+    if selected > 1 {
+        return Err(anyhow!(
+            "optimize accepts only one of --status, --dry-run, --apply, --reset"
+        ));
+    }
+    let value = if reset {
+        serde_json::to_value(optimize_reset(&db)?)?
+    } else if dry_run {
+        serde_json::to_value(optimize_dry_run(&db, min_events)?)?
+    } else if apply {
+        serde_json::to_value(optimize_apply(&db, min_events)?)?
+    } else {
+        serde_json::to_value(json!({
+            "schema_version": "orderk.optimize.v1",
+            "ok": true,
+            "mode": "status",
+            "status": optimize_status(&db)?,
+        }))?
+    };
+    Ok(value)
 }
 
 fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
@@ -502,7 +540,7 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         vector_backend: vector_backend.as_str().to_string(),
         outcomes,
     };
-    let baseline = serde_json::to_value(&response)?;
+    let baseline = serde_json::to_value(response)?;
     if let Some(overlap) = ab_chunk_overlap {
         let vault = ab_vault
             .as_deref()
@@ -1385,7 +1423,8 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                 "exact".to_string(),
             )?)?;
             let explain = take_flag(&mut args, "--explain");
-            let query_expansion = take_flag(&mut args, "--query-expansion") || take_flag(&mut args, "--expand-query");
+            let query_expansion =
+                take_flag(&mut args, "--query-expansion") || take_flag(&mut args, "--expand-query");
             let external_reranker = parse_reranker_flag(&mut args)?;
             let freshness = parse_freshness(&take_string(
                 &mut args,
@@ -1458,6 +1497,7 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                 },
             )?)?)
         }
+        "optimize" => optimize_command(&mut args),
         "capsule" => capsule_command(&mut args),
         other => Err(anyhow!("unsupported test command: {other}")),
     }
@@ -1465,13 +1505,14 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
 
 fn print_usage() {
     eprintln!(
-        "orderk <init|index|search|get|status|health|doctor|eval|maintain|capsule|mcp|feedback> [--flags]"
+        "orderk <init|index|search|get|status|health|doctor|eval|maintain|optimize|capsule|mcp|feedback> [--flags]"
     );
     eprintln!(
         "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--query-expansion] [--reranker lexical|none] [--json-lines] [--explain] [--no-rerank]"
     );
     eprintln!("index flags: --vault <path> --db <orderk.sqlite> [--chunk-max-chars <n>] [--chunk-overlap <n>]");
     eprintln!("eval flags: --db <orderk.sqlite> --queries <queries.json> [--ab-chunk-overlap <n>] [--vault <path>]");
+    eprintln!("optimize flags: --db <orderk.sqlite> [--status|--dry-run|--apply|--reset] [--min-events <n>]");
     eprintln!(
         "capsule export flags: --db <orderk.sqlite> [--vault <vault>] [--out <capsule.json>]"
     );
@@ -2062,6 +2103,7 @@ Temporal quality summary needle keeps evidence readable.
             routing: Default::default(),
             vector_backend: "exact".to_string(),
             explain: None,
+            optimizer: None,
             results: vec![orderk_core::SearchResult {
                 chunk_id: "chk_test".to_string(),
                 file_path: "rag.md".to_string(),
@@ -2107,6 +2149,175 @@ Temporal quality summary needle keeps evidence readable.
     }
 
     #[test]
+    fn search_records_optimizer_telemetry_and_exposes_lifecycle_commands() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-optimizer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("money.md"),
+            "# Money\nMaking money depends on leverage, distribution, and durable value creation.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("noise.md"),
+            "# Noise\nHow and what and why are weak connective words without search intent.\n",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+
+        let search = run_with_args(vec![
+            "search".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--query".into(),
+            "how to make money".into(),
+            "--limit".into(),
+            "5".into(),
+            "--view".into(),
+            "index".into(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let optimizer = search
+            .get("optimizer")
+            .and_then(|value| value.as_object())
+            .expect(
+                "search responses must expose optimizer status at the tail, including index view",
+            );
+        assert_eq!(
+            optimizer.get("schema_version").and_then(|v| v.as_str()),
+            Some("orderk.optimizer_status.v1")
+        );
+        assert_eq!(
+            optimizer.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(optimizer
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("自优化"));
+
+        let status = run_with_args(vec![
+            "optimize".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--status".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            status.get("schema_version").and_then(|v| v.as_str()),
+            Some("orderk.optimize.v1")
+        );
+        assert_eq!(status.get("mode").and_then(|v| v.as_str()), Some("status"));
+        assert!(
+            status
+                .pointer("/status/total_events")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                >= 1
+        );
+
+        let dry_run = run_with_args(vec![
+            "optimize".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--dry-run".into(),
+            "--min-events".into(),
+            "1".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            dry_run.get("mode").and_then(|v| v.as_str()),
+            Some("dry_run")
+        );
+        assert_eq!(dry_run.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert!(dry_run.get("proposal").is_some());
+
+        let reset = run_with_args(vec![
+            "optimize".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--reset".into(),
+        ])
+        .unwrap();
+        assert_eq!(reset.get("mode").and_then(|v| v.as_str()), Some("reset"));
+        assert_eq!(
+            reset
+                .pointer("/status/text_only_penalty")
+                .and_then(|v| v.as_f64()),
+            Some(1.0)
+        );
+        assert_eq!(
+            reset
+                .pointer("/status/dynamic_stopwords")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let missing = root.join("missing.sqlite");
+        let status_err = run_with_args(vec![
+            "optimize".into(),
+            "--db".into(),
+            missing.to_string_lossy().to_string(),
+            "--status".into(),
+        ])
+        .unwrap_err();
+        assert!(status_err.to_string().contains("open"));
+        assert!(
+            !missing.exists(),
+            "optimize --status must not create missing DB files"
+        );
+
+        let dry_run_err = run_with_args(vec![
+            "optimize".into(),
+            "--db".into(),
+            missing.to_string_lossy().to_string(),
+            "--dry-run".into(),
+        ])
+        .unwrap_err();
+        assert!(dry_run_err.to_string().contains("open"));
+        assert!(
+            !missing.exists(),
+            "optimize --dry-run must not create missing DB files"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn index_cli_contract_exposes_chunk_overlap_profile() {
         let root = std::env::temp_dir().join(format!(
             "orderk-cli-overlap-{}-{}",
@@ -2144,8 +2355,14 @@ Retrieval augmented generation uses embeddings and bm25.
             "80".into(),
         ])
         .unwrap();
-        assert_eq!(indexed.get("chunk_overlap_chars").and_then(|v| v.as_u64()), Some(80));
-        assert_eq!(indexed.get("chunk_strategy").and_then(|v| v.as_str()), Some("heading_overlap"));
+        assert_eq!(
+            indexed.get("chunk_overlap_chars").and_then(|v| v.as_u64()),
+            Some(80)
+        );
+        assert_eq!(
+            indexed.get("chunk_strategy").and_then(|v| v.as_str()),
+            Some("heading_overlap")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

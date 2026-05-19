@@ -1,8 +1,12 @@
-use crate::chunker::{chunk_document_with_options, has_code, has_incomplete_tasks, has_link, has_task_list, ChunkingOptions};
+use crate::chunker::{
+    chunk_document_with_options, has_code, has_incomplete_tasks, has_link, has_task_list,
+    ChunkingOptions,
+};
 use crate::embedding::{vector_hash, EmbeddingProvider};
 use crate::filter::{compile_filter, FilterSql};
 use crate::markdown::parse_markdown;
 use crate::models::*;
+use crate::optimizer;
 use crate::scanner::scan_vault;
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, TimeZone, Utc};
@@ -190,6 +194,15 @@ impl QueryPlan {
             self.patterns.dedup();
             self.expanded_terms = expanded;
         }
+        self
+    }
+
+    fn with_runtime_config(mut self, config: &OptimizerRuntimeConfig) -> Self {
+        self.terms = optimizer::filter_dynamic_stopwords(self.terms, &config.dynamic_stopwords);
+        self.expanded_terms =
+            optimizer::filter_dynamic_stopwords(self.expanded_terms, &config.dynamic_stopwords);
+        self.patterns =
+            optimizer::filter_dynamic_stopwords(self.patterns, &config.dynamic_stopwords);
         self
     }
 
@@ -619,11 +632,12 @@ fn chunk_profile_matches(settings: &HashMap<String, String>, options: &IndexOpti
     let existing_overlap = setting_value(settings, "chunk_overlap_chars")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
-    let existing_strategy = setting_value(settings, "chunk_strategy").unwrap_or(if existing_overlap > 0 {
-        "heading_overlap"
-    } else {
-        "heading"
-    });
+    let existing_strategy =
+        setting_value(settings, "chunk_strategy").unwrap_or(if existing_overlap > 0 {
+            "heading_overlap"
+        } else {
+            "heading"
+        });
     existing_max == options.chunk_max_chars
         && existing_overlap == options.chunk_overlap_chars
         && existing_strategy == options.strategy()
@@ -950,8 +964,16 @@ impl IndexStore {
         upsert_setting(conn, "embedding_dim", &embedding_dim.to_string())?;
         upsert_setting(conn, "vector_backend", vector_backend.as_str())?;
         upsert_setting(conn, "chunk_strategy", &chunk_strategy)?;
-        upsert_setting(conn, "chunk_max_chars", &chunk_options.chunk_max_chars.to_string())?;
-        upsert_setting(conn, "chunk_overlap_chars", &chunk_options.chunk_overlap_chars.to_string())?;
+        upsert_setting(
+            conn,
+            "chunk_max_chars",
+            &chunk_options.chunk_max_chars.to_string(),
+        )?;
+        upsert_setting(
+            conn,
+            "chunk_overlap_chars",
+            &chunk_options.chunk_overlap_chars.to_string(),
+        )?;
 
         Ok(IndexSummary {
             ok: true,
@@ -1036,6 +1058,8 @@ impl IndexStore {
         let filter_sql = compile_filter(filter_text.as_deref(), "c")?;
         provider.health()?;
         ensure_has_embeddings(conn)?;
+        let optimizer_config = optimizer::load_runtime_config(conn).unwrap_or_default();
+        let plan = plan.with_runtime_config(&optimizer_config);
         ensure_runtime_profile(
             conn,
             provider,
@@ -1084,6 +1108,9 @@ impl IndexStore {
         if options.external_reranker {
             apply_lexical_reranker(&mut results, &plan, query);
         }
+        if optimizer::apply_runtime_adjustments(&mut results, &optimizer_config) > 0 {
+            sort_search_results(&mut results);
+        }
         let filtered_candidates = results.len();
         if let Some(min_score) = options.min_score {
             let before_threshold = results.len();
@@ -1130,6 +1157,7 @@ impl IndexStore {
         } else {
             None
         };
+        let optimizer_status = None;
         Ok(QueryResponse {
             query: query.to_string(),
             query_id,
@@ -1139,6 +1167,7 @@ impl IndexStore {
             routing,
             vector_backend: vector_backend.as_str().to_string(),
             explain,
+            optimizer: optimizer_status,
             results,
         })
     }
@@ -2359,7 +2388,11 @@ fn sort_search_results(results: &mut [SearchResult]) {
 
 fn apply_lexical_reranker(results: &mut [SearchResult], plan: &QueryPlan, query: &str) {
     let mut terms = plan.all_terms();
-    terms.extend(normalize_query(query).split_whitespace().map(ToString::to_string));
+    terms.extend(
+        normalize_query(query)
+            .split_whitespace()
+            .map(ToString::to_string),
+    );
     terms.retain(|term| term.chars().count() >= 2);
     terms.sort();
     terms.dedup();
@@ -2377,7 +2410,10 @@ fn apply_lexical_reranker(results: &mut [SearchResult], plan: &QueryPlan, query:
             result.tags.join(" ")
         )
         .to_lowercase();
-        let matched = terms.iter().filter(|term| haystack.contains(term.as_str())).count();
+        let matched = terms
+            .iter()
+            .filter(|term| haystack.contains(term.as_str()))
+            .count();
         if matched == 0 {
             continue;
         }
@@ -2931,6 +2967,7 @@ fn build_result(
         recency_boost: recency_boost(mtime),
         metadata_boost,
         link_boost: 0.0,
+        optimizer_adjustment: 0.0,
         freshness_boost: 0.0,
         confidence_boost: 0.0,
         status_boost: 0.0,

@@ -298,6 +298,8 @@ pub struct ScoreBreakdown {
     #[serde(default)]
     pub link_boost: f32,
     #[serde(default)]
+    pub optimizer_adjustment: f32,
+    #[serde(default)]
     pub freshness_boost: f32,
     #[serde(default)]
     pub confidence_boost: f32,
@@ -621,7 +623,76 @@ pub struct QueryResponse {
     pub vector_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<QueryExplainTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer: Option<OptimizerStatus>,
     pub results: Vec<SearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OptimizerRuntimeConfig {
+    pub text_only_penalty: f32,
+    pub dynamic_stopwords: Vec<String>,
+}
+
+impl Default for OptimizerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            text_only_penalty: 1.0,
+            dynamic_stopwords: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OptimizerStatus {
+    pub schema_version: String,
+    pub enabled: bool,
+    pub message: String,
+    pub total_events: usize,
+    pub pending_events: usize,
+    pub text_only_penalty: f64,
+    pub dynamic_stopwords: Vec<String>,
+    pub consecutive_adjustments: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_applied_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rollback_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OptimizerMetrics {
+    pub events: usize,
+    pub returned_results: usize,
+    pub text_only_results: usize,
+    pub vector_confirmed_results: usize,
+    pub text_only_ratio: f64,
+    pub vector_confirmed_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OptimizeProposal {
+    pub schema_version: String,
+    pub eligible: bool,
+    pub reason: String,
+    pub stopwords_to_add: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_only_penalty_from: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_only_penalty_to: Option<f64>,
+    pub latest_event_id: i64,
+    pub metrics: OptimizerMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OptimizeResponse {
+    pub schema_version: String,
+    pub ok: bool,
+    pub mode: String,
+    pub status: OptimizerStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<OptimizeProposal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,6 +729,8 @@ pub struct SearchIndexResponse {
     pub vector_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<QueryExplainTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer: Option<OptimizerStatus>,
     pub results: Vec<SearchIndexEntry>,
 }
 
@@ -685,6 +758,7 @@ impl From<QueryResponse> for SearchIndexResponse {
             })
             .collect();
         let explain = response.explain;
+        let optimizer = response.optimizer;
         Self {
             schema_version: "orderk.search_index.v1".to_string(),
             query: response.query,
@@ -696,6 +770,7 @@ impl From<QueryResponse> for SearchIndexResponse {
             routing: response.routing,
             vector_backend: response.vector_backend,
             explain,
+            optimizer,
             results,
         }
     }

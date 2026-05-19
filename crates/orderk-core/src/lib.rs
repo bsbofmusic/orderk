@@ -7,11 +7,13 @@ pub mod health;
 pub mod index;
 pub mod markdown;
 pub mod models;
+pub mod optimizer;
 pub mod scanner;
 
 pub use api::{
-    feedback, get_chunks, index_vault, index_vault_with_options, init, provider_from_env,
-    provider_from_name, query, query_with_filter, query_with_options, status,
+    feedback, get_chunks, index_vault, index_vault_with_options, init, optimize_apply,
+    optimize_dry_run, optimize_reset, optimize_status, provider_from_env, provider_from_name,
+    query, query_with_filter, query_with_options, status,
 };
 pub use capsule::{export_capsule_manifest, inspect_capsule_manifest, write_capsule_manifest};
 pub use embedding::{EmbeddingProvider, MockEmbeddingProvider, SiliconFlowM3Provider};
