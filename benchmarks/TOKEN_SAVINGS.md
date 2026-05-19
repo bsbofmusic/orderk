@@ -3,6 +3,8 @@
 orderk's token-efficiency story is not "summarize everything with an LLM".
 It is progressive disclosure:
 
+This report still centers `--view index` + `get`, but the current CLI also exposes `--json-lines` for pipelines and `--query-expansion` / `--reranker lexical|none` for retrieval shaping.
+
 ```text
 search --view index -> choose candidates -> get selected chunks
 ```

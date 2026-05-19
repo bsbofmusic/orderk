@@ -54,6 +54,8 @@ orderk maintain \
 
 Output schema: `orderk.maintain.v1`.
 
+The maintainer-facing query path now also supports the retrieval workflow controls surfaced in the CLI: `--chunk-overlap`, `--query-expansion`, `--json-lines`, `--reranker lexical|none`, and `eval --ab-chunk-overlap`. These are opt-in controls for recall quality and pipeline ergonomics, not new write paths.
+
 ### Continuous retrieval quality monitoring
 
 `maintain --queries` can be wired into any monitoring system (cron, systemd timer, CI) to catch retrieval-quality regressions before users notice.

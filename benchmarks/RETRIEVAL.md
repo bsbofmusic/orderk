@@ -3,6 +3,8 @@
 This report captures orderk's own retrieval-quality evidence.
 It is not a LongMemEval-S reproduction.
 
+It now reflects the opt-in retrieval workflow controls shipped in the CLI: chunk overlap, deterministic query expansion, JSON Lines output, the bounded lexical reranker, and eval A/B for overlap.
+
 ## What was measured
 
 Two layers matter here:

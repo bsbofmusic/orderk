@@ -34,6 +34,7 @@ It is built for people who want better recall without giving another app permiss
 | Disposable SQLite index | Files, chunks, embeddings, FTS, vector rows, settings, and feedback live in one rebuildable DB. Delete the index and your Markdown vault is still intact. |
 | Hybrid retrieval | Keyword search, vector search, query-aware routing, path/tag/recency signals, and RRF-style fusion work together instead of pretending one score explains everything. |
 | Metadata-aware reranking | Paths, headings, tags, frontmatter, confidence, status, source type, and link evidence can influence rank without an LLM rewrite step. |
+| Retrieval workflow controls | Opt-in chunk overlap, deterministic query expansion, JSON Lines output, eval A/B, and a bounded lexical reranker give agents and maintainers more control without widening the read-only boundary. |
 | Obsidian-native evidence | Results can include snippets, headings, tags, wikilinks, backlinks, neighbor chunks, score breakdowns, and routing timings, so agents can explain what they found. |
 | Cheap embeddings by default | Production defaults use SiliconFlow + `BAAI/bge-m3` (`1024` dimensions), which is strong enough for everyday personal-vault recall without paying for a large memory platform. |
 | Read-only agent surface | CLI search and MCP expose retrieval, status, and health. They do not expose note writing, save, forget, chat, or index mutation tools. |
@@ -71,6 +72,37 @@ search --view index -> inspect candidate cards -> get selected chunks
 |---|---:|---:|---:|---|
 | `orderk retrieval blade` | 22,830 | 13,400 | 2,996 | yes |
 | `Obsidian graph rules` | 22,364 | 12,757 | 2,285 | yes |
+
+### Retrieval workflow controls
+
+These knobs are opt-in and do not change the source of truth or the read-only boundary.
+
+```bash
+orderk index \
+  --vault /path/to/vault \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --chunk-max-chars 1200 \
+  --chunk-overlap 80
+
+orderk search \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --query "retrieval workflow notes" \
+  --query-expansion \
+  --reranker lexical \
+  --json-lines
+
+orderk eval \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --queries /path/to/eval-queries.json \
+  --vault /path/to/vault \
+  --ab-chunk-overlap 80
+```
+
+- `--chunk-overlap` preserves boundary context when chunks are size-capped.
+- `--query-expansion` uses a deterministic lexical map, not an LLM rewrite.
+- `--json-lines` emits one JSON object per line for piping and tooling.
+- `--reranker lexical|none` enables or disables a bounded deterministic lexical second pass; `--no-rerank` only disables the metadata-aware rerank path.
+- `--ab-chunk-overlap` compares overlap settings against the baseline eval run.
 
 In representative live-vault queries, compact recall cut output size by **41–46%** while preserving the same top file. See [`benchmarks/TOKEN_SAVINGS.md`](benchmarks/TOKEN_SAVINGS.md).
 
@@ -257,7 +289,10 @@ orderk search \
 - `--retrieval-depth 1`: include one-hop authored Obsidian wikilink/backlink candidates for deeper recall. Default `0` returns direct keyword/vector/route candidates only.
 - `--expand-links 1`: compatibility alias for `--retrieval-depth 1`; off by default and capped at one hop.
 - `--filter "tag == 'rust' && has_code == true && confidence == 'high'"`: optional metadata filter DSL. Supported fields are `path`, `title`, `heading`, `tag`, `has_code`, `has_link`, `has_task_list`, `has_incomplete_tasks`, `confidence`, `status`, and `source_type`.
-- `--no-rerank`: disable deterministic metadata-aware rerank. By default orderk adds a bounded `score_breakdown.metadata_boost` from indexed structure/frontmatter, with no LLM or cross-encoder reranker.
+- `--no-rerank`: disable the deterministic metadata-aware rerank path. By default orderk adds a bounded `score_breakdown.metadata_boost` from indexed structure/frontmatter.
+- `--reranker lexical|none`: optionally run a bounded deterministic lexical reranker after temporal-quality adjustment.
+- `--query-expansion`: enable deterministic lexical query expansion for short or synonym-heavy searches.
+- `--json-lines`: emit one JSON object per line for scripts and pipes.
 
 ### 5) MCP read-only server
 
@@ -341,7 +376,7 @@ python3 scripts/eval.py
 
 The eval script is a deterministic offline quality gate. It indexes the checked-in fixture vault at `fixtures/eval/vault`, runs `fixtures/eval/queries.json`, and compares the report against `baselines/orderk-eval-baseline.json`. The gate fails on missing fixtures, zero-hit cases, top-1 regressions, or metric regressions in `recall_at_k`, `ndcg_at_k`, `mrr`, and mean latency. Advanced/dev-only overrides are available through `ORDERK_EVAL_VAULT`, `ORDERK_EVAL_QUERIES`, and `ORDERK_EVAL_BASELINE`; release runs should use the checked-in defaults.
 
-The CLI prints JSON by default.
+The CLI prints JSON by default. Search can also emit JSON Lines via `--json-lines` when a pipeline wants one result per line.
 
 ## Agent setup
 
@@ -354,7 +389,7 @@ This is the shortest path for an agent or automation:
 5. Use `sqlite_vec` as the vector backend.
 6. Consume the JSON output directly. Search responses include `route`, `routing` with per-stage timings, `retrieval_depth`, and link expansion counts, per-result `score_breakdown`, `evidence` with `evidence_count` and per-result `retrieval_depth`, `tags`, `confidence`, `status`, `source_type`, optional neighbor `context_chunks`, and optional Obsidian link evidence.
 7. Use `--view index` plus `orderk get --ids ...` for two-stage compact recall when an agent should inspect candidate IDs before fetching full text.
-8. Use `--min-score`/`--threshold`, `--context-chunks`, `--include-links`, `--retrieval-depth 1`, `--expand-links 1`, `--filter`, and `--no-rerank` when an agent needs thicker evidence, authored one-hop graph recall, or wants deterministic metadata rerank disabled.
+8. Use `--chunk-max-chars`, `--chunk-overlap`, `--query-expansion`, `--json-lines`, `--reranker lexical|none`, `--min-score`/`--threshold`, `--context-chunks`, `--include-links`, `--retrieval-depth 1`, `--expand-links 1`, `--filter`, and `--no-rerank` when an agent needs thicker evidence, deterministic lexical expansion, machine-friendly line output, or wants metadata rerank disabled.
 9. If the client supports MCP, use `orderk mcp` for read-only `search`/`get`/`status`/`health` tools instead of asking the agent to guess shell flags.
 10. Use `orderk capsule export` / `orderk capsule inspect` when an agent needs to verify that a portable SQLite index artifact still matches its recorded profile, counts, size, and checksum.
 11. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
@@ -426,7 +461,7 @@ For the full maintenance contract, see [`docs/MAINTAIN.md`](docs/MAINTAIN.md). F
 - agent orchestration
 - note writing
 - automatic summaries
-- LLM reranking
+- LLM / cross-encoder reranking; the only optional rerank path is the bounded deterministic lexical reranker
 - second-brain style lifecycle management
 
 ## License

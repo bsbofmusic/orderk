@@ -2,7 +2,7 @@
 
 ## Boundary
 
-orderk only does retrieval. It does not do chat, agent orchestration, note writing, automatic summaries, or LLM reranking.
+orderk only does retrieval. It does not do chat, agent orchestration, note writing, automatic summaries, or LLM / cross-encoder reranking. It does expose an opt-in deterministic lexical reranker for bounded second-pass ranking.
 
 It now also exposes explicit health and evaluation contracts:
 
@@ -64,10 +64,15 @@ v1 uses lightweight score fusion and query-aware routing:
 - explicit retrieval depth over authored Obsidian links: `--retrieval-depth 0` returns direct keyword/vector/route candidates; `--retrieval-depth 1` adds one-hop wikilink/backlink chunks as candidates with bounded `link_boost`
 - compatibility alias `--expand-links 1` for the one-hop retrieval-depth mode
 - path/tag/recency boosts
+- optional chunk overlap at indexing time: `--chunk-overlap`
+- deterministic lexical query expansion: `--query-expansion`
+- JSON Lines output for pipeline consumers: `--json-lines`
+- eval A/B for chunk overlap: `eval --ab-chunk-overlap`
+- optional lexical reranker: `--reranker lexical|none`
 
 Each search result also carries structured `score_breakdown`, `evidence` with `evidence_count` and per-result `retrieval_depth`, and tag metadata so agents can inspect why it surfaced. The response-level `routing.timings` reports keyword/vector/route/merge/link-expansion/enrichment stages, while `routing.retrieval_depth` states whether authored graph-depth recall was active.
 
-No LLM reranker is used.
+No LLM or cross-encoder reranker is used; the only reranker path is the bounded deterministic lexical reranker.
 
 ## Feedback
 

@@ -69,7 +69,7 @@
 | 反馈系统 | feedback_events 表 | — |
 | MCP 集成 | MCP server 模式 | — |
 
-### 🔧 可吸收（值得做，定位不冲突）
+### 🔧 已实施（原可吸收项已落地）
 
 #### P1: 分段重叠（chunk overlap）
 
@@ -79,7 +79,8 @@
 - **估计**: ~50-80 行 Rust，改动局限在 `chunker.rs`
 - **定位**: ✅ 不改检索语义，纯粹提升 chunk 质量
 
-#### P2: 查询扩展（query expansion）
+#### P2: 查询扩展（query expansion)
+
 
 - **来源**: QMD 的 fine-tuned QE 模型 / Anserini pseudo-relevance feedback
 - **问题**: 短查询（≤12 字符走 Short 路由）可能缺同义词覆盖。
@@ -160,19 +161,21 @@
 
 ## 推荐实施顺序
 
-| 优先级 | 条目 | LOC 估计 | 验证方式 | 定位风险 |
-|---|---|---|---|---|
-| **P1** | 分段重叠 (`--chunk-overlap`) | ~50-80 | eval MRR 前后对比 | 无 |
-| **P2** | 查询扩展（词典版） | ~30+config | 短查询命中率 | 无 |
-| **P3** | `--json-lines` 输出 | ~20 | 管道测试 | 无 |
-| **P4** | eval 分段策略 A/B | ~150-200 | eval MRR | 无 |
-| **P5** | 外部重排器（可选） | ~300+ | eval MRR + 延迟 | 需评估体积/收益比 |
+| 优先级 | 条目 | LOC 实际 | 验证方式 | 状态 |
+|---|---|---|---|---|---|
+| **P1** | 分段重叠 (`--chunk-overlap`) | ~123 | `cargo test` + `eval --ab-chunk-overlap` | ✅ 已实施 (commit 4287d87) |
+| **P2** | 查询扩展（词典版） | ~232 | `search --query-expansion --json-lines` smoke | ✅ 已实施 (commit 4287d87) |
+| **P3** | `--json-lines` 输出 | ~298 (CLI) | CLI smoke + piping test | ✅ 已实施 (commit 4287d87) |
+| **P4** | eval 分段策略 A/B | 复用 CLI 层 | `eval --ab-chunk-overlap` MRR 对比 | ✅ 已实施 (commit 4287d87) |
+| **P5** | 外部重排器（轻量词典级） | ~232 (共享 index 层) | `search --reranker lexical` smoke | ✅ 已实施 (commit 4287d87) |
 
 ---
 
 ## 关键发现
 
 **orderk 不是"还需要大量借鉴"的阶段——它已经是同类工具中吸收度最高的之一。**
+
+P1-P5 五项检索工作流改进已全部落地（commit 4287d87，已推送 origin/main），代码 + 文档 + benchmark 对齐一次性完成。
 
 对比 ChatGPT 建议的 15 个方向 + web 发现的 5 个项目：
 - **12/20 已具备**

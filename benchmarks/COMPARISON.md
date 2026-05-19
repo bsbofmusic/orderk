@@ -5,6 +5,8 @@ This comparison is about product shape, not a claim that one tool replaces every
 agentmemory, mem0, Letta/MemGPT, and similar projects are memory systems or agent runtimes.
 orderk is a local retrieval blade for an existing Markdown / Obsidian vault.
 
+The current orderk shape also includes opt-in retrieval controls like `--chunk-overlap`, `--query-expansion`, `--json-lines`, `--reranker lexical|none`, and `eval --ab-chunk-overlap`.
+
 ## Quick comparison
 
 | Dimension | orderk | agentmemory | mem0 / Letta class tools | Built-in note search |

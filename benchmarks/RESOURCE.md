@@ -2,6 +2,8 @@
 
 This report captures the resource envelope behind the README's lightweight claims.
 
+The current retrieval workflow controls are opt-in and do not change the baseline claim that orderk stays a small, one-shot, read-only retrieval blade.
+
 ## Environment
 
 - Host: Linux x64 maintainer machine

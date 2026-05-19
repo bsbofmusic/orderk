@@ -64,5 +64,5 @@ Do not publish from a partially green run.
 - No agent orchestrator.
 - No note writing.
 - No automatic summaries.
-- No LLM reranker in v1.
+- No LLM or cross-encoder reranker in v1; the only rerank path is the bounded deterministic lexical reranker.
 - No background daemon or automatic polling by default.

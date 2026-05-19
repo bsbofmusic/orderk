@@ -8,6 +8,7 @@ This directory holds the longer-form evidence behind the README claims.
 - `RESOURCE.md` — binary size, RSS, daemon count, index footprint
 - `TOKEN_SAVINGS.md` — full-context vs `--view index` vs `get` token-shape comparisons
 - `COMPARISON.md` — orderk vs memory systems vs built-in note search
+- These reports also reflect the current retrieval workflow controls: `--chunk-overlap`, `--query-expansion`, `--json-lines`, `--reranker lexical|none`, and `--ab-chunk-overlap`.
 
 These files are meant to be auditable, not promotional.
 Each report should list:
