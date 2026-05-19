@@ -114,7 +114,7 @@ impl SiliconFlowM3Provider {
             .timeout(Duration::from_secs(SILICONFLOW_REQUEST_TIMEOUT_SECS))
             .build();
         let auth = format!("Bearer {}", self.api_key);
-        let body = serde_json::json!({ "model": &self.model, "input": inputs }).to_string();
+        let body = serde_json::json!({ "model": &self.model, "input": inputs, "dimensions": self.dim }).to_string();
 
         let mut last_error = String::new();
         for attempt in 1..=SILICONFLOW_MAX_ATTEMPTS {
