@@ -283,7 +283,7 @@ pub fn set_optimizer(
     ensure_optimizer_schema(conn)?;
     if text_only_penalty.is_none() && add_stopwords.is_empty() && remove_stopwords.is_empty() {
         return Err(anyhow!(
-            "optimize set requires --text-only-penalty, --add-stopword, or --remove-stopword"
+            "optimize tune/set requires --text-only-penalty, --add-stopword, or --remove-stopword"
         ));
     }
 
@@ -606,10 +606,10 @@ fn optimizer_message(
     dynamic_stopwords: usize,
 ) -> String {
     let model_hint = embedding_model
-        .map(|model| format!("当前模型 `{model}` "))
-        .unwrap_or_default();
+        .map(|model| format!("当前模型 `{model}` 会"))
+        .unwrap_or_else(|| "当前模型会".to_string());
     format!(
-        "⚙️ {model_hint}正在使用持续优化迭代算法优化搜索结果；如结果不满意，可用 `orderk optimize set --db <orderk.sqlite> --text-only-penalty <0.65-1.0> --add-stopword <term> --remove-stopword <term>` 手动调整参数来优化目标结果。已记录 {total_events} 次查询，待优化事件 {pending_events} 个；text_only_penalty={text_only_penalty:.2}，动态停用词 {dynamic_stopwords} 个。"
+        "✨ 搜索正在自动校准：{model_hint}基于持续优化迭代算法，结合你的查询反馈微调排序；若这次结果不够准，可用 `orderk optimize tune --db <orderk.sqlite> --text-only-penalty <0.65-1.0> --add-stopword <term> --remove-stopword <term>` 手动校准权重/停用词，让结果更贴近你的目标。已记录 {total_events} 次查询，待校准查询 {pending_events} 个；text_only_penalty={text_only_penalty:.2}，动态停用词 {dynamic_stopwords} 个。"
     )
 }
 
