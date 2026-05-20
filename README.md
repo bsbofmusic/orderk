@@ -28,7 +28,7 @@ It is built for people who want better recall without giving another app permiss
 
 | Feature | Benefit |
 |---|---|
-| Single Rust binary | Small surface area and fast startup. The installed Linux x64 binary for v0.1.8 is 23,716,616 bytes, about 22.6 MiB, under a 30 MiB release-gate ceiling. |
+| Single Rust binary | Small surface area and fast startup. The installed Linux x64 binary for v0.1.9 is 23,886,168 bytes, about 22.8 MiB, under a 30 MiB release-gate ceiling. |
 | On-demand CLI | No always-on orderk daemon. Normal runtime is one command, one result, then exit. |
 | Low runtime memory | A live search probe on the maintainer machine used about 9.2 MiB VmRSS and 12.3 MiB VmPeak, under a 15 MiB baseline ceiling. |
 | Disposable SQLite index | Files, chunks, embeddings, FTS, vector rows, settings, and feedback live in one rebuildable DB. Delete the index and your Markdown vault is still intact. |

@@ -51,7 +51,7 @@ These features return vault evidence only; they do not write notes, generate sum
 - `orderk-obsidian`: Obsidian desktop plugin package.
 
 Runtime installs resolve a stable native binary through `ORDERK_BIN`, a package-local vendor binary, or `orderk` on `PATH`; they do not depend on Cargo `target/` build artifacts.
-The v0.1.8 npm one-click path targets Linux x64 first; other platforms can build from source and install/copy the resulting binary to a stable path.
+The v0.1.9 npm one-click path targets Linux x64 first; other platforms can build from source and install/copy the resulting binary to a stable path.
 
 ## Obsidian artifact
 
