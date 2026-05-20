@@ -103,19 +103,11 @@ pub fn query_with_options(
     let read_conn = open_existing(db_path)?;
     let mut response =
         IndexStore::query_with_options(&read_conn, query, options, provider, &vector_backend)?;
-    drop(read_conn);
-    if !optimizer::optimizer_disabled() {
-        if let Ok(write_conn) = open_writable_existing(db_path) {
-            if let Ok(status) = optimizer::record_query_and_maybe_optimize(&write_conn, &response) {
-                response.optimizer = Some(optimizer::with_model_hint(status, provider.model_id()));
-            }
-        }
-    } else {
-        response.optimizer = Some(optimizer::with_model_hint(
-            optimizer::disabled_optimizer_status(),
-            provider.model_id(),
-        ));
-    }
+    response.optimizer = Some(optimizer::with_model_hint(
+        optimizer::optimizer_status(&read_conn)
+            .unwrap_or_else(|_| optimizer::disabled_optimizer_status()),
+        provider.model_id(),
+    ));
     Ok(response)
 }
 

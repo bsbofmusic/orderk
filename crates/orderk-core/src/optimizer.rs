@@ -308,7 +308,11 @@ pub fn set_optimizer(
     }
     for term in add_stopwords {
         let term = normalize_manual_stopword(term)?;
-        if !state.dynamic_stopwords.iter().any(|current| current == &term) {
+        if !state
+            .dynamic_stopwords
+            .iter()
+            .any(|current| current == &term)
+        {
             state.dynamic_stopwords.push(term);
         }
     }

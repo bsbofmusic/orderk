@@ -19,6 +19,11 @@ import subprocess
 import tempfile
 import time
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is unavailable on Windows.
+    resource = None
+
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BIN = REPO / "target" / "release" / ("orderk.exe" if os.name == "nt" else "orderk")
 
@@ -68,6 +73,25 @@ def percentile(values: list[float], pct: float) -> float:
     data = sorted(values)
     idx = min(len(data) - 1, int(round((pct / 100.0) * (len(data) - 1))))
     return data[idx]
+
+
+def max_rss_mb() -> float | None:
+    """Return max RSS for child orderk processes in MiB, when the OS exposes it."""
+    if resource is None:
+        return None
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    rss_kb = float(usage.ru_maxrss)
+    if rss_kb <= 0:
+        return None
+    # Linux reports ru_maxrss in KiB. macOS reports bytes, but this release gate
+    # runs on Linux CI/ops; keep a defensive conversion for unusually large values.
+    if sys_platform_is_darwin():
+        return round(rss_kb / 1024 / 1024, 2)
+    return round(rss_kb / 1024, 2)
+
+
+def sys_platform_is_darwin() -> bool:
+    return os.uname().sysname == "Darwin" if hasattr(os, "uname") else False
 
 
 def main() -> None:
@@ -201,6 +225,7 @@ def main() -> None:
             "query_ms_p50": round(statistics.median(durations), 2),
             "query_ms_p95": round(percentile(durations, 95), 2),
             "query_ms_max": round(max(durations), 2),
+            "max_rss_mb": max_rss_mb(),
             "updated": second_index["updated"],
             "deleted": second_index["deleted"],
             "final_notes": status_after["notes"],

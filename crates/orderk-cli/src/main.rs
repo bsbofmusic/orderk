@@ -2,9 +2,10 @@ use anyhow::{anyhow, Result};
 use orderk_core::{
     classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
     index_vault_with_options, init, inspect_capsule_manifest, optimize_apply, optimize_dry_run,
-    optimize_reset, optimize_set, optimize_status, provider_from_name, query, query_with_options, status,
-    write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider, FeedbackEvent,
-    FreshnessMode, IndexOptions, QueryOptions, QueryResponse, SearchIndexResponse, VectorBackend,
+    optimize_reset, optimize_set, optimize_status, provider_from_name, query, query_with_options,
+    status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider,
+    FeedbackEvent, FreshnessMode, IndexOptions, QueryOptions, QueryResponse, SearchIndexResponse,
+    VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -614,6 +615,48 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     Ok(baseline)
 }
 
+fn eval_missing_expected_phrase_cases(value: &serde_json::Value) -> Vec<String> {
+    let mut cases = Vec::new();
+    let Some(outcomes) = value.get("outcomes").and_then(|v| v.as_array()) else {
+        return cases;
+    };
+    for outcome in outcomes {
+        let expected_count = outcome
+            .get("expected_phrases")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))
+                    .count()
+            })
+            .unwrap_or(0);
+        if expected_count == 0 {
+            continue;
+        }
+        let matched_count = outcome
+            .get("matched_expected_phrases")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))
+                    .count()
+            })
+            .unwrap_or(0);
+        if matched_count < expected_count {
+            cases.push(
+                outcome
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unknown>")
+                    .to_string(),
+            );
+        }
+    }
+    cases
+}
+
 fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let started = Instant::now();
     let db = take_path(args, "--db")?;
@@ -663,19 +706,35 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                 Ok(value) => {
                     let zero_hit = value.get("zero_hit").and_then(|v| v.as_u64()).unwrap_or(0);
                     let queries_count = value.get("queries").and_then(|v| v.as_u64()).unwrap_or(0);
-                    if zero_hit == 0 {
+                    let missing_phrase_cases = eval_missing_expected_phrase_cases(&value);
+                    if zero_hit == 0 && missing_phrase_cases.is_empty() {
                         checks.push(orderk_core::HealthCheck::ok(
                             "eval",
                             "eval gate passed",
-                            json!({"queries": queries_count, "zero_hit": zero_hit}),
+                            json!({
+                                "queries": queries_count,
+                                "zero_hit": zero_hit,
+                                "missing_expected_phrase_cases": missing_phrase_cases.len()
+                            }),
                         ));
                     } else {
+                        let message = if zero_hit > 0 && !missing_phrase_cases.is_empty() {
+                            "eval gate found zero-hit and expected phrase evidence failures"
+                        } else if zero_hit > 0 {
+                            "eval gate found zero-hit cases"
+                        } else {
+                            "eval gate found expected phrase evidence failures"
+                        };
                         checks.push(orderk_core::HealthCheck::fail(
                             "eval",
                             orderk_core::ErrorCode::ESmokeQueryFailed,
-                            "eval gate found zero-hit cases",
-                            Some("inspect expected_paths, indexing freshness, and ranking before release".to_string()),
-                            json!({"queries": queries_count, "zero_hit": zero_hit}),
+                            message,
+                            Some("inspect expected_paths, snippets, indexing freshness, and ranking before release".to_string()),
+                            json!({
+                                "queries": queries_count,
+                                "zero_hit": zero_hit,
+                                "missing_expected_phrase_cases": missing_phrase_cases
+                            }),
                         ));
                     }
                     Some(value)
@@ -2022,6 +2081,88 @@ mod tests {
     }
 
     #[test]
+    fn maintain_eval_fails_when_expected_phrase_evidence_is_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-maintain-phrase-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("expected.md"),
+            "# Expected\nalpha unique expected path has local evidence only.\n",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let queries = root.join("queries.json");
+        fs::write(
+            &queries,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "orderk.eval_queries.v1",
+                "queries": [{
+                    "id": "phrase-evidence",
+                    "query": "alpha unique expected path",
+                    "expected_paths": ["expected.md"],
+                    "expected_phrases": ["missing phrase"]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let report = maintain_command(&mut vec![
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--queries".into(),
+            queries.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        assert_eq!(report.get("ok").and_then(|v| v.as_bool()), Some(false));
+        let checks = report["checks"].as_array().expect("maintain checks array");
+        let eval_check = checks
+            .iter()
+            .find(|check| check.get("component").and_then(|v| v.as_str()) == Some("eval"))
+            .expect("eval check exists");
+        assert!(
+            eval_check
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("expected phrase"),
+            "eval check must explain phrase evidence failure: {eval_check}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn full_search_results_include_quality_and_evidence_summary() {
         let root = std::env::temp_dir().join(format!(
             "orderk-cli-quality-summary-{}-{}",
@@ -2179,7 +2320,7 @@ Temporal quality summary needle keeps evidence readable.
     }
 
     #[test]
-    fn search_records_optimizer_telemetry_and_exposes_lifecycle_commands() {
+    fn search_exposes_optimizer_status_without_writing_and_manual_tune_still_works() {
         let root = std::env::temp_dir().join(format!(
             "orderk-cli-optimizer-{}-{}",
             std::process::id(),
@@ -2257,6 +2398,20 @@ Temporal quality summary needle keeps evidence readable.
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let status_after_search = run_with_args(vec![
+            "optimize".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--status".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            status_after_search
+                .pointer("/status/total_events")
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "plain search must stay read-only and must not record optimizer_events"
+        );
         let manual_tune = run_with_args(vec![
             "optimize".into(),
             "--db".into(),
@@ -2286,11 +2441,10 @@ Temporal quality summary needle keeps evidence readable.
         assert!(manual_stopwords.iter().any(|v| v.as_str() == Some("how")));
         assert!(manual_stopwords.iter().any(|v| v.as_str() == Some("what")));
 
-        assert!(optimizer_message.contains("搜索正在自动校准"));
-        assert!(optimizer_message.contains("持续优化迭代算法"));
-        assert!(optimizer_message.contains("结合你的查询反馈微调排序"));
-        assert!(optimizer_message.contains("mock-8"));
-        assert!(optimizer_message.contains("optimize tune"));
+        assert!(
+            optimizer_message.contains("optimize tune"),
+            "search should expose manual optimizer instructions without writing telemetry: {optimizer_message}"
+        );
         assert!(optimizer_message.contains("--text-only-penalty"));
         assert!(optimizer_message.contains("--add-stopword"));
         assert!(optimizer_message.contains("--remove-stopword"));
@@ -2356,8 +2510,12 @@ Temporal quality summary needle keeps evidence readable.
             .pointer("/status/dynamic_stopwords")
             .and_then(|v| v.as_array())
             .unwrap();
-        assert!(!remaining_stopwords.iter().any(|v| v.as_str() == Some("how")));
-        assert!(remaining_stopwords.iter().any(|v| v.as_str() == Some("what")));
+        assert!(!remaining_stopwords
+            .iter()
+            .any(|v| v.as_str() == Some("how")));
+        assert!(remaining_stopwords
+            .iter()
+            .any(|v| v.as_str() == Some("what")));
 
         let status = run_with_args(vec![
             "optimize".into(),
@@ -2376,7 +2534,7 @@ Temporal quality summary needle keeps evidence readable.
                 .pointer("/status/total_events")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0)
-                >= 1
+                == 0
         );
 
         let dry_run = run_with_args(vec![

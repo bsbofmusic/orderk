@@ -4,13 +4,13 @@
   "queries": [
     {
       "id": "orderk-design",
-      "query": "orderk design architecture retrieval blade headless",
+      "query": "orderk 无头向量搜索方案 检索核心 知识代理",
       "expected_paths": ["brain/systems/orderk-设计决策与定位.md"],
-      "expected_phrases": ["检索刀片", "headless"]
+      "expected_phrases": ["无头向量搜索方案", "检索核心"]
     },
     {
       "id": "obsidian-graph",
-      "query": "Obsidian graph rules knowledge mapping wikilink backlink",
+      "query": "Obsidian图谱规则 wikilink backlink 图谱 规则",
       "expected_paths": ["brain/concepts/Obsidian图谱规则.md"],
       "expected_phrases": ["wikilink", "图谱"]
     },

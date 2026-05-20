@@ -350,9 +350,7 @@ mod tests {
             .map(|idx| format!("alpha boundary line {idx} carries enough repeated retrieval context for splitting"))
             .collect::<Vec<_>>()
             .join("\n");
-        let body = format!(
-            "# Alpha\n{alpha_lines}\n## Beta\nsix six six\nseven seven seven\n"
-        );
+        let body = format!("# Alpha\n{alpha_lines}\n## Beta\nsix six six\nseven seven seven\n");
         let doc = parse_markdown("notes/overlap.md", &body).unwrap();
         let chunks = chunk_document_with_options(
             &doc,

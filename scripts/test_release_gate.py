@@ -81,6 +81,136 @@ class ReleaseGateStaticChecksTest(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn("binary_size_bytes", result["stdout_tail"])
 
+    def test_stress_resource_baseline_rejects_latency_regression(self) -> None:
+        stress_report = {
+            "ok": True,
+            "notes_indexed": 1000,
+            "queries": 300,
+            "query_ms_p50": 151.0,
+            "query_ms_p95": 201.0,
+            "initial_index_ms": 1900.0,
+            "max_rss_mb": 9.0,
+        }
+        baseline = {
+            "stress_min_notes_indexed": 1000,
+            "stress_min_queries": 300,
+            "mock_query_ms_p50_max": 150.0,
+            "mock_query_ms_p95_max": 200.0,
+            "mock_index_ms_max": 5000.0,
+            "mock_stress_rss_max_mb": 15.0,
+        }
+        result = release_gate.check_stress_resource_baseline(stress_report, baseline=baseline)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("query_ms_p50", result["stderr_tail"])
+        self.assertIn("query_ms_p95", result["stderr_tail"])
+
+    def test_stress_resource_baseline_rejects_missing_required_metrics(self) -> None:
+        stress_report = {
+            "ok": True,
+            "notes_indexed": 1000,
+            "queries": 300,
+            "max_rss_mb": 9.0,
+        }
+        baseline = {
+            "stress_min_notes_indexed": 1000,
+            "stress_min_queries": 300,
+            "mock_query_ms_p50_max": 150.0,
+            "mock_query_ms_p95_max": 200.0,
+            "mock_index_ms_max": 5000.0,
+            "mock_stress_rss_max_mb": 15.0,
+        }
+        result = release_gate.check_stress_resource_baseline(stress_report, baseline=baseline)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("query_ms_p50 missing", result["stderr_tail"])
+        self.assertIn("query_ms_p95 missing", result["stderr_tail"])
+        self.assertIn("initial_index_ms missing", result["stderr_tail"])
+
+    def test_stress_resource_baseline_rejects_index_regression(self) -> None:
+        stress_report = {
+            "ok": True,
+            "notes_indexed": 1000,
+            "queries": 300,
+            "query_ms_p50": 75.0,
+            "query_ms_p95": 90.0,
+            "initial_index_ms": 5001.0,
+            "max_rss_mb": 9.0,
+        }
+        baseline = {
+            "stress_min_notes_indexed": 1000,
+            "stress_min_queries": 300,
+            "mock_query_ms_p50_max": 150.0,
+            "mock_query_ms_p95_max": 200.0,
+            "mock_index_ms_max": 5000.0,
+            "mock_stress_rss_max_mb": 15.0,
+        }
+        result = release_gate.check_stress_resource_baseline(stress_report, baseline=baseline)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("initial_index_ms", result["stderr_tail"])
+
+    def test_stress_resource_baseline_rejects_missing_rss_when_required(self) -> None:
+        stress_report = {
+            "ok": True,
+            "notes_indexed": 1000,
+            "queries": 300,
+            "query_ms_p50": 75.0,
+            "query_ms_p95": 90.0,
+            "initial_index_ms": 1900.0,
+        }
+        baseline = {
+            "stress_min_notes_indexed": 1000,
+            "stress_min_queries": 300,
+            "mock_query_ms_p50_max": 150.0,
+            "mock_query_ms_p95_max": 200.0,
+            "mock_index_ms_max": 5000.0,
+            "mock_stress_rss_max_mb": 15.0,
+        }
+        result = release_gate.check_stress_resource_baseline(stress_report, baseline=baseline)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("max_rss_mb missing", result["stderr_tail"])
+
+    def test_stress_resource_baseline_rejects_rss_regression(self) -> None:
+        stress_report = {
+            "ok": True,
+            "notes_indexed": 1000,
+            "queries": 300,
+            "query_ms_p50": 75.0,
+            "query_ms_p95": 90.0,
+            "initial_index_ms": 1900.0,
+            "max_rss_mb": 16.0,
+        }
+        baseline = {
+            "stress_min_notes_indexed": 1000,
+            "stress_min_queries": 300,
+            "mock_query_ms_p50_max": 150.0,
+            "mock_query_ms_p95_max": 200.0,
+            "mock_index_ms_max": 5000.0,
+            "mock_stress_rss_max_mb": 15.0,
+        }
+        result = release_gate.check_stress_resource_baseline(stress_report, baseline=baseline)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("max_rss_mb", result["stderr_tail"])
+
+    def test_stress_resource_baseline_accepts_complete_report_within_limits(self) -> None:
+        stress_report = {
+            "ok": True,
+            "notes_indexed": 1000,
+            "queries": 300,
+            "query_ms_p50": 75.0,
+            "query_ms_p95": 90.0,
+            "initial_index_ms": 1900.0,
+            "max_rss_mb": 9.0,
+        }
+        baseline = {
+            "stress_min_notes_indexed": 1000,
+            "stress_min_queries": 300,
+            "mock_query_ms_p50_max": 150.0,
+            "mock_query_ms_p95_max": 200.0,
+            "mock_index_ms_max": 5000.0,
+            "mock_stress_rss_max_mb": 15.0,
+        }
+        result = release_gate.check_stress_resource_baseline(stress_report, baseline=baseline)
+        self.assertTrue(result["ok"], result)
+
 
 if __name__ == "__main__":
     unittest.main()

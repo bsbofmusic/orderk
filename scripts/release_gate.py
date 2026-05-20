@@ -8,6 +8,7 @@ same deterministic checks an agent/release operator should use before publishing
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import re
@@ -232,6 +233,100 @@ def count_orderk_processes() -> int:
     return count
 
 
+def check_stress_resource_baseline(
+    stress_report: dict[str, Any],
+    baseline: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    started = time.time()
+    baseline = baseline or load_resource_baseline(REPO)
+    details: dict[str, Any] = {
+        "schema_version": "orderk.stress_resource_gate.v1",
+        "notes_indexed": stress_report.get("notes_indexed"),
+        "queries": stress_report.get("queries"),
+        "query_ms_p50": stress_report.get("query_ms_p50"),
+        "query_ms_p95": stress_report.get("query_ms_p95"),
+        "initial_index_ms": stress_report.get("initial_index_ms"),
+        "max_rss_mb": stress_report.get("max_rss_mb"),
+    }
+    failures: list[str] = []
+
+    def required_int(field: str) -> int | None:
+        raw = stress_report.get(field)
+        if raw is None:
+            failures.append(f"{field} missing from stress report")
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            failures.append(f"{field} invalid in stress report: {raw!r}")
+            return None
+
+    def required_float(field: str) -> float | None:
+        raw = stress_report.get(field)
+        if raw is None:
+            failures.append(f"{field} missing from stress report")
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            failures.append(f"{field} invalid in stress report: {raw!r}")
+            return None
+        if not math.isfinite(value):
+            failures.append(f"{field} invalid in stress report: {raw!r}")
+            return None
+        return value
+
+    if stress_report.get("ok") is not True:
+        failures.append("stress_report ok is not true")
+
+    min_notes = int(baseline.get("stress_min_notes_indexed", 0))
+    if min_notes:
+        details["stress_min_notes_indexed"] = min_notes
+        notes_indexed = required_int("notes_indexed")
+        if notes_indexed is not None and notes_indexed < min_notes:
+            failures.append(f"notes_indexed {notes_indexed} < stress_min_notes_indexed {min_notes}")
+
+    min_queries = int(baseline.get("stress_min_queries", 0))
+    if min_queries:
+        details["stress_min_queries"] = min_queries
+        queries = required_int("queries")
+        if queries is not None and queries < min_queries:
+            failures.append(f"queries {queries} < stress_min_queries {min_queries}")
+
+    p50_max = float(baseline.get("mock_query_ms_p50_max", 0.0) or 0.0)
+    if p50_max:
+        details["mock_query_ms_p50_max"] = p50_max
+        p50 = required_float("query_ms_p50")
+        if p50 is not None and p50 > p50_max:
+            failures.append(f"query_ms_p50 {p50} > mock_query_ms_p50_max {p50_max}")
+
+    p95_max = float(baseline.get("mock_query_ms_p95_max", 0.0) or 0.0)
+    if p95_max:
+        details["mock_query_ms_p95_max"] = p95_max
+        p95 = required_float("query_ms_p95")
+        if p95 is not None and p95 > p95_max:
+            failures.append(f"query_ms_p95 {p95} > mock_query_ms_p95_max {p95_max}")
+
+    index_max = float(baseline.get("mock_index_ms_max", 0.0) or 0.0)
+    if index_max:
+        details["mock_index_ms_max"] = index_max
+        index_ms = required_float("initial_index_ms")
+        if index_ms is not None and index_ms > index_max:
+            failures.append(f"initial_index_ms {index_ms} > mock_index_ms_max {index_max}")
+
+    rss_max = float(baseline.get("mock_stress_rss_max_mb", 0.0) or 0.0)
+    if rss_max:
+        details["mock_stress_rss_max_mb"] = rss_max
+        rss_mb = required_float("max_rss_mb")
+        if rss_mb is not None and rss_mb > rss_max:
+            failures.append(f"max_rss_mb {rss_mb} > mock_stress_rss_max_mb {rss_max}")
+
+    ok = not failures
+    stdout = json.dumps(details, indent=2, sort_keys=True)
+    stderr = "" if ok else "\n".join(failures)
+    return make_result("stress_resource_baseline", ok, started, stdout, stderr)
+
+
 def check_resource_baseline(
     repo: pathlib.Path = REPO,
     baseline: dict[str, Any] | None = None,
@@ -294,6 +389,21 @@ def main() -> int:
             results.append(resource_result)
             if not resource_result["ok"]:
                 return emit_failure(resource_result, results)
+        if cmd == ["python3", "scripts/stress.py"]:
+            try:
+                stress_report = json.loads(str(result.get("stdout_tail", "{}")))
+            except json.JSONDecodeError as err:
+                stress_resource_result = make_result(
+                    "stress_resource_baseline",
+                    False,
+                    time.time(),
+                    stderr=f"stress JSON parse failed: {err}",
+                )
+            else:
+                stress_resource_result = check_stress_resource_baseline(stress_report)
+            results.append(stress_resource_result)
+            if not stress_resource_result["ok"]:
+                return emit_failure(stress_resource_result, results)
     print(json.dumps({"ok": True, "schema_version": "orderk.release_gate.v1", "results": results}, indent=2))
     return 0
 
