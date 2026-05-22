@@ -421,7 +421,7 @@ fn build_proposal(
             *weak_counts.entry(term.clone()).or_insert(0) += 1;
         }
     }
-    let weak_threshold = min_events.min(3).max(1);
+    let weak_threshold = min_events.clamp(1, 3);
     let mut stopwords_to_add = weak_counts
         .into_iter()
         .filter(|(term, count)| {
