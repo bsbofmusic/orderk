@@ -16,7 +16,7 @@
     },
     {
       "id": "user-preferences",
-      "query": "user preference config hermes agent memory routing",
+      "query": "茶老板偏好配置 偏好 配置 USER MEMORY 路由",
       "expected_paths": ["brain/identity/茶老板偏好配置.md"],
       "expected_phrases": ["偏好", "配置"]
     },
