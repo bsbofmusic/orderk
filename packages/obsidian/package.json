@@ -1,5 +1,6 @@
 {
   "name": "orderk-obsidian",
+  "private": true,
   "version": "0.1.9",
   "description": "Thin Obsidian wrapper for orderk",
   "license": "MIT",
@@ -7,9 +8,6 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bsbofmusic/orderk.git"
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "main": "main.js",
   "files": [

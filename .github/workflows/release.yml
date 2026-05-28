@@ -28,7 +28,7 @@ jobs:
       - run: npm install
       - run: npm run build --workspaces --if-present
       - run: npm test --workspaces --if-present
-      - run: npm pack --workspaces --dry-run
+      - run: npm pack --workspace orderk-cli --dry-run
 
       - name: Package Linux binary
         run: |

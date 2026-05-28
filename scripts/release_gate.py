@@ -46,7 +46,7 @@ COMMANDS = [
     ["npm", "install"],
     ["npm", "run", "build", "--workspaces", "--if-present"],
     ["npm", "test", "--workspaces", "--if-present"],
-    ["npm", "pack", "--workspaces", "--dry-run"],
+    ["npm", "pack", "--workspace", "orderk-cli", "--dry-run"],
 ]
 
 SECRET_PATTERNS = [

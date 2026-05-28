@@ -23,7 +23,7 @@ python3 scripts/eval.py
 npm install
 npm run build --workspaces --if-present
 npm test --workspaces --if-present
-npm pack --workspaces --dry-run
+npm pack --workspace orderk-cli --dry-run
 ```
 
 `python3 scripts/release_gate.py` also runs internal version-consistency, secret-scan, package-cleanliness, Supermemory absorption regressions, release/eval/feedback-growth gate unit tests, resource-baseline, and eval-quality-baseline checks. Resource thresholds live in `baselines/orderk-resource-baseline.json`; deterministic eval thresholds live in `baselines/orderk-eval-baseline.json` and use `fixtures/eval/*`.
@@ -47,8 +47,8 @@ These features return vault evidence only; they do not write notes, generate sum
 
 ## npm packages
 
-- `orderk-cli`: JavaScript wrapper for the native binary.
-- `orderk-obsidian`: Obsidian desktop plugin package.
+- `orderk-cli`: the only maintained npm package; JavaScript wrapper for the native binary.
+- `orderk-obsidian`: legacy/deprecated on npm; the Obsidian wrapper source remains in `packages/obsidian` for local/plugin builds.
 
 Runtime installs resolve a stable native binary through `ORDERK_BIN`, a package-local vendor binary, or `orderk` on `PATH`; they do not depend on Cargo `target/` build artifacts.
 The v0.1.9 npm one-click path targets Linux x64 first; other platforms can build from source and install/copy the resulting binary to a stable path.
@@ -58,6 +58,8 @@ The v0.1.9 npm one-click path targets Linux x64 first; other platforms can build
 ```bash
 npm run dist --workspace orderk-obsidian
 ```
+
+The Obsidian wrapper build is source-only for GitHub/plugin packaging. Do not publish `orderk-obsidian` to npm.
 
 Output:
 

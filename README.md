@@ -176,7 +176,7 @@ Agent
 |---|---|
 | Native CLI for local / agent use | `cargo install --path crates/orderk-cli --locked` |
 | JavaScript entrypoint + Linux x64 one-click path | `npm install -g orderk-cli` |
-| Obsidian desktop plugin | `orderk-obsidian` |
+| Obsidian desktop plugin | Source-only wrapper in `packages/obsidian`; not published as a maintained npm package |
 | Core Rust retrieval engine | `crates/orderk-core` |
 
 ## Production defaults
@@ -194,7 +194,7 @@ Set one of these environment variables before indexing or searching:
 ## Prerequisites
 
 - Rust + Cargo if you want to build from source
-- Node.js if you want the npm wrapper or Obsidian package
+- Node.js if you want the npm wrapper or local Obsidian plugin build
 - Obsidian desktop only for the plugin wrapper
 - A SiliconFlow API key for production embeddings
 - Linux x64 if you want the one-click npm binary download path
@@ -423,7 +423,7 @@ python3 scripts/release_gate.py
 npm install
 npm run build --workspaces --if-present
 npm test --workspaces --if-present
-npm pack --workspaces --dry-run
+npm pack --workspace orderk-cli --dry-run
 ```
 
 `python3 scripts/release_gate.py` is the canonical pre-publish gate. It also checks version consistency, secret/package cleanliness, release/eval/feedback-growth gate unit tests, the resource baseline in `baselines/orderk-resource-baseline.json`, and the eval quality baseline in `baselines/orderk-eval-baseline.json`.
@@ -451,8 +451,8 @@ For the full maintenance contract, see [`docs/MAINTAIN.md`](docs/MAINTAIN.md). F
 
 ## Release notes
 
-- `orderk-cli` is the Node wrapper around the native binary.
-- `orderk-obsidian` is the desktop plugin package.
+- `orderk-cli` is the only maintained npm package and is the Node wrapper around the native binary.
+- `orderk-obsidian` is legacy/deprecated on npm; the Obsidian wrapper source remains in `packages/obsidian`.
 - Linux x64 one-click install is served from GitHub Releases.
 
 ## What orderk deliberately does not do

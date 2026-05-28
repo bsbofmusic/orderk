@@ -11,6 +11,6 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "verify": "python3 scripts/release_gate.py",
-    "pack": "npm run dist --workspace orderk-obsidian"
+    "pack": "npm pack --workspace orderk-cli"
   }
 }
