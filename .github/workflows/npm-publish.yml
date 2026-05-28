@@ -46,7 +46,9 @@ jobs:
 
       - name: Read package version
         id: version
-        run: echo "version=$(node -p \"require('./packages/cli/package.json').version\")" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(node -e "const fs = require('node:fs'); process.stdout.write(JSON.parse(fs.readFileSync('packages/cli/package.json', 'utf8')).version)")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Check whether version is already published
         id: published
