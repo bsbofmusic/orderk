@@ -1,0 +1,74 @@
+name: npm-publish
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - release
+    types:
+      - completed
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-orderk-cli:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Use npm with trusted publishing support
+        run: |
+          npm install -g npm@11
+          node --version
+          npm --version
+
+      - run: npm ci
+      - run: cargo build --workspace --all-features --release
+      - run: npm run build --workspaces --if-present
+      - run: npm test --workspaces --if-present
+        env:
+          ORDERK_SKIP_BINARY_DOWNLOAD: "1"
+          ORDERK_BIN: ${{ github.workspace }}/target/release/orderk
+      - run: npm pack --workspace orderk-cli --dry-run
+
+      - name: Read package version
+        id: version
+        run: echo "version=$(node -p \"require('./packages/cli/package.json').version\")" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether version is already published
+        id: published
+        run: |
+          if npm view "orderk-cli@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "orderk-cli@${{ steps.version.outputs.version }} already exists on npm; skipping publish."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish orderk-cli
+        if: ${{ steps.published.outputs.already != 'true' }}
+        run: npm publish --workspace orderk-cli --access public
+
+      - name: Verify registry metadata
+        run: npm view "orderk-cli@${{ steps.version.outputs.version }}" name version dist-tags.latest time dist.tarball dist.shasum --json
+
+      - name: Clean install smoke
+        run: |
+          tmp="$(mktemp -d)"
+          cd "$tmp"
+          npm init -y >/dev/null
+          npm install "orderk-cli@${{ steps.version.outputs.version }}"
+          npx orderk --version
