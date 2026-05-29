@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -30,6 +32,15 @@ jobs:
       - run: npm test --workspaces --if-present
       - run: npm pack --workspace orderk-cli --dry-run
 
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+          GITHUB_REPO: ${{ github.repository }}
+
       - name: Package Linux binary
         run: |
           set -euo pipefail
@@ -42,4 +53,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/orderk-${{ github.ref_name }}-linux-x64
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md

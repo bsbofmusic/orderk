@@ -151,6 +151,38 @@ def check_version_consistency(repo: pathlib.Path = REPO) -> dict[str, object]:
         return make_result("version_consistency", False, started, stderr=f"version consistency check failed: {err}")
 
 
+def check_changelog(repo: pathlib.Path = REPO) -> dict[str, object]:
+    """Check that CHANGELOG.md exists and contains a section for the current version."""
+    started = time.time()
+    try:
+        version = read_cargo_workspace_version(repo)
+        changelog_path = repo / "CHANGELOG.md"
+        if not changelog_path.exists():
+            return make_result(
+                "changelog",
+                False,
+                started,
+                stderr=f"CHANGELOG.md not found at {changelog_path}",
+            )
+        text = changelog_path.read_text(encoding="utf-8")
+        pattern = re.compile(r"^## \[" + re.escape(version) + r"\]", re.MULTILINE)
+        if not pattern.search(text):
+            return make_result(
+                "changelog",
+                False,
+                started,
+                stderr=f"CHANGELOG.md missing section header '## [{version}]'",
+            )
+        return make_result(
+            "changelog",
+            True,
+            started,
+            stdout=f"CHANGELOG.md contains section for {version}",
+        )
+    except Exception as err:  # noqa: BLE001 - release gate should return structured failure evidence.
+        return make_result("changelog", False, started, stderr=f"changelog check failed: {err}")
+
+
 def check_secret_scan(repo: pathlib.Path = REPO, files: Iterable[pathlib.Path] | None = None) -> dict[str, object]:
     started = time.time()
     findings: list[str] = []
@@ -374,7 +406,7 @@ def main() -> int:
     if GENERATED_VENDOR_ORDERK.exists():
         GENERATED_VENDOR_ORDERK.unlink()
     results: list[dict[str, object]] = []
-    for check in (check_version_consistency, check_secret_scan, check_package_cleanliness):
+    for check in (check_version_consistency, check_changelog, check_secret_scan, check_package_cleanliness):
         result = check(REPO)
         results.append(result)
         if not result["ok"]:

@@ -1,0 +1,122 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/),
+and this project adheres to [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+### Fixed
+- Inherit embedding profile for CLI search
+
+## [0.1.10] - 2026-05-28
+
+### Fixed
+- Resolve package vendor binary from npx symlink (npm)
+
+### Changed
+- Consolidate npm package publishing
+
+### CI
+- Fix npm publish version output
+- Add npm trusted publishing workflow
+- Pin Rust toolchain and satisfy clippy
+
+### Testing
+- Stabilize live orderk health query
+
+## [0.1.9] - 2026-05-20
+
+### Added
+- Unattended Rust search optimizer
+- Manual optimizer tuning and search prompt
+- Polish optimizer tuning UX
+- Absorb retrieval workflow refinements
+- Continuous retrieval quality monitoring section to MAINTAIN.md
+- Honest benchmark battle reports
+
+### Changed
+- Harden orderk health and resource gates
+- Harden product gates — pycache cleanup, runtime baseline v2, live eval queries
+
+### Fixed
+- Pass dimensions param for Qwen3 series compatibility (embedding)
+
+### Documentation
+- Align README, docs, benchmarks, audit report with 5 retrieval workflow controls
+- Cross-project absorption audit — orderk vs 2026 retrieval landscape
+
+## [0.1.8] - 2026-05-18
+
+### Added
+- Complete temporal quality recall phases
+
+## [0.1.7] - 2026-05-18
+
+### Added
+- Eval evidence URI and explain trace
+- Compact recall get flow
+- Verifiable capsule manifests
+- Explicit retrieval depth evidence
+
+### Documentation
+- Clarify orderk value proposition
+
+## [0.1.6] - 2026-05-13
+
+### Added
+- Obsidian link expansion recall
+- Supermemory-inspired retrieval evidence
+- Metadata/frontmatter-aware rerank
+
+### Changed
+- Decouple runtime binary from build artifacts
+
+## [0.1.5] - 2026-05-12
+
+### Added
+- Structured filters and metadata
+
+## [0.1.4] - 2026-05-12
+
+### Added
+- Orderk maintenance release gate
+
+### Documentation
+- Sharpen orderk positioning
+
+## [0.1.3] - 2026-05-11
+
+### Misc
+- Release orderk 0.1.3
+
+## [0.1.2] - 2026-05-11
+
+### Fixed
+- Harden orderk release and reindex safety
+
+## [0.1.1] - 2026-05-11
+
+### Fixed
+- Make orderk npm install resolve packaged binary
+
+## [0.1.0] - 2026-05-11
+
+### Added
+- Initial orderk release
+- Ship orderk npm packages and release flow
+
+[Keep a Changelog]: https://keepachangelog.com/
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/bsbofmusic/orderk/compare/v0.1.9...v0.1.10
+[0.1.9]: https://github.com/bsbofmusic/orderk/compare/v0.1.8...v0.1.9
+[0.1.8]: https://github.com/bsbofmusic/orderk/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/bsbofmusic/orderk/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/bsbofmusic/orderk/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/bsbofmusic/orderk/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/bsbofmusic/orderk/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/bsbofmusic/orderk/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/bsbofmusic/orderk/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/bsbofmusic/orderk/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/bsbofmusic/orderk/releases/tag/v0.1.0
