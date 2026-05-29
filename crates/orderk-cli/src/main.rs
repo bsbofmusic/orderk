@@ -16,6 +16,55 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+const DEFAULT_EMBEDDING_PROVIDER: &str = "siliconflow";
+const DEFAULT_EMBEDDING_MODEL: &str = "BAAI/bge-m3";
+const DEFAULT_EMBEDDING_DIM: usize = 1024;
+const DEFAULT_VECTOR_BACKEND: &str = "sqlite_vec";
+
+#[derive(Debug, Clone)]
+struct CliEmbeddingProfile {
+    embedding_provider: String,
+    embedding_dim: usize,
+    embedding_model: String,
+    vector_backend: VectorBackend,
+}
+
+fn env_string(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    env_string(name).and_then(|value| value.parse::<usize>().ok())
+}
+
+fn existing_db_profile(db: &Path) -> Option<CliEmbeddingProfile> {
+    let resp = status(db).ok()?;
+    let embedding_provider = non_unknown(resp.embedding_provider)?;
+    let embedding_model = non_unknown(resp.embedding_model)?;
+    let vector_backend = parse_backend(&non_unknown(resp.vector_backend)?).ok()?;
+    if resp.embedding_dim == 0 {
+        return None;
+    }
+    Some(CliEmbeddingProfile {
+        embedding_provider,
+        embedding_dim: resp.embedding_dim,
+        embedding_model,
+        vector_backend,
+    })
+}
+
+fn non_unknown(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn main() {
     if let Err(err) = run() {
         let error_code = classify_error_message(&err.to_string());
@@ -55,45 +104,34 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
     match cmd.as_str() {
         "init" => {
             let db = take_path(&mut args, "--db")?;
-            let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024)?;
-            let embedding_model =
-                take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-            let vector_backend = parse_backend(&take_string(
-                &mut args,
-                "--vector-backend",
-                "sqlite_vec".to_string(),
-            )?)?;
-            let vector_backend_name = vector_backend.as_str().to_string();
-            init(&db, embedding_dim, &embedding_model, vector_backend)?;
+            let profile = resolve_embedding_profile(&mut args, Some(&db))?;
+            let vector_backend_name = profile.vector_backend.as_str().to_string();
+            init(
+                &db,
+                profile.embedding_dim,
+                &profile.embedding_model,
+                profile.vector_backend,
+            )?;
             print_json(&json!({"ok": true, "db": db, "vector_backend": vector_backend_name}))?;
         }
         "index" => {
             let vault = take_path(&mut args, "--vault")?;
             let db = take_path(&mut args, "--db")?;
-            let embedding_provider =
-                take_string(&mut args, "--embedding-provider", "siliconflow".to_string())?;
-            let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024)?;
-            let embedding_model =
-                take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-            let vector_backend = parse_backend(&take_string(
-                &mut args,
-                "--vector-backend",
-                "sqlite_vec".to_string(),
-            )?)?;
+            let profile = resolve_embedding_profile(&mut args, Some(&db))?;
             let chunk_max_chars = take_usize(&mut args, "--chunk-max-chars", 1200)?;
             let chunk_overlap_chars = take_usize(&mut args, "--chunk-overlap", 0)?;
             let provider = provider_from_name(
-                &embedding_provider,
-                embedding_dim,
-                Some(embedding_model.clone()),
+                &profile.embedding_provider,
+                profile.embedding_dim,
+                Some(profile.embedding_model.clone()),
             )?;
             let summary = index_vault_with_options(
                 &vault,
                 &db,
                 provider.as_ref(),
-                embedding_dim,
-                &embedding_model,
-                vector_backend,
+                profile.embedding_dim,
+                &profile.embedding_model,
+                profile.vector_backend,
                 &IndexOptions {
                     chunk_max_chars,
                     chunk_overlap_chars,
@@ -106,16 +144,7 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let query_text = take_required_string(&mut args, "--query")?;
             let limit = take_usize(&mut args, "--limit", 10)?;
             let view = take_string(&mut args, "--view", "full".to_string())?;
-            let embedding_provider =
-                take_string(&mut args, "--embedding-provider", "siliconflow".to_string())?;
-            let embedding_dim = take_usize(&mut args, "--embedding-dim", 1024)?;
-            let embedding_model =
-                take_string(&mut args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-            let vector_backend = parse_backend(&take_string(
-                &mut args,
-                "--vector-backend",
-                "sqlite_vec".to_string(),
-            )?)?;
+            let profile = resolve_embedding_profile(&mut args, Some(&db))?;
             let filter = take_optional_string(&mut args, "--filter")?;
             let min_score = take_optional_f32(&mut args, "--min-score")?;
             let threshold = take_optional_f32(&mut args, "--threshold")?;
@@ -136,9 +165,9 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let as_of = take_optional_string(&mut args, "--as-of")?;
             let include_stale = take_flag(&mut args, "--include-stale");
             let provider = provider_from_name(
-                &embedding_provider,
-                embedding_dim,
-                Some(embedding_model.clone()),
+                &profile.embedding_provider,
+                profile.embedding_dim,
+                Some(profile.embedding_model.clone()),
             )?;
             let resp = query_with_options(
                 &db,
@@ -160,7 +189,7 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
                     external_reranker,
                 },
                 provider.as_ref(),
-                vector_backend,
+                profile.vector_backend,
             )?;
             if json_lines {
                 print_search_json_lines(resp, &view)?;
@@ -320,29 +349,22 @@ fn capsule_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
 fn health_like_command(args: &mut Vec<String>, _doctor: bool) -> Result<serde_json::Value> {
     let db = take_path(args, "--db")?;
     let vault = take_optional_string(args, "--vault")?.map(PathBuf::from);
-    let embedding_provider = take_string(args, "--embedding-provider", "siliconflow".to_string())?;
-    let embedding_dim = take_usize(args, "--embedding-dim", 1024)?;
-    let embedding_model = take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-    let vector_backend = parse_backend(&take_string(
-        args,
-        "--vector-backend",
-        "sqlite_vec".to_string(),
-    )?)?;
+    let profile = resolve_embedding_profile(args, Some(&db))?;
     let smoke_query = take_optional_string(args, "--smoke-query")?;
     let (provider, provider_error) = resolve_provider(
-        &embedding_provider,
-        embedding_dim,
-        Some(embedding_model.clone()),
+        &profile.embedding_provider,
+        profile.embedding_dim,
+        Some(profile.embedding_model.clone()),
     );
     let report = health_report(
         &db,
         vault.as_deref(),
         provider.as_deref(),
         provider_error,
-        &embedding_provider,
-        embedding_dim,
-        &embedding_model,
-        &vector_backend,
+        &profile.embedding_provider,
+        profile.embedding_dim,
+        &profile.embedding_model,
+        &profile.vector_backend,
         smoke_query.as_deref(),
     );
     Ok(serde_json::to_value(report)?)
@@ -400,18 +422,11 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let limit = take_usize(args, "--limit", 10)?;
     let ab_chunk_overlap = take_optional_usize(args, "--ab-chunk-overlap")?;
     let ab_vault = take_optional_string(args, "--vault")?.map(PathBuf::from);
-    let embedding_provider = take_string(args, "--embedding-provider", "siliconflow".to_string())?;
-    let embedding_dim = take_usize(args, "--embedding-dim", 1024)?;
-    let embedding_model = take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-    let vector_backend = parse_backend(&take_string(
-        args,
-        "--vector-backend",
-        "sqlite_vec".to_string(),
-    )?)?;
+    let profile = resolve_embedding_profile(args, Some(&db))?;
     let provider = provider_from_name(
-        &embedding_provider,
-        embedding_dim,
-        Some(embedding_model.clone()),
+        &profile.embedding_provider,
+        profile.embedding_dim,
+        Some(profile.embedding_model.clone()),
     )?;
 
     let raw = fs::read_to_string(&queries_path)?;
@@ -454,7 +469,7 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             &case.query,
             limit,
             provider.as_ref(),
-            vector_backend.clone(),
+            profile.vector_backend.clone(),
         )?;
         let mut found_rank = None;
         let mut top_rank_hit = false;
@@ -548,10 +563,10 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         ndcg_at_k: ndcg_sum / total as f32,
         mrr,
         mean_took_ms,
-        embedding_provider: embedding_provider.clone(),
-        embedding_model: embedding_model.clone(),
-        embedding_dim,
-        vector_backend: vector_backend.as_str().to_string(),
+        embedding_provider: profile.embedding_provider.clone(),
+        embedding_model: profile.embedding_model.clone(),
+        embedding_dim: profile.embedding_dim,
+        vector_backend: profile.vector_backend.as_str().to_string(),
         outcomes,
     };
     let baseline = serde_json::to_value(response)?;
@@ -570,9 +585,9 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             vault,
             &candidate_db,
             provider.as_ref(),
-            embedding_dim,
-            &embedding_model,
-            vector_backend.clone(),
+            profile.embedding_dim,
+            &profile.embedding_model,
+            profile.vector_backend.clone(),
             &IndexOptions {
                 chunk_max_chars: 1200,
                 chunk_overlap_chars: overlap,
@@ -586,13 +601,13 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             "--limit".to_string(),
             limit.to_string(),
             "--embedding-provider".to_string(),
-            embedding_provider.clone(),
+            profile.embedding_provider.clone(),
             "--embedding-dim".to_string(),
-            embedding_dim.to_string(),
+            profile.embedding_dim.to_string(),
             "--embedding-model".to_string(),
-            embedding_model.clone(),
+            profile.embedding_model.clone(),
             "--vector-backend".to_string(),
-            vector_backend.as_str().to_string(),
+            profile.vector_backend.as_str().to_string(),
         ];
         let candidate = eval_command(&mut candidate_args)?;
         let candidate_mrr = candidate.get("mrr").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -665,18 +680,11 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let report_dir = take_optional_string(args, "--report-dir")?.map(PathBuf::from);
     let smoke_query = take_optional_string(args, "--smoke-query")?;
     let limit = take_usize(args, "--limit", 10)?;
-    let embedding_provider = take_string(args, "--embedding-provider", "siliconflow".to_string())?;
-    let embedding_dim = take_usize(args, "--embedding-dim", 1024)?;
-    let embedding_model = take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?;
-    let vector_backend = parse_backend(&take_string(
-        args,
-        "--vector-backend",
-        "sqlite_vec".to_string(),
-    )?)?;
+    let profile = resolve_embedding_profile(args, Some(&db))?;
     let (provider, provider_error) = resolve_provider(
-        &embedding_provider,
-        embedding_dim,
-        Some(embedding_model.clone()),
+        &profile.embedding_provider,
+        profile.embedding_dim,
+        Some(profile.embedding_model.clone()),
     );
 
     let health = health_report(
@@ -684,10 +692,10 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         vault.as_deref(),
         provider.as_deref(),
         provider_error,
-        &embedding_provider,
-        embedding_dim,
-        &embedding_model,
-        &vector_backend,
+        &profile.embedding_provider,
+        profile.embedding_dim,
+        &profile.embedding_model,
+        &profile.vector_backend,
         smoke_query.as_deref(),
     );
 
@@ -698,10 +706,10 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                 &db,
                 queries_path,
                 limit,
-                &embedding_provider,
-                embedding_dim,
-                &embedding_model,
-                vector_backend.clone(),
+                &profile.embedding_provider,
+                profile.embedding_dim,
+                &profile.embedding_model,
+                profile.vector_backend.clone(),
             ) {
                 Ok(value) => {
                     let zero_hit = value.get("zero_hit").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -788,11 +796,11 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         "state": state,
         "db": db.to_string_lossy(),
         "vault": vault.as_ref().map(|p| p.to_string_lossy().to_string()),
-        "embedding_provider": embedding_provider,
-        "embedding_model": embedding_model,
-        "embedding_dim": embedding_dim,
+        "embedding_provider": profile.embedding_provider.clone(),
+        "embedding_model": profile.embedding_model.clone(),
+        "embedding_dim": profile.embedding_dim,
         "limit": limit,
-        "vector_backend": vector_backend.as_str(),
+        "vector_backend": profile.vector_backend.as_str(),
         "error_codes": error_codes,
         "checks": checks,
         "health": health,
@@ -849,16 +857,14 @@ struct McpConfig {
 }
 
 fn run_mcp_server(args: &mut Vec<String>) -> Result<()> {
+    let db = take_path(args, "--db")?;
+    let profile = resolve_embedding_profile(args, Some(&db))?;
     let config = McpConfig {
-        db: take_path(args, "--db")?,
-        embedding_provider: take_string(args, "--embedding-provider", "siliconflow".to_string())?,
-        embedding_dim: take_usize(args, "--embedding-dim", 1024)?,
-        embedding_model: take_string(args, "--embedding-model", "BAAI/bge-m3".to_string())?,
-        vector_backend: parse_backend(&take_string(
-            args,
-            "--vector-backend",
-            "sqlite_vec".to_string(),
-        )?)?,
+        db,
+        embedding_provider: profile.embedding_provider,
+        embedding_dim: profile.embedding_dim,
+        embedding_model: profile.embedding_model,
+        vector_backend: profile.vector_backend,
     };
 
     let stdin = io::stdin();
@@ -1347,6 +1353,47 @@ fn take_optional_usize(args: &mut Vec<String>, name: &str) -> Result<Option<usiz
         .map_err(|_| anyhow!("{} must be a positive integer", name))
 }
 
+fn resolve_embedding_profile(
+    args: &mut Vec<String>,
+    db: Option<&Path>,
+) -> Result<CliEmbeddingProfile> {
+    let db_profile = db.and_then(existing_db_profile);
+    let embedding_provider = take_optional_string(args, "--embedding-provider")?
+        .or_else(|| env_string("ORDERK_EMBEDDING_PROVIDER"))
+        .or_else(|| {
+            db_profile
+                .as_ref()
+                .map(|profile| profile.embedding_provider.clone())
+        })
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_PROVIDER.to_string());
+    let embedding_dim = take_optional_usize(args, "--embedding-dim")?
+        .or_else(|| env_usize("ORDERK_EMBEDDING_DIM"))
+        .or_else(|| db_profile.as_ref().map(|profile| profile.embedding_dim))
+        .unwrap_or(DEFAULT_EMBEDDING_DIM);
+    let embedding_model = take_optional_string(args, "--embedding-model")?
+        .or_else(|| env_string("ORDERK_EMBEDDING_MODEL"))
+        .or_else(|| {
+            db_profile
+                .as_ref()
+                .map(|profile| profile.embedding_model.clone())
+        })
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+    let vector_backend = take_optional_string(args, "--vector-backend")?
+        .or_else(|| env_string("ORDERK_VECTOR_BACKEND"))
+        .or_else(|| {
+            db_profile
+                .as_ref()
+                .map(|profile| profile.vector_backend.as_str().to_string())
+        })
+        .unwrap_or_else(|| DEFAULT_VECTOR_BACKEND.to_string());
+    Ok(CliEmbeddingProfile {
+        embedding_provider,
+        embedding_dim,
+        embedding_model,
+        vector_backend: parse_backend(&vector_backend)?,
+    })
+}
+
 fn parse_reranker_flag(args: &mut Vec<String>) -> Result<bool> {
     if take_flag(args, "--lexical-reranker") {
         return Ok(true);
@@ -1674,6 +1721,57 @@ struct EvalResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_without_profile_flags_inherits_existing_db_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-profile-inherit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("wealth.md"),
+            "# Wealth\nCashflow assets compound when profits buy more productive assets.\n",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+
+        run_cli_args(vec![
+            "search".into(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--query".into(),
+            "cashflow compound".into(),
+            "--limit".into(),
+            "3".into(),
+            "--view".into(),
+            "index".into(),
+        ])
+        .expect("bare search should reuse provider/model/dim/backend stored in the DB profile");
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn mcp_tool_surface_is_read_only() {

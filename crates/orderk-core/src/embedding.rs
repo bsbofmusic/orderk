@@ -101,7 +101,13 @@ impl SiliconFlowM3Provider {
     ) -> Self {
         Self {
             api_key,
-            model: model.unwrap_or_else(|| "BAAI/bge-m3".to_string()),
+            model: model.unwrap_or_else(|| {
+                std::env::var("ORDERK_EMBEDDING_MODEL")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "BAAI/bge-m3".to_string())
+            }),
             dim,
             base_url: base_url
                 .unwrap_or_else(|| "https://api.siliconflow.cn/v1/embeddings".to_string()),
@@ -311,7 +317,7 @@ mod tests {
 
         let provider = SiliconFlowM3Provider::new(
             "test-key".to_string(),
-            Some("BAAI/bge-m3".to_string()),
+            Some("fixture-embedding-model".to_string()),
             3,
             Some(format!("http://{}/v1/embeddings", addr)),
         );
