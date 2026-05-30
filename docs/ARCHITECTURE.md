@@ -62,7 +62,7 @@ v1 uses lightweight score fusion and query-aware routing:
 - reciprocal-rank fusion for keyword/vector candidate overlap
 - query routing for short / path / tag queries
 - explicit retrieval depth over authored Obsidian links: `--retrieval-depth 0` returns direct keyword/vector/route candidates; `--retrieval-depth 1` adds one-hop wikilink/backlink chunks as candidates with bounded `link_boost`
-- compatibility alias `--expand-links 1` for the one-hop retrieval-depth mode
+- the legacy `expand_links` field is accepted for backwards compatibility in MCP/JSON inputs but deprecated; prefer `retrieval_depth`
 - path/tag/recency boosts
 - optional chunk overlap at indexing time: `--chunk-overlap`
 - deterministic lexical query expansion: `--query-expansion`
@@ -72,8 +72,33 @@ v1 uses lightweight score fusion and query-aware routing:
 
 Each search result also carries structured `score_breakdown`, `evidence` with `evidence_count` and per-result `retrieval_depth`, and tag metadata so agents can inspect why it surfaced. The response-level `routing.timings` reports keyword/vector/route/merge/link-expansion/enrichment stages, while `routing.retrieval_depth` states whether authored graph-depth recall was active.
 
+### Pipeline stages → score_breakdown mapping
+
+All scoring stages are additive and deterministic (no LLM, no cross-encoder, no runtime config except the bounded self-tuning optimizer which is opt-out).
+
+```
+Stage                          score_breakdown field            Configurable?
+─────                          ──────────────────────            ────────────
+1. Reciprocal-rank fusion      keyword_score, vector_score,      —
+   (RRF + BM25 + vector)       route_score
+2. Link expansion               link_score                       --retrieval-depth 1
+   (one-hop wikilink/backlink) 
+3. Temporal quality decay       temporal_quality_score           --freshness
+4. Lexical reranker             rerank_bonus                     --reranker lexical (default on)
+5. Bounded self-tuning          optimizer_adjustment             ORDERK_OPTIMIZER=off to disable;
+   (text-only penalty)                                          orderk optimize set/reset for manual
+6. Filter & truncate            min_score gate, top-N            --min-score, --limit
+7. Enrich (context chunks,      evidence_count,                  --context-chunks
+   link metadata)               retrieval_depth
+```
+
+Key invariants:
+- Stages 1-4 always run in order; stage 5 (optimizer) only applies when ORDERK_OPTIMIZER is not disabled.
+- The optimizer's `text_only_penalty` is clamped [0.65, 1.0], max 3 dynamic stopwords, auto-rollback after 3 consecutive adjustments if vector hit ratio drops 5%+.
+- Every stage writes to `score_breakdown` — no hidden score manipulation.
+
 No LLM or cross-encoder reranker is used; the only reranker path is the bounded deterministic lexical reranker.
 
 ## Feedback
 
-Feedback events are recorded but do not affect v1 ranking. This preserves a future self-evolution interface without making the first release heavy.
+DORMANT (v1): feedback_events are collected but not consumed in ranking or optimizer analysis. This is an intentional future-interface reservation, not a missing feature. The schema and `orderk feedback` command are in place for future self-tuning integration.

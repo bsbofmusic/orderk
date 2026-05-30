@@ -150,7 +150,6 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let threshold = take_optional_f32(&mut args, "--threshold")?;
             let context_chunks = take_usize(&mut args, "--context-chunks", 0)?;
             let include_links = take_flag(&mut args, "--include-links");
-            let expand_links = take_usize(&mut args, "--expand-links", 0)?;
             let retrieval_depth = take_usize(&mut args, "--retrieval-depth", 0)?;
             let explain = take_flag(&mut args, "--explain");
             let rerank = !take_flag(&mut args, "--no-rerank");
@@ -179,7 +178,7 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
                     context_chunks,
                     include_links,
                     rerank,
-                    expand_links,
+                    expand_links: retrieval_depth,
                     retrieval_depth,
                     explain,
                     freshness,
@@ -1213,7 +1212,7 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
                     "view": {"type": "string", "enum": ["full", "index"], "default": "full", "description": "Use index for compact id/title/score/path cards, then call get for selected chunk IDs"},
                     "include_links": {"type": "boolean", "default": false},
                     "retrieval_depth": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Retrieval depth over authored Obsidian wikilinks/backlinks: 0 direct only, 1 one-hop expansion; deterministic and off by default"},
-                    "expand_links": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Compatibility alias for retrieval_depth=1; expands recall one hop along indexed Obsidian wikilinks/backlinks"},
+                    "expand_links": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "DEPRECATED: compatibility alias for retrieval_depth; use retrieval_depth instead"},
                     "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, temporal validity/quality metadata, etc.)"},
                     "freshness": {"type": "string", "enum": ["off", "balanced", "recent", "oldest"], "default": "balanced", "description": "Temporal rerank mode: off disables freshness boost, recent favors newly updated valid evidence, oldest favors earliest valid evidence"},
                     "as_of": {"type": "string", "description": "Optional YYYY-MM-DD historical validity date; returns evidence valid at that date instead of only current evidence"},
@@ -1574,6 +1573,7 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                 embedding_dim,
                 Some(embedding_model.clone()),
             )?;
+            let retrieval_depth_mcp = take_usize(&mut args, "--retrieval-depth", 0)?;
             let response = query_with_options(
                 &db,
                 &query_text,
@@ -1584,8 +1584,8 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                     context_chunks: take_usize(&mut args, "--context-chunks", 0)?,
                     include_links: take_flag(&mut args, "--include-links"),
                     rerank: !take_flag(&mut args, "--no-rerank"),
-                    expand_links: take_usize(&mut args, "--expand-links", 0)?,
-                    retrieval_depth: take_usize(&mut args, "--retrieval-depth", 0)?,
+                    retrieval_depth: retrieval_depth_mcp,
+                    expand_links: retrieval_depth_mcp,
                     explain,
                     freshness,
                     as_of,
@@ -1644,7 +1644,7 @@ fn print_usage() {
         "orderk <init|index|search|get|status|health|doctor|eval|maintain|optimize|capsule|mcp|feedback> [--flags]"
     );
     eprintln!(
-        "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--expand-links 1] [--query-expansion] [--reranker lexical|none] [--json-lines] [--explain] [--no-rerank]"
+        "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--query-expansion] [--reranker lexical|none] [--json-lines] [--explain] [--no-rerank]"
     );
     eprintln!("index flags: --vault <path> --db <orderk.sqlite> [--chunk-max-chars <n>] [--chunk-overlap <n>]");
     eprintln!("eval flags: --db <orderk.sqlite> --queries <queries.json> [--ab-chunk-overlap <n>] [--vault <path>]");

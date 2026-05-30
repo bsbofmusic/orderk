@@ -529,6 +529,12 @@ impl IndexStore {
         })
     }
 
+    /// Store and aggregate human feedback on search results.
+    ///
+    /// DORMANT (v1): feedback_events are collected but not yet consumed in ranking
+    /// or optimizer analysis. This is an intentional future-interface reservation, not
+    /// a missing feature. When feedback is wired into the optimizer's self-tuning
+    /// loop (planned), the dormant marker will be removed.
     pub fn feedback(conn: &Connection, event: &FeedbackEvent) -> Result<FeedbackResponse> {
         let id = conn.execute(
             "INSERT INTO feedback_events(event, query_id, chunk_id, query, payload, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
