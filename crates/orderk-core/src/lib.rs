@@ -16,7 +16,10 @@ pub use api::{
     provider_from_name, query, query_with_filter, query_with_options, status,
 };
 pub use capsule::{export_capsule_manifest, inspect_capsule_manifest, write_capsule_manifest};
-pub use embedding::{EmbeddingProvider, MockEmbeddingProvider, SiliconFlowM3Provider};
+pub use embedding::{
+    EmbeddingProvider, MockEmbeddingProvider, OpenAiCompatibleEmbeddingConfig,
+    OpenAiCompatibleEmbeddingProvider, SiliconFlowM3Provider,
+};
 pub use health::{classify_error_message, health_report};
 pub use models::*;
 

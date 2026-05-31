@@ -1,4 +1,7 @@
-use crate::embedding::{EmbeddingProvider, MockEmbeddingProvider, SiliconFlowM3Provider};
+use crate::embedding::{
+    EmbeddingProvider, MockEmbeddingProvider, OpenAiCompatibleEmbeddingConfig,
+    OpenAiCompatibleEmbeddingProvider, SiliconFlowM3Provider,
+};
 use crate::index::{open_db, IndexStore};
 use crate::models::*;
 use crate::optimizer;
@@ -159,10 +162,9 @@ pub fn feedback(db_path: &Path, event: &FeedbackEvent) -> Result<FeedbackRespons
 }
 
 pub fn provider_from_env(dim: usize, model: Option<String>) -> Result<Box<dyn EmbeddingProvider>> {
-    let key = std::env::var("HERMES_SILICONFLOW_API_KEY")
-        .or_else(|_| std::env::var("SILICONFLOW_API_KEY"))
-        .map_err(|_| anyhow::anyhow!("SiliconFlow API key is missing"))?;
-    Ok(Box::new(SiliconFlowM3Provider::new(key, model, dim, None)))
+    let name = env_string("ORDERK_EMBEDDING_PROVIDER").unwrap_or_else(|| "siliconflow".to_string());
+    let model = model.or_else(|| env_string("ORDERK_EMBEDDING_MODEL"));
+    provider_from_name(&name, dim, model)
 }
 
 pub fn provider_from_name(
@@ -170,16 +172,76 @@ pub fn provider_from_name(
     dim: usize,
     model: Option<String>,
 ) -> Result<Box<dyn EmbeddingProvider>> {
-    match name {
+    let normalized = name.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "mock" => Ok(Box::new(MockEmbeddingProvider::new(dim))),
         "siliconflow" => {
-            let key = std::env::var("HERMES_SILICONFLOW_API_KEY")
-                .or_else(|_| std::env::var("SILICONFLOW_API_KEY"))
-                .map_err(|_| anyhow::anyhow!("SiliconFlow API key is missing"))?;
-            Ok(Box::new(SiliconFlowM3Provider::new(key, model, dim, None)))
+            let key = required_env("ORDERK_SILICONFLOW_API_KEY", "SiliconFlow")?;
+            Ok(Box::new(SiliconFlowM3Provider::new(
+                key,
+                model,
+                dim,
+                env_string("ORDERK_SILICONFLOW_BASE_URL"),
+            )))
         }
+        "openai" => Ok(Box::new(OpenAiCompatibleEmbeddingProvider::new(
+            OpenAiCompatibleEmbeddingConfig {
+                provider_id: "openai".to_string(),
+                label: "OpenAI".to_string(),
+                api_key: required_env_any(
+                    &["ORDERK_OPENAI_API_KEY", "ORDERK_EMBEDDING_API_KEY"],
+                    "OpenAI",
+                )?,
+                key_hint: "ORDERK_OPENAI_API_KEY or ORDERK_EMBEDDING_API_KEY".to_string(),
+                model,
+                default_model: "text-embedding-3-small".to_string(),
+                dim,
+                base_url: env_string("ORDERK_OPENAI_BASE_URL"),
+                default_base_url: "https://api.openai.com/v1/embeddings".to_string(),
+            },
+        ))),
+        "openai-compatible" | "generic" => Ok(Box::new(OpenAiCompatibleEmbeddingProvider::new(
+            OpenAiCompatibleEmbeddingConfig {
+                provider_id: normalized.clone(),
+                label: "OpenAI-compatible".to_string(),
+                api_key: required_env("ORDERK_EMBEDDING_API_KEY", "OpenAI-compatible")?,
+                key_hint: "ORDERK_EMBEDDING_API_KEY".to_string(),
+                model,
+                default_model: "text-embedding-3-small".to_string(),
+                dim,
+                base_url: Some(required_env(
+                    "ORDERK_EMBEDDING_BASE_URL",
+                    "OpenAI-compatible embedding base URL",
+                )?),
+                default_base_url: String::new(),
+            },
+        ))),
         other => Err(anyhow::anyhow!("unknown embedding provider: {}", other)),
     }
+}
+
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn required_env(name: &str, label: &str) -> Result<String> {
+    env_string(name)
+        .ok_or_else(|| anyhow::anyhow!("{label} embedding API key is missing; set {name}"))
+}
+
+fn required_env_any(names: &[&str], label: &str) -> Result<String> {
+    for name in names {
+        if let Some(value) = env_string(name) {
+            return Ok(value);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "{label} embedding API key is missing; set {}",
+        names.join(" or ")
+    ))
 }
 
 fn open_existing(db_path: &Path) -> Result<Connection> {
@@ -195,4 +257,100 @@ fn open_writable_existing(db_path: &Path) -> Result<Connection> {
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
     crate::index::migrate_chunk_metadata_columns(&conn)?;
     Ok(conn)
+}
+
+#[cfg(test)]
+mod provider_resolution_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    const PROVIDER_ENV_NAMES: &[&str] = &[
+        "ORDERK_EMBEDDING_PROVIDER",
+        "ORDERK_EMBEDDING_API_KEY",
+        "ORDERK_EMBEDDING_BASE_URL",
+        "ORDERK_SILICONFLOW_API_KEY",
+        "ORDERK_SILICONFLOW_BASE_URL",
+        "ORDERK_OPENAI_API_KEY",
+        "ORDERK_OPENAI_BASE_URL",
+        "HERMES_SILICONFLOW_API_KEY",
+        "HERMES_SF_API_KEY",
+        "HERMES_ORDERK_SILICONFLOW_API_KEY",
+        "SILICONFLOW_API_KEY",
+    ];
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn with_clean_provider_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = env_lock();
+        let saved = PROVIDER_ENV_NAMES
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in PROVIDER_ENV_NAMES {
+            std::env::remove_var(name);
+        }
+        let result = f();
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn provider_from_env_honors_orderk_embedding_provider_without_key() {
+        with_clean_provider_env(|| {
+            std::env::set_var("ORDERK_EMBEDDING_PROVIDER", "mock");
+            let provider = provider_from_env(7, None).expect("mock provider should not need a key");
+            assert_eq!(provider.provider_id(), "mock");
+            assert_eq!(provider.dimension(), 7);
+        });
+    }
+
+    #[test]
+    fn siliconflow_provider_rejects_hermes_and_bare_siliconflow_keys() {
+        with_clean_provider_env(|| {
+            std::env::set_var("HERMES_SILICONFLOW_API_KEY", "hermes-chat-key");
+            std::env::set_var("HERMES_SF_API_KEY", "hermes-provider-key");
+            std::env::set_var("SILICONFLOW_API_KEY", "ambiguous-legacy-key");
+            let err = match provider_from_name("siliconflow", 3, Some("fixture-model".to_string()))
+            {
+                Ok(_) => {
+                    panic!("siliconflow provider must not accept Hermes or ambiguous legacy keys")
+                }
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains("ORDERK_SILICONFLOW_API_KEY"), "{err}");
+            assert!(!err.contains("HERMES"), "{err}");
+            assert!(!err.contains("SILICONFLOW_API_KEY or"), "{err}");
+        });
+    }
+
+    #[test]
+    fn openai_compatible_provider_uses_orderk_scoped_generic_key_and_base_url() {
+        with_clean_provider_env(|| {
+            std::env::set_var("ORDERK_EMBEDDING_API_KEY", "orderk-generic-key");
+            std::env::set_var(
+                "ORDERK_EMBEDDING_BASE_URL",
+                "http://127.0.0.1:1/v1/embeddings",
+            );
+            let provider = provider_from_name(
+                "openai-compatible",
+                5,
+                Some("fixture-online-model".to_string()),
+            )
+            .expect("openai-compatible provider should use orderk-scoped key/base_url");
+            assert_eq!(provider.provider_id(), "openai-compatible");
+            assert_eq!(provider.model_id(), "fixture-online-model");
+            assert_eq!(provider.dimension(), 5);
+        });
+    }
 }

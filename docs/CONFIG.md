@@ -123,9 +123,9 @@ Eval query file schema:
 ## Providers
 
 - `mock`: deterministic offline provider for testing.
-- `siliconflow`: cloud provider path. Reads API key from `HERMES_SILICONFLOW_API_KEY` or `SILICONFLOW_API_KEY`.
+- `siliconflow`: cloud provider path. Reads API key from `ORDERK_SILICONFLOW_API_KEY`.
 
-Production default: `siliconflow` + `BAAI/bge-m3` + `1024`.
+Production default: `siliconflow` + `BAAI/bge-m3` + `1024`. OpenAI-compatible providers use `ORDERK_OPENAI_API_KEY` / `ORDERK_EMBEDDING_API_KEY` plus optional `ORDERK_*_BASE_URL`.
 Use `mock` only for tests or offline smoke runs.
 
 Recommended SiliconFlow model for production: `BAAI/bge-m3` with dimension `1024`.

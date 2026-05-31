@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-05-31
+
+### Added
+- Add OpenAI-compatible embedding provider plumbing for `openai`, `openai-compatible`, and `generic` providers.
+
 ### Fixed
-- Inherit embedding profile for CLI search
+- Keep orderk embedding credentials scoped to `ORDERK_*` variables and reject Hermes/SF or bare legacy SiliconFlow keys.
+- Inherit embedding profile for CLI search.
+
+### Changed
+- Export the reusable `OpenAiCompatibleEmbeddingProvider` and config from `orderk-core`.
 
 ## [0.1.10] - 2026-05-28
 
@@ -108,7 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/bsbofmusic/orderk/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/bsbofmusic/orderk/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/bsbofmusic/orderk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/bsbofmusic/orderk/compare/v0.1.7...v0.1.8

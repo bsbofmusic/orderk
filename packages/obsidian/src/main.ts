@@ -95,7 +95,7 @@ class OrderkSettingTab extends PluginSettingTab {
       }));
     new Setting(containerEl)
       .setName("Embedding model")
-      .setDesc("Production default: BAAI/bge-m3. API key must be available to Obsidian through HERMES_SILICONFLOW_API_KEY or SILICONFLOW_API_KEY.")
+      .setDesc("Production default: BAAI/bge-m3. API key must be available to Obsidian through ORDERK_SILICONFLOW_API_KEY.")
       .addText((text) => text.setValue(this.plugin.settings.embeddingModel ?? "BAAI/bge-m3").onChange(async (value) => {
         this.plugin.settings.embeddingModel = value || "BAAI/bge-m3";
         await this.plugin.saveSettings();

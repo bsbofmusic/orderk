@@ -188,8 +188,8 @@ Agent
 
 Set one of these environment variables before indexing or searching:
 
-- `HERMES_SILICONFLOW_API_KEY`
-- `SILICONFLOW_API_KEY`
+- `ORDERK_SILICONFLOW_API_KEY` for SiliconFlow
+- `ORDERK_OPENAI_API_KEY` or `ORDERK_EMBEDDING_API_KEY` for OpenAI-compatible providers
 
 ## Prerequisites
 
@@ -212,9 +212,7 @@ npm install -g orderk-cli
 ### 2) Export your embedding key
 
 ```bash
-export HERMES_SILICONFLOW_API_KEY="..."
-# or
-export SILICONFLOW_API_KEY="..."
+export ORDERK_SILICONFLOW_API_KEY="..."
 ```
 
 ### 3) Index a vault
@@ -434,7 +432,7 @@ For the full maintenance contract, see [`docs/MAINTAIN.md`](docs/MAINTAIN.md). F
 
 | Symptom | Likely fix |
 |---|---|
-| `SiliconFlow API key is missing` | Export `HERMES_SILICONFLOW_API_KEY` or `SILICONFLOW_API_KEY` |
+| `SiliconFlow embedding API key is missing; set ORDERK_SILICONFLOW_API_KEY` | Export `ORDERK_SILICONFLOW_API_KEY` |
 | `orderk CLI not found` | Install the native binary or set `ORDERK_BIN` |
 | Search returns no vector hits | Re-index with matching provider / model / dim |
 | `index profile mismatch` | Rebuild the SQLite DB with the same embedding provider, model, dimension, and backend |

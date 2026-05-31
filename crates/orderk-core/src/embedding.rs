@@ -70,17 +70,39 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 }
 
 #[derive(Debug, Clone)]
-pub struct SiliconFlowM3Provider {
+pub struct OpenAiCompatibleEmbeddingProvider {
+    provider_id: String,
+    label: String,
     api_key: String,
+    key_hint: String,
     model: String,
     dim: usize,
     base_url: String,
+    max_batch_inputs: usize,
 }
 
-const SILICONFLOW_CONNECT_TIMEOUT_SECS: u64 = 10;
-const SILICONFLOW_REQUEST_TIMEOUT_SECS: u64 = 60;
-const SILICONFLOW_MAX_ATTEMPTS: usize = 3;
-const SILICONFLOW_MAX_BATCH_INPUTS: usize = 64;
+#[derive(Debug, Clone)]
+pub struct OpenAiCompatibleEmbeddingConfig {
+    pub provider_id: String,
+    pub label: String,
+    pub api_key: String,
+    pub key_hint: String,
+    pub model: Option<String>,
+    pub default_model: String,
+    pub dim: usize,
+    pub base_url: Option<String>,
+    pub default_base_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SiliconFlowM3Provider {
+    inner: OpenAiCompatibleEmbeddingProvider,
+}
+
+const ONLINE_EMBEDDING_CONNECT_TIMEOUT_SECS: u64 = 10;
+const ONLINE_EMBEDDING_REQUEST_TIMEOUT_SECS: u64 = 60;
+const ONLINE_EMBEDDING_MAX_ATTEMPTS: usize = 3;
+const ONLINE_EMBEDDING_MAX_BATCH_INPUTS: usize = 64;
 
 #[derive(Debug, Deserialize)]
 struct SiliconFlowEmbeddingsResponse {
@@ -92,32 +114,32 @@ struct SiliconFlowEmbeddingRow {
     embedding: Vec<f32>,
 }
 
-impl SiliconFlowM3Provider {
-    pub fn new(
-        api_key: String,
-        model: Option<String>,
-        dim: usize,
-        base_url: Option<String>,
-    ) -> Self {
+impl OpenAiCompatibleEmbeddingProvider {
+    pub fn new(config: OpenAiCompatibleEmbeddingConfig) -> Self {
         Self {
-            api_key,
-            model: model.unwrap_or_else(|| {
-                std::env::var("ORDERK_EMBEDDING_MODEL")
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "BAAI/bge-m3".to_string())
-            }),
-            dim,
-            base_url: base_url
-                .unwrap_or_else(|| "https://api.siliconflow.cn/v1/embeddings".to_string()),
+            provider_id: config.provider_id,
+            label: config.label,
+            api_key: config.api_key,
+            key_hint: config.key_hint,
+            model: config
+                .model
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or(config.default_model),
+            dim: config.dim,
+            base_url: config
+                .base_url
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or(config.default_base_url),
+            max_batch_inputs: ONLINE_EMBEDDING_MAX_BATCH_INPUTS,
         }
     }
 
     fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(SILICONFLOW_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(SILICONFLOW_REQUEST_TIMEOUT_SECS))
+            .timeout_connect(Duration::from_secs(ONLINE_EMBEDDING_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(ONLINE_EMBEDDING_REQUEST_TIMEOUT_SECS))
             .build();
         let auth = format!("Bearer {}", self.api_key);
         let body =
@@ -125,7 +147,7 @@ impl SiliconFlowM3Provider {
                 .to_string();
 
         let mut last_error = String::new();
-        for attempt in 1..=SILICONFLOW_MAX_ATTEMPTS {
+        for attempt in 1..=ONLINE_EMBEDDING_MAX_ATTEMPTS {
             match agent
                 .post(&self.base_url)
                 .set("Content-Type", "application/json")
@@ -135,10 +157,10 @@ impl SiliconFlowM3Provider {
                 Ok(response) => {
                     let response_body = response
                         .into_string()
-                        .context("read SiliconFlow embedding response")?;
+                        .with_context(|| format!("read {} embedding response", self.label))?;
                     let parsed: SiliconFlowEmbeddingsResponse =
                         serde_json::from_str(&response_body)
-                            .context("parse SiliconFlow embedding response")?;
+                            .with_context(|| format!("parse {} embedding response", self.label))?;
                     let mut rows = Vec::with_capacity(parsed.data.len());
                     for row in parsed.data {
                         if row.embedding.len() != self.dim {
@@ -164,23 +186,28 @@ impl SiliconFlowM3Provider {
                 Err(ureq::Error::Status(code, response)) => {
                     let body = response.into_string().unwrap_or_default();
                     let message = format!("HTTP {}: {}", code, summarize_error_body(&body));
-                    if should_retry_http_status(code) && attempt < SILICONFLOW_MAX_ATTEMPTS {
-                        last_error = message;
-                        thread::sleep(Duration::from_millis(retry_backoff_ms(attempt)));
-                        continue;
-                    }
-                    return Err(anyhow!("SiliconFlow embedding request failed: {}", message));
-                }
-                Err(ureq::Error::Transport(err)) => {
-                    let message = err.to_string();
-                    if attempt < SILICONFLOW_MAX_ATTEMPTS {
+                    if should_retry_http_status(code) && attempt < ONLINE_EMBEDDING_MAX_ATTEMPTS {
                         last_error = message;
                         thread::sleep(Duration::from_millis(retry_backoff_ms(attempt)));
                         continue;
                     }
                     return Err(anyhow!(
-                        "SiliconFlow embedding request failed after {} attempts: {}",
-                        SILICONFLOW_MAX_ATTEMPTS,
+                        "{} embedding request failed: {}",
+                        self.label,
+                        message
+                    ));
+                }
+                Err(ureq::Error::Transport(err)) => {
+                    let message = err.to_string();
+                    if attempt < ONLINE_EMBEDDING_MAX_ATTEMPTS {
+                        last_error = message;
+                        thread::sleep(Duration::from_millis(retry_backoff_ms(attempt)));
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "{} embedding request failed after {} attempts: {}",
+                        self.label,
+                        ONLINE_EMBEDDING_MAX_ATTEMPTS,
                         message
                     ));
                 }
@@ -188,8 +215,9 @@ impl SiliconFlowM3Provider {
         }
 
         Err(anyhow!(
-            "SiliconFlow embedding request failed after {} attempts: {}",
-            SILICONFLOW_MAX_ATTEMPTS,
+            "{} embedding request failed after {} attempts: {}",
+            self.label,
+            ONLINE_EMBEDDING_MAX_ATTEMPTS,
             if last_error.is_empty() {
                 "unknown error"
             } else {
@@ -199,9 +227,9 @@ impl SiliconFlowM3Provider {
     }
 }
 
-impl EmbeddingProvider for SiliconFlowM3Provider {
+impl EmbeddingProvider for OpenAiCompatibleEmbeddingProvider {
     fn provider_id(&self) -> &str {
-        "siliconflow"
+        &self.provider_id
     }
     fn model_id(&self) -> &str {
         &self.model
@@ -211,7 +239,14 @@ impl EmbeddingProvider for SiliconFlowM3Provider {
     }
     fn health(&self) -> Result<()> {
         if self.api_key.trim().is_empty() {
-            return Err(anyhow!("SiliconFlow API key is missing; set HERMES_SILICONFLOW_API_KEY or SILICONFLOW_API_KEY"));
+            return Err(anyhow!(
+                "{} embedding API key is missing; set {}",
+                self.label,
+                self.key_hint
+            ));
+        }
+        if self.base_url.trim().is_empty() {
+            return Err(anyhow!("{} embedding base URL is missing", self.label));
         }
         Ok(())
     }
@@ -223,7 +258,7 @@ impl EmbeddingProvider for SiliconFlowM3Provider {
         }
 
         let mut rows = Vec::with_capacity(inputs.len());
-        for batch in inputs.chunks(SILICONFLOW_MAX_BATCH_INPUTS) {
+        for batch in inputs.chunks(self.max_batch_inputs.max(1)) {
             let mut batch_rows = self.embed_batch(batch)?;
             rows.append(&mut batch_rows);
         }
@@ -235,6 +270,47 @@ impl EmbeddingProvider for SiliconFlowM3Provider {
             ));
         }
         Ok(rows)
+    }
+}
+
+impl SiliconFlowM3Provider {
+    pub fn new(
+        api_key: String,
+        model: Option<String>,
+        dim: usize,
+        base_url: Option<String>,
+    ) -> Self {
+        Self {
+            inner: OpenAiCompatibleEmbeddingProvider::new(OpenAiCompatibleEmbeddingConfig {
+                provider_id: "siliconflow".to_string(),
+                label: "SiliconFlow".to_string(),
+                api_key,
+                key_hint: "ORDERK_SILICONFLOW_API_KEY".to_string(),
+                model,
+                default_model: "BAAI/bge-m3".to_string(),
+                dim,
+                base_url,
+                default_base_url: "https://api.siliconflow.cn/v1/embeddings".to_string(),
+            }),
+        }
+    }
+}
+
+impl EmbeddingProvider for SiliconFlowM3Provider {
+    fn provider_id(&self) -> &str {
+        self.inner.provider_id()
+    }
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn health(&self) -> Result<()> {
+        self.inner.health()
+    }
+    fn embed_documents(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.inner.embed_documents(inputs)
     }
 }
 

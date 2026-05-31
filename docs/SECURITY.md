@@ -8,8 +8,9 @@
 
 ## Provider key names
 
-- `HERMES_SILICONFLOW_API_KEY`
-- `SILICONFLOW_API_KEY`
+- `ORDERK_SILICONFLOW_API_KEY` for orderk SiliconFlow embeddings
+- `ORDERK_OPENAI_API_KEY` / `ORDERK_EMBEDDING_API_KEY` for OpenAI-compatible orderk embeddings
+- Hermes/SF provider keys such as `HERMES_SF_API_KEY` and `HERMES_SILICONFLOW_API_KEY` belong to Hermes chat/provider routing, not orderk production paths
 
 ## Plugin boundary
 

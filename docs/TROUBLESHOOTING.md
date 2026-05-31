@@ -14,7 +14,7 @@ orderk is a scanner with a fault ticket printer:
 
 | Symptom | Likely cause | Fix | Verification |
 |---|---|---|---|
-| `SiliconFlow API key is missing` | Production provider has no key | Export `HERMES_SILICONFLOW_API_KEY` or `SILICONFLOW_API_KEY` | `orderk health ... --embedding-provider siliconflow` |
+| `SiliconFlow embedding API key is missing; set ORDERK_SILICONFLOW_API_KEY` | Production provider has no orderk-scoped key | Export `ORDERK_SILICONFLOW_API_KEY` | `orderk health ... --embedding-provider siliconflow` |
 | `E_PROFILE_MISMATCH` | DB was built with a different provider/model/dim/backend | Use matching flags or rebuild the DB | `orderk status --db ...` then `orderk maintain ...` |
 | `E_NO_EMBEDDINGS` / `needs_index` | DB exists but has no vectors yet | Run `orderk index` with the intended profile | `orderk status --db ...` |
 | Search works by keyword but vector quality looks wrong | Wrong profile, stale index, or vector backend unavailable | Rebuild and run eval | `orderk eval --queries ...` |
