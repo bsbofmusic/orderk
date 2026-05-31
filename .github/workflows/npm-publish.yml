@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -80,5 +82,6 @@ jobs:
           tmp="$(mktemp -d)"
           cd "$tmp"
           npm init -y >/dev/null
+          npm pkg set allowScripts.orderk-cli=true --json
           npm install "orderk-cli@${{ steps.version.outputs.version }}"
-          npx orderk --version
+          test "$(npx orderk --version)" = "${{ steps.version.outputs.version }}"

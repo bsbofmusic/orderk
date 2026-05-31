@@ -21,6 +21,19 @@ class ReleaseGateStaticChecksTest(unittest.TestCase):
         self.assertIn("--all-targets", clippy_commands[0])
         self.assertIn("--all-features", clippy_commands[0])
 
+    def test_npm_publish_workflow_checks_out_trigger_sha_for_workflow_run(self) -> None:
+        workflow = RELEASE_GATE_MODULE_PATH.parents[1] / ".github" / "workflows" / "npm-publish.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("github.event.workflow_run.head_sha", text)
+        self.assertIn("github.ref", text)
+
+    def test_npm_publish_clean_install_smoke_allows_orderk_postinstall_and_checks_exact_version(self) -> None:
+        workflow = RELEASE_GATE_MODULE_PATH.parents[1] / ".github" / "workflows" / "npm-publish.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("npm pkg set allowScripts.orderk-cli=true --json", text)
+        self.assertIn('npm install "orderk-cli@${{ steps.version.outputs.version }}"', text)
+        self.assertIn('test "$(npx orderk --version)" = "${{ steps.version.outputs.version }}"', text)
+
     def make_repo(self) -> pathlib.Path:
         root = pathlib.Path(tempfile.mkdtemp(prefix="orderk-release-gate-test-"))
         (root / "crates" / "orderk-cli").mkdir(parents=True)
