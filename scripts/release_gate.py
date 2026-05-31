@@ -36,7 +36,7 @@ COMMANDS = [
     ["cargo", "test", "-p", "orderk-core", "--all-features", "query_options_"],
     ["cargo", "test", "-p", "orderk-cli", "--all-features", "mcp_"],
     ["cargo", "fmt", "--all", "--", "--check"],
-    ["cargo", "clippy", "--workspace", "--all-features", "--", "-D", "warnings"],
+    ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
     ["cargo", "test", "--workspace", "--all-features"],
     ["cargo", "build", "--workspace", "--all-features", "--release"],
     ["python3", "scripts/contract.py"],

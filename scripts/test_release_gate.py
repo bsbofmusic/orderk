@@ -15,6 +15,12 @@ spec.loader.exec_module(release_gate)
 
 
 class ReleaseGateStaticChecksTest(unittest.TestCase):
+    def test_clippy_gate_covers_all_targets(self) -> None:
+        clippy_commands = [cmd for cmd in release_gate.COMMANDS if len(cmd) > 1 and cmd[0] == "cargo" and cmd[1] == "clippy"]
+        self.assertEqual(len(clippy_commands), 1)
+        self.assertIn("--all-targets", clippy_commands[0])
+        self.assertIn("--all-features", clippy_commands[0])
+
     def make_repo(self) -> pathlib.Path:
         root = pathlib.Path(tempfile.mkdtemp(prefix="orderk-release-gate-test-"))
         (root / "crates" / "orderk-cli").mkdir(parents=True)

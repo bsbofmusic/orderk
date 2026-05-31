@@ -104,6 +104,20 @@ class EvalQualityGateTest(unittest.TestCase):
                 ],
             )
 
+    def test_default_eval_queries_are_mvp_sized_and_fixture_backed(self) -> None:
+        queries = orderk_eval.load_json(orderk_eval.DEFAULT_QUERIES)
+        baseline = orderk_eval.load_json(orderk_eval.DEFAULT_BASELINE)
+        cases = queries.get("queries")
+        self.assertIsInstance(cases, list)
+        self.assertGreaterEqual(len(cases), 10)
+        case_ids = {case["id"] for case in cases}
+        self.assertEqual(set(baseline.get("required_case_ids", [])), case_ids)
+        for case in cases:
+            self.assertTrue(case.get("expected_paths"), case)
+            self.assertTrue(case.get("expected_phrases"), case)
+            for rel_path in case["expected_paths"]:
+                self.assertTrue((orderk_eval.DEFAULT_FIXTURE_VAULT / rel_path).is_file(), rel_path)
+
 
 if __name__ == "__main__":
     unittest.main()

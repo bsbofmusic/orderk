@@ -1,19 +1,24 @@
 {
   "schema_version": "orderk.eval_baseline.v1",
-  "description": "Deterministic offline retrieval-quality baseline for scripts/eval.py using fixtures/eval and the mock embedding provider. It keeps eval queries as a checked-in regression gate, not an ad hoc generated smoke.",
-  "min_queries": 4,
+  "min_queries": 10,
   "max_zero_hit": 0,
-  "min_hits_at_k": 4,
-  "min_top1_hits": 4,
+  "min_hits_at_k": 10,
+  "min_top1_hits": 10,
   "min_recall_at_k": 1.0,
   "min_ndcg_at_k": 1.0,
   "min_mrr": 1.0,
   "max_mean_took_ms": 1000.0,
   "required_case_ids": [
-    "alpha",
-    "bravo",
+    "alpha-vector",
+    "bravo-npm-workspace",
     "quality-gates",
-    "release-resources"
+    "release-resources",
+    "graph-depth",
+    "provider-surface",
+    "query-py-smoke",
+    "freshness-policy",
+    "vector-degradation",
+    "oral-query"
   ],
   "case_thresholds": {
     "require_hit": true,
