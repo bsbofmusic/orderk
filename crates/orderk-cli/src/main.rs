@@ -1,12 +1,15 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use orderk_core::{
-    classify_error_message, default_sword_llm_model, default_sword_llm_provider,
-    export_capsule_manifest, feedback, get_chunks, health_report, index_vault_with_options, init,
-    inspect_capsule_manifest, optimize_apply, optimize_dry_run, optimize_reset, optimize_set,
-    optimize_status, provider_from_name, query, query_with_options, run_sword_spirit, status,
-    sword_spirit_status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions,
-    EmbeddingProvider, FeedbackEvent, FreshnessMode, IndexOptions, QueryOptions, QueryResponse,
-    SearchIndexResponse, SwordSpiritOptions, VectorBackend,
+    classify_error_message, default_sword_embedding_dim, default_sword_embedding_model,
+    default_sword_embedding_provider, default_sword_llm_model, default_sword_llm_provider,
+    default_sword_reranker_model, default_sword_reranker_provider, export_capsule_manifest,
+    feedback, get_chunks, health_report, index_vault_with_options, init, inspect_capsule_manifest,
+    optimize_apply, optimize_dry_run, optimize_reset, optimize_set, optimize_status,
+    provider_from_name, query, query_with_options, run_sword_spirit, status, sword_spirit_status,
+    write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider, FeedbackEvent,
+    FreshnessMode, IndexOptions, QueryOptions, QueryResponse, SearchIndexResponse,
+    SwordSpiritBudgetProfile, SwordSpiritOptions, SwordSpiritProposal, SwordSpiritThinkingMode,
+    SwordSpiritTraceLevel, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -319,12 +322,36 @@ fn sword_spirit_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             let vault = take_path(args, "--vault")?;
             let max_files = take_usize(args, "--max-files", 200)?;
             let max_proposals = take_usize(args, "--max-proposals", 100)?;
+            let thinking_mode = SwordSpiritThinkingMode::parse(&take_string(
+                args,
+                "--thinking",
+                "heuristic".to_string(),
+            )?)?;
             let llm_provider = take_optional_string(args, "--llm-provider")?
                 .or(take_optional_string(args, "--model-provider")?)
                 .unwrap_or_else(default_sword_llm_provider);
             let llm_model = take_optional_string(args, "--llm-model")?
                 .or(take_optional_string(args, "--model")?)
                 .unwrap_or_else(default_sword_llm_model);
+            let reranker_provider = take_optional_string(args, "--reranker-provider")?
+                .unwrap_or_else(default_sword_reranker_provider);
+            let reranker_model = take_optional_string(args, "--reranker-model")?
+                .unwrap_or_else(default_sword_reranker_model);
+            let embedding_provider = take_optional_string(args, "--embedding-provider")?
+                .unwrap_or_else(default_sword_embedding_provider);
+            let embedding_model = take_optional_string(args, "--embedding-model")?
+                .unwrap_or_else(default_sword_embedding_model);
+            let embedding_dim = take_usize(args, "--embedding-dim", default_sword_embedding_dim())?;
+            let budget_profile = SwordSpiritBudgetProfile::parse(&take_string(
+                args,
+                "--budget-profile",
+                "digest_standard".to_string(),
+            )?)?;
+            let trace_level = SwordSpiritTraceLevel::parse(&take_string(
+                args,
+                "--trace",
+                "compact".to_string(),
+            )?)?;
             if !args.is_empty() {
                 return Err(anyhow!(
                     "unexpected sword run arguments: {}",
@@ -338,9 +365,18 @@ fn sword_spirit_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                     max_proposals,
                     llm_provider,
                     llm_model,
+                    thinking_mode,
+                    reranker_provider,
+                    reranker_model,
+                    embedding_provider,
+                    embedding_model,
+                    embedding_dim,
+                    budget_profile,
+                    trace_level,
                 },
             )?)?)
         }
+        "search" => sword_search_command(args),
         "status" => {
             let vault = take_path(args, "--vault")?;
             if !args.is_empty() {
@@ -353,6 +389,295 @@ fn sword_spirit_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         }
         other => Err(anyhow!("unknown sword subcommand: {other}")),
     }
+}
+
+fn sword_search_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    let vault = take_path(args, "--vault")?;
+    let db = take_path(args, "--db")?;
+    let query_text = take_required_string(args, "--query")?;
+    let limit = take_usize(args, "--limit", 10)?;
+    let profile = resolve_embedding_profile(args, Some(&db))?;
+    let context_chunks = take_usize(args, "--context-chunks", 0)?;
+    let include_links = take_flag(args, "--include-links");
+    let retrieval_depth = take_usize(args, "--retrieval-depth", 1)?;
+    let explain = take_flag(args, "--explain");
+    let rerank = !take_flag(args, "--no-rerank");
+    let query_expansion = take_flag(args, "--query-expansion") || take_flag(args, "--expand-query");
+    let external_reranker = parse_reranker_flag(args)?;
+    let freshness = parse_freshness(&take_string(args, "--freshness", "balanced".to_string())?)?;
+    let include_stale = take_flag(args, "--include-stale");
+    if !args.is_empty() {
+        return Err(anyhow!(
+            "unexpected sword search arguments: {}",
+            args.join(" ")
+        ));
+    }
+
+    let provider = provider_from_name(
+        &profile.embedding_provider,
+        profile.embedding_dim,
+        Some(profile.embedding_model.clone()),
+    )?;
+    let mut response = query_with_options(
+        &db,
+        &query_text,
+        &QueryOptions {
+            limit: limit.saturating_mul(3).max(limit).max(10),
+            filter: None,
+            min_score: None,
+            context_chunks,
+            include_links,
+            rerank,
+            expand_links: retrieval_depth,
+            retrieval_depth,
+            explain,
+            freshness,
+            as_of: None,
+            include_stale,
+            query_expansion,
+            external_reranker,
+        },
+        provider.as_ref(),
+        profile.vector_backend,
+    )?;
+    let sidecar = load_latest_sword_sidecar(&vault)?;
+    let boost_summary = apply_sword_sidecar_boosts(&mut response, &sidecar.proposals, limit);
+    Ok(json!({
+        "ok": true,
+        "schema_version": "orderk.sword_search.v1",
+        "query": query_text,
+        "took_ms": response.took_ms,
+        "mode": "sword_spirit_search",
+        "base_mode": response.mode,
+        "sidecar": {
+            "run_id": sidecar.run_id,
+            "run_dir": sidecar.run_dir,
+            "proposals_loaded": sidecar.proposals.len(),
+            "rejected_loaded": sidecar.rejected_count,
+            "boosted_results": boost_summary.boosted_results,
+            "max_boost": boost_summary.max_boost,
+            "llm_calls": 0,
+            "llm_policy": "not_called_query_time",
+            "fallback_policy": "sidecar_observational_small_boost",
+        },
+        "routing": response.routing,
+        "vector_backend": response.vector_backend,
+        "results": response.results,
+    }))
+}
+
+#[derive(Debug)]
+struct SwordSidecarLoad {
+    run_id: String,
+    run_dir: String,
+    proposals: Vec<SwordSpiritProposal>,
+    rejected_count: usize,
+}
+
+#[derive(Debug)]
+struct SwordBoostSummary {
+    boosted_results: usize,
+    max_boost: f32,
+}
+
+fn load_latest_sword_sidecar(vault: &Path) -> Result<SwordSidecarLoad> {
+    let vault = vault
+        .canonicalize()
+        .with_context(|| format!("vault path not found: {}", vault.display()))?;
+    let runs_dir = vault.join(".orderk").join("sword_spirit").join("runs");
+    let mut runs = Vec::new();
+    if runs_dir.exists() {
+        for entry in fs::read_dir(&runs_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                runs.push(entry.path());
+            }
+        }
+    }
+    runs.sort();
+    let run_dir = runs.pop().ok_or_else(|| {
+        anyhow!(
+            "no Sword Spirit sidecar runs found under {}",
+            runs_dir.display()
+        )
+    })?;
+    let run_id = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid Sword Spirit run dir name: {}", run_dir.display()))?
+        .to_string();
+    let proposal_path = run_dir.join("proposals.jsonl");
+    let raw = fs::read_to_string(&proposal_path)
+        .with_context(|| format!("read {}", proposal_path.display()))?;
+    let rejected_path = run_dir.join("rejected.jsonl");
+    let rejected_count = fs::read_to_string(&rejected_path)
+        .ok()
+        .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0);
+    let mut proposals = Vec::new();
+    for (line_no, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let proposal: SwordSpiritProposal = serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "parse Sword Spirit proposal {} line {}",
+                proposal_path.display(),
+                line_no + 1
+            )
+        })?;
+        proposals.push(proposal);
+    }
+    Ok(SwordSidecarLoad {
+        run_id,
+        run_dir: run_dir.to_string_lossy().to_string(),
+        proposals,
+        rejected_count,
+    })
+}
+
+fn apply_sword_sidecar_boosts(
+    response: &mut QueryResponse,
+    proposals: &[SwordSpiritProposal],
+    limit: usize,
+) -> SwordBoostSummary {
+    let anchors: HashSet<String> = response
+        .results
+        .iter()
+        .take(1)
+        .map(|result| result.path.clone())
+        .collect();
+    let query_tokens = sword_query_tokens(&response.query);
+    let mut boosted_results = 0usize;
+    let mut max_boost = 0.0_f32;
+    for result in &mut response.results {
+        let mut boost = 0.0_f32;
+        for proposal in proposals {
+            let Some(target) = proposal.target_path.as_deref() else {
+                continue;
+            };
+            let proposal_text = format!(
+                "{} {} {} {}",
+                proposal.source_path,
+                target,
+                proposal.relation.as_deref().unwrap_or(""),
+                proposal.rationale
+            )
+            .to_lowercase();
+            let query_overlap = sword_query_overlap(&query_tokens, &proposal_text);
+            if query_overlap < 2 {
+                continue;
+            }
+            let proposal_involves_anchor =
+                anchors.contains(&proposal.source_path) || anchors.contains(target);
+            let connected_to_anchor = proposal_involves_anchor
+                && ((anchors.contains(&proposal.source_path) && target == result.path)
+                    || (anchors.contains(target) && proposal.source_path == result.path));
+            if connected_to_anchor {
+                boost = boost.max((proposal.confidence * 0.055).min(0.075));
+            }
+            if proposal_involves_anchor
+                && (result.path == proposal.source_path || result.path == target)
+            {
+                boost = boost.max((proposal.confidence * 0.035).min(0.05));
+            }
+        }
+        if boost > 0.0 {
+            result.score += boost;
+            result.score_breakdown.reranker_boost += boost;
+            if !result
+                .evidence
+                .sources
+                .iter()
+                .any(|source| source == "sword_spirit_sidecar")
+            {
+                result
+                    .evidence
+                    .sources
+                    .push("sword_spirit_sidecar".to_string());
+                result.evidence.evidence_count = result.evidence.sources.len();
+            }
+            boosted_results += 1;
+            max_boost = max_boost.max(boost);
+        }
+    }
+    response.results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line_start.cmp(&b.line_start))
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
+    response.results = file_diverse_top_results(std::mem::take(&mut response.results), limit);
+    response.routing.returned = response.results.len();
+    SwordBoostSummary {
+        boosted_results,
+        max_boost,
+    }
+}
+
+fn file_diverse_top_results(
+    results: Vec<orderk_core::SearchResult>,
+    limit: usize,
+) -> Vec<orderk_core::SearchResult> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut selected = Vec::with_capacity(limit.min(results.len()));
+    let mut deferred = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for result in results {
+        if selected.len() >= limit {
+            deferred.push(result);
+            continue;
+        }
+        if seen_paths.insert(result.path.clone()) {
+            selected.push(result);
+        } else {
+            deferred.push(result);
+        }
+    }
+    for result in deferred {
+        if selected.len() >= limit {
+            break;
+        }
+        selected.push(result);
+    }
+    selected
+}
+
+fn sword_query_overlap(tokens: &[String], haystack: &str) -> usize {
+    tokens
+        .iter()
+        .filter(|token| token.chars().count() >= 3 || !token.is_ascii())
+        .filter(|token| haystack.contains(token.as_str()))
+        .count()
+}
+
+fn sword_query_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in query.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            if current.chars().count() >= 2 {
+                tokens.push(current.clone());
+            }
+            current.clear();
+            if !ch.is_ascii() && ch.is_alphanumeric() {
+                tokens.push(ch.to_string());
+            }
+        }
+    }
+    if current.chars().count() >= 2 {
+        tokens.push(current);
+    }
+    tokens.sort();
+    tokens.dedup();
+    tokens
 }
 
 fn capsule_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
@@ -2413,6 +2738,100 @@ Temporal quality summary needle keeps evidence readable.
             .unwrap_or("")
             .starts_with("orderk://chunk/"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_result(path: &str, chunk_id: &str, score: f32) -> orderk_core::SearchResult {
+        orderk_core::SearchResult {
+            chunk_id: chunk_id.to_string(),
+            file_path: path.to_string(),
+            path: path.to_string(),
+            title: Some(path.to_string()),
+            heading: Some(path.to_string()),
+            line_start: 1,
+            line_end: 2,
+            evidence_uri: format!("orderk://chunk/{chunk_id}"),
+            open_uri: format!("obsidian://open?path={path}&line=1"),
+            snippet: path.to_string(),
+            score,
+            score_breakdown: Default::default(),
+            evidence: Default::default(),
+            quality: Default::default(),
+            evidence_summary: Default::default(),
+            context_chunks: Vec::new(),
+            tags: Vec::new(),
+            confidence: None,
+            status: None,
+            source_type: None,
+            validity: Default::default(),
+            valid_from: None,
+            valid_until: None,
+            supersedes: None,
+            superseded_by: None,
+            updated: None,
+            mtime: None,
+        }
+    }
+
+    fn test_sword_proposal(
+        source: &str,
+        target: &str,
+        confidence: f32,
+        rationale: &str,
+    ) -> SwordSpiritProposal {
+        SwordSpiritProposal {
+            schema_version: "orderk.sword_spirit.proposal.v1".to_string(),
+            id: format!("{source}->{target}"),
+            proposal_type: "semantic_neighbor".to_string(),
+            relation: Some("supports".to_string()),
+            source_path: source.to_string(),
+            target_path: Some(target.to_string()),
+            confidence,
+            risk: "review".to_string(),
+            auto_apply: false,
+            human_review_required: true,
+            evidence: Vec::new(),
+            rationale: rationale.to_string(),
+        }
+    }
+
+    #[test]
+    fn sword_sidecar_boosts_must_not_demote_base_top_hit_or_collapse_file_diversity() {
+        let mut response = QueryResponse {
+            query: "exact target phrase".to_string(),
+            query_id: "q_sword_guard".to_string(),
+            took_ms: 1,
+            mode: "hybrid".to_string(),
+            route: "short".to_string(),
+            routing: Default::default(),
+            vector_backend: "exact".to_string(),
+            explain: None,
+            optimizer: None,
+            results: vec![
+                test_result("expected.md", "expected-1", 1.000),
+                test_result("noise.md", "noise-1", 0.970),
+                test_result("noise.md", "noise-2", 0.969),
+                test_result("noise.md", "noise-3", 0.968),
+                test_result("other.md", "other-1", 0.940),
+            ],
+        };
+        let proposals = vec![test_sword_proposal(
+            "noise.md",
+            "other.md",
+            0.99,
+            "exact target phrase overlap should not let a sidecar proposal flood the final top results",
+        )];
+
+        let summary = apply_sword_sidecar_boosts(&mut response, &proposals, 3);
+
+        assert_eq!(response.results[0].path, "expected.md");
+        let unique_paths: std::collections::HashSet<_> =
+            response.results.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            unique_paths.len() >= 3,
+            "Sword Spirit search must preserve file-level diversity after sidecar boosts: {:#?}",
+            response.results
+        );
+        assert_eq!(summary.boosted_results, 0, "irrelevant sidecar must stay observational instead of perturbing a stronger base ranking");
     }
 
     #[test]

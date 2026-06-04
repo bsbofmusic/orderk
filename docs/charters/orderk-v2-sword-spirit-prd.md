@@ -170,6 +170,61 @@ raw/source 层只追加或导入，不允许 LLM 原地改写；wiki/concept/dec
 
 Digest 默认预算要先保守：embedding 邻居召回 top-30，BM25/topical 邻居 top-10，RRF 去重后最多给 LLM 20 个候选邻居；单次 digest job 输入不超过 8K tokens；每批最多处理 20 个新增/变更文件或 200 个 chunk；候选边每批最多 50 条，低置信自动砍到 10 条以内。超预算时不强跑，进入 proposal-only 或 queued 状态。digest 写入必须事务化：先 dry-run 生成 proposals 和 audit preview，确认后再 apply；高置信边是在 dry-run、schema 校验、预算校验都通过后自动 apply，中置信仍进入 proposal queue。崩溃后从 audit.jsonl 最后 confirmed batch resume；并发 ingest 使用文件级 lock；两条 raw 互相 contradict 时不自动裁决，生成 conflict_pair proposal 给用户批准。P3 之前还要冻结 digest prompt contract：prompt 版本、输入片段类型（raw chunk 摘要、候选邻居 frontmatter、source quote）、结构化 JSON 输出 schema、校验失败重试策略都必须进入 audit。
 
+## 11.1 Hindsight 精量比对后的量产槽位
+
+2026-06-04 对 Hindsight 实际源码 `/home/agent/services/hindsight/.venv/lib/python3.12/site-packages/hindsight_api` 做精量比对后，V2 量产版必须补齐以下槽位。吸收的是机制，不复制 Hindsight 的完整主脑器官。
+
+**Budget profile**：Hindsight 用 `low/mid/high` budget 映射 thinking budget，并支持 fixed/adaptive 两种预算函数。orderk V2 要把这个机制改造成 `fast/standard/deep/digest_low/digest_standard/digest_deep/eval`，每个 profile 同时约束 candidate caps、vector top-k、BM25 top-k、graph expansion、reranker cap、LLM call cap、token cap、wall-time cap、fallback policy。预算必须可审计地进入 `thinking` / `routing` / `trace`，不能散落成 magic constants。
+
+**Fusion / rerank**：Hindsight 的核心不是“多搜几路”，而是 semantic、BM25、graph、temporal 多路候选先用 RRF 合并，再对有限候选 rerank，并把 recency / temporal / proof_count 作为有界小 boost 调制主相关性。orderk V2 要吸收 RRF `k`、source ranks、rerank `max_candidates`、passthrough reranker guard、NaN/Inf score sanitize、provider score normalization；拒绝直接相加不可比 raw score。
+
+**Graph expansion**：Hindsight 的 link expansion 同时利用 entity、semantic kNN、causal link，并用 per-entity cap、timeout fallback 防止高 fanout 爆炸。orderk V2 不复制 observation/mental-model 图谱，但要保留 `entity/semantic/causal/temporal` 四类可解释 expansion signal，默认 compact trace，只有 debug/high trace 才记录全量 visit/prune。
+
+**Tag / scope isolation**：Hindsight 的 `any/all/any_strict/all_strict` tag 语义很关键，strict 模式会排除 untagged，consolidation 也按 exact tag scope 分批。orderk V2 要明确 untagged 是否可见，digest/proposal 要支持 scope isolation，防止一个项目的低置信边串到另一个项目。
+
+**Trace contract**：Hindsight 的 SearchTracer 会记录 query info、retrieval phase、RRF merge、rerank、score components 和 final summary。orderk V2 要冻结 `trace_level=off|compact|full`：compact 至少记录 query slots、budget、retrieval arm counts、source ranks、score components、fallback/warnings；full 才记录 graph visit/prune 细节。
+
+**Proposal governance**：Hindsight consolidation 对 LLM action 有硬门禁：update/delete 的 target 必须来自 evidence set；LLM batch 失败会 adaptive split；duplicate updates 会去重并合并 source ids；scope 达上限后只允许 update/delete，不允许 create。orderk V2 的剑灵 proposal 也必须有 evidence-set gate、adaptive split、duplicate-action dedupe、scope cap、append-only audit 和 redaction policy。
+
+**Fallback/status schema**：所有 provider 调用必须区分 `not_called`、`called`、`called_unparseable_fallback`、`called_failed_degraded`、`called_timeout_degraded`。MiniMax 只返回 thinking block 不能被粉饰成 typed decision 成功；fallback 也要有 proposal-only / skipped / queued 的明确状态。
+
+### 11.1.1 Absorb / Adapt / Reject 决策表
+
+**Absorb，直接吸收机制**：
+- Budget profile：吸收 Hindsight 的 `low/mid/high` 预算观，但改成 orderk 语义的 `digest_low/digest_standard/digest_deep/eval`；所有 candidate cap、reranker cap、LLM cap、fallback threshold 必须来自 profile。
+- RRF + bounded boosts：保留现有 RRF 思路，补齐 source rank trace、NaN/Inf sanitize、reranker score normalization，拒绝直接混加不可比 raw score。
+- Search/digest trace：吸收 SearchTracer 的阶段性 trace contract，先落 compact trace 到 JSON，再逐步扩 full trace。
+- Evidence-set gate：LLM proposal 只能引用候选 evidence set 内对象；不存在的 target/action 一律丢弃或进入 rejected 样本。
+
+**Adapt，改造成轻量形态**：
+- Hindsight graph expansion 不照搬全量 entity/observation/mental-model 图谱，只改造成 sidecar semantic edge + link graph adapter + bounded graph boost。
+- Hindsight consolidation worker 不照搬重队列，只改造成单后台剑灵 digest run：事务化 sidecar、proposal queue、audit resume、scope cap。
+- Hindsight tag_groups / strict scope 改造成 vault/project/profile scope：默认不跨 scope 自动生效，untagged visibility 明确写入 profile。
+- Reflect/reasoning 改造成主动唤醒推理：只在低置信、冲突、统综/架构意图时触发，不进入默认 search path。
+
+**Reject，明确不搬器官**：
+- 不复制 Hindsight 的主脑 bank、operation queue、mental model 刷新洪流、默认 reflect answer path。
+- 不把 Hindsight 的 Postgres/worker/control-plane 作为 orderk 核心依赖。
+- 不让 LLM 直接写 raw/source Markdown，不让 MCP 远程自开写权限。
+- 不把 provider fallback 静默伪装成成功；fallback 必须显式记录并进入评测。
+
+### 11.1.2 量产车级别 P0 门禁
+
+下赛道前先把 P0 门禁从“能跑”升级成“能控”：
+1. `orderk sword run` 支持 budget profile 与 trace level，并在 `thinking` / audit / report 中记录实际使用的 caps、阈值和 fallback policy。
+2. 所有 active digest magic constants 都必须归一到 budget profile：candidate multiplier/min/max、per-source lexical/embedding/reranker cap、LLM candidate cap、fallback threshold。
+3. 50-query / 50-digest fixture bench 输出固定 JSON：base、sword、Hindsight reference 三方的 top-k hit、MRR、latency、RSS、proposal precision proxy、fallback distribution。
+4. 真实 3,713-md vault active run 至少完成一轮 bounded digest，不改 raw，sidecar 可读，secret marker 为 0；若 provider 慢/失败，必须报告 degraded 状态而不是假成功。
+5. release gate 之前必须有独立审计：边界、secret、budget/trace、fallback、raw immutability、bench 脚本都要过。
+
+### 11.1.3 本轮 real-battle 实测边界
+
+本轮实测把“量产车”拆成两档，避免把轻量工程跑成无上限长跑：
+
+- **全库 remote embedding 尝试**：对 `/home/agent/obsidian-vault` 的 3,713-md 全库做远程 embedding/index 时，超过 10 分钟轻量阈值仍未完成；停机证据记录在 `/tmp/orderk-sword-full-vault-aborted-evidence.json`。该证据只说明全库 active/remote embedding 当前过重，需要降级/分批/缓存策略，不能当作全库通过。
+- **代表性 50-doc sample 赛道**：`scripts/sword_real_vault_bench.py` 从真实 3,713-md vault 按目录配额抽 50 篇复制到 `/tmp/orderk-sword-real-vault-bench/sample-vault`，只索引 sample vault，跑 50-query base-vs-sword bench。最新 `/tmp/orderk-sword-real-vault-bench/summary.json` 显示：base top1 34/50、hit@3 37/50、hit@10 48/50、MRR 0.7444；Sword top1 33/50、hit@3 42/50、hit@10 49/50、MRR 0.7663。结论只能写成“轻量代表性 sample 赛道基本通过，近邻/MRR 改善但 top1 小退 1 条”，不能写成“3,713-md 全库量产达标”。
+- **Search guard 回归**：sample bench 暴露 `orderk sword search` 的 sidecar boost 曾在 chunk 级排序里污染 topN；修复策略是 sidecar boost 只围绕 base top1 anchor 生效，并在最终 topN 做 file-level diversity，避免一个文件的多个 chunk 淹没不同文件。
+
 ## 12. 检索链路
 
 快查档：本地 FTS/BM25 + path/title/tag/heading，完全不调用 LLM，目标是毫秒到低秒级响应，适合找文件、旧句子、旧配置、明确关键词。

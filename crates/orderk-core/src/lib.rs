@@ -24,8 +24,11 @@ pub use embedding::{
 pub use health::{classify_error_message, health_report};
 pub use models::*;
 pub use sword_spirit::{
-    default_sword_llm_model, default_sword_llm_provider, run_sword_spirit, sword_spirit_status,
-    SwordSpiritOptions,
+    default_sword_embedding_dim, default_sword_embedding_model, default_sword_embedding_provider,
+    default_sword_llm_model, default_sword_llm_provider, default_sword_reranker_model,
+    default_sword_reranker_provider, run_sword_spirit, sword_spirit_status,
+    SwordSpiritBudgetProfile, SwordSpiritOptions, SwordSpiritProposal, SwordSpiritThinkingMode,
+    SwordSpiritTraceLevel,
 };
 
 #[cfg(test)]

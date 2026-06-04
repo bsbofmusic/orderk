@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-06-04
+
+### Added
+- Add Sword Spirit active race gates with RRF source-rank traces, evidence-gated typed-edge decisions, rejected-decision sidecars, and query-time LLM=0 search metadata.
+- Add real-vault Sword Spirit benchmark harness with representative sampling, base-vs-Sword deltas, fallback/rejection sidecar counts, and resource summaries.
+
+### Fixed
+- Keep Sword Spirit sidecar boosts observational and file-diverse so they cannot demote a stronger base top hit.
+- Block cross-scope same-name auto-link candidates and reject out-of-vocabulary LLM relations instead of normalizing them silently.
+
 ## [0.1.12] - 2026-06-01
 
 ### Added
@@ -128,7 +138,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/bsbofmusic/orderk/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/bsbofmusic/orderk/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/bsbofmusic/orderk/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/bsbofmusic/orderk/compare/v0.1.9...v0.1.10
