@@ -51,7 +51,7 @@ fn should_skip(path: &Path) -> bool {
             let s = name.to_string_lossy();
             matches!(
                 s.as_ref(),
-                ".obsidian" | ".trash" | ".git" | "node_modules" | "target"
+                ".obsidian" | ".orderk" | ".trash" | ".git" | "node_modules" | "target"
             )
         } else {
             false

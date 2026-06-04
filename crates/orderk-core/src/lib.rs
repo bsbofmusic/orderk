@@ -9,6 +9,7 @@ pub mod markdown;
 pub mod models;
 pub mod optimizer;
 pub mod scanner;
+pub mod sword_spirit;
 
 pub use api::{
     feedback, get_chunks, index_vault, index_vault_with_options, init, optimize_apply,
@@ -22,6 +23,10 @@ pub use embedding::{
 };
 pub use health::{classify_error_message, health_report};
 pub use models::*;
+pub use sword_spirit::{
+    default_sword_llm_model, default_sword_llm_provider, run_sword_spirit, sword_spirit_status,
+    SwordSpiritOptions,
+};
 
 #[cfg(test)]
 mod capsule_contract_tests {

@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Result};
 use orderk_core::{
-    classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
-    index_vault_with_options, init, inspect_capsule_manifest, optimize_apply, optimize_dry_run,
-    optimize_reset, optimize_set, optimize_status, provider_from_name, query, query_with_options,
-    status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider,
-    FeedbackEvent, FreshnessMode, IndexOptions, QueryOptions, QueryResponse, SearchIndexResponse,
-    VectorBackend,
+    classify_error_message, default_sword_llm_model, default_sword_llm_provider,
+    export_capsule_manifest, feedback, get_chunks, health_report, index_vault_with_options, init,
+    inspect_capsule_manifest, optimize_apply, optimize_dry_run, optimize_reset, optimize_set,
+    optimize_status, provider_from_name, query, query_with_options, run_sword_spirit, status,
+    sword_spirit_status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions,
+    EmbeddingProvider, FeedbackEvent, FreshnessMode, IndexOptions, QueryOptions, QueryResponse,
+    SearchIndexResponse, SwordSpiritOptions, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -261,6 +262,10 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let resp = optimize_command(&mut args)?;
             print_json(&resp)?;
         }
+        "sword" | "sword-spirit" => {
+            let resp = sword_spirit_command(&mut args)?;
+            print_json(&resp)?;
+        }
         "mcp" => {
             run_mcp_server(&mut args)?;
         }
@@ -302,6 +307,52 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn sword_spirit_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    if args.is_empty() {
+        return Err(anyhow!("sword requires a subcommand: run or status"));
+    }
+    let subcommand = args.remove(0);
+    match subcommand.as_str() {
+        "run" => {
+            let vault = take_path(args, "--vault")?;
+            let max_files = take_usize(args, "--max-files", 200)?;
+            let max_proposals = take_usize(args, "--max-proposals", 100)?;
+            let llm_provider = take_optional_string(args, "--llm-provider")?
+                .or(take_optional_string(args, "--model-provider")?)
+                .unwrap_or_else(default_sword_llm_provider);
+            let llm_model = take_optional_string(args, "--llm-model")?
+                .or(take_optional_string(args, "--model")?)
+                .unwrap_or_else(default_sword_llm_model);
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unexpected sword run arguments: {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(run_sword_spirit(
+                &vault,
+                &SwordSpiritOptions {
+                    max_files,
+                    max_proposals,
+                    llm_provider,
+                    llm_model,
+                },
+            )?)?)
+        }
+        "status" => {
+            let vault = take_path(args, "--vault")?;
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unexpected sword status arguments: {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(sword_spirit_status(&vault)?)?)
+        }
+        other => Err(anyhow!("unknown sword subcommand: {other}")),
+    }
 }
 
 fn capsule_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
@@ -1635,13 +1686,14 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
         }
         "optimize" => optimize_command(&mut args),
         "capsule" => capsule_command(&mut args),
+        "sword" | "sword-spirit" => sword_spirit_command(&mut args),
         other => Err(anyhow!("unsupported test command: {other}")),
     }
 }
 
 fn print_usage() {
     eprintln!(
-        "orderk <init|index|search|get|status|health|doctor|eval|maintain|optimize|capsule|mcp|feedback> [--flags]"
+        "orderk <init|index|search|get|status|health|doctor|eval|maintain|optimize|capsule|sword|sword-spirit|mcp|feedback> [--flags]"
     );
     eprintln!(
         "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--query-expansion] [--reranker lexical|none] [--json-lines] [--explain] [--no-rerank]"
@@ -1653,6 +1705,8 @@ fn print_usage() {
         "capsule export flags: --db <orderk.sqlite> [--vault <vault>] [--out <capsule.json>]"
     );
     eprintln!("capsule inspect flags: --file <capsule.json> [--db <orderk.sqlite>]");
+    eprintln!("sword run flags: --vault <path> [--max-files <n>] [--max-proposals <n>] [--llm-provider <provider>] [--llm-model <model>]");
+    eprintln!("sword status flags: --vault <path>");
 }
 
 #[derive(Debug, Deserialize)]
@@ -2848,6 +2902,32 @@ Retrieval augmented generation uses embeddings and bm25.
         assert!(err
             .to_string()
             .contains("unexpected capsule export arguments"));
+    }
+
+    #[test]
+    fn sword_cli_rejects_custom_out_dir_to_keep_sidecar_quarantined() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-sword-out-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("alpha.md"), "# Alpha\n").unwrap();
+        let err = run_with_args(vec![
+            "sword".into(),
+            "run".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--out-dir".into(),
+            vault.join("sword_out").to_string_lossy().to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("unexpected sword run arguments"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
