@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-06-04
+
+### Added
+- Add a full-vault active Sword Spirit gate that copies the real 3,713 Markdown vault, runs live HS-aligned embedding/reranker/MiniMax typed decisions, verifies sidecar artifacts, and fails on raw Markdown mutation or fallback.
+
+### Fixed
+- Parse MiniMax Anthropic-compatible single-decision JSON and thinking-plus-text responses, while disabling thinking in the request contract for typed decisions.
+- Preserve base search ordering when Sword sidecar evidence does not apply, preventing non-Sword top1 regressions from enlarged candidate windows.
+- Respect typed LLM rejects as valid decisions instead of manufacturing fallback proposals when the LLM path is parseable.
+- Limit large-corpus Sword candidate generation with indexed token/tag/title pools so full-vault active digest completes within a bounded race gate.
+
 ## [0.1.13] - 2026-06-04
 
 ### Added
@@ -138,7 +149,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/bsbofmusic/orderk/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/bsbofmusic/orderk/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/bsbofmusic/orderk/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/bsbofmusic/orderk/compare/v0.1.10...v0.1.11

@@ -422,7 +422,7 @@ fn sword_search_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         &db,
         &query_text,
         &QueryOptions {
-            limit: limit.saturating_mul(3).max(limit).max(10),
+            limit,
             filter: None,
             min_score: None,
             context_chunks,
@@ -602,10 +602,22 @@ fn apply_sword_sidecar_boosts(
             max_boost = max_boost.max(boost);
         }
     }
+    let original_order: std::collections::HashMap<String, usize> = response
+        .results
+        .iter()
+        .enumerate()
+        .map(|(idx, result)| (result.chunk_id.clone(), idx))
+        .collect();
     response.results.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                original_order
+                    .get(&a.chunk_id)
+                    .unwrap_or(&usize::MAX)
+                    .cmp(original_order.get(&b.chunk_id).unwrap_or(&usize::MAX))
+            })
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line_start.cmp(&b.line_start))
             .then_with(|| a.chunk_id.cmp(&b.chunk_id))
@@ -2832,6 +2844,40 @@ Temporal quality summary needle keeps evidence readable.
             response.results
         );
         assert_eq!(summary.boosted_results, 0, "irrelevant sidecar must stay observational instead of perturbing a stronger base ranking");
+    }
+
+    #[test]
+    fn sword_sidecar_search_preserves_base_top_when_no_sidecar_boost_applies() {
+        let mut response = QueryResponse {
+            query: "tie query".to_string(),
+            query_id: "q_sword_no_boost_guard".to_string(),
+            took_ms: 1,
+            mode: "hybrid".to_string(),
+            route: "short".to_string(),
+            routing: Default::default(),
+            vector_backend: "exact".to_string(),
+            explain: None,
+            optimizer: None,
+            results: vec![
+                test_result("z-base-top.md", "z-base-top-1", 1.000),
+                test_result("a-alpha.md", "a-alpha-1", 1.000),
+                test_result("b-beta.md", "b-beta-1", 0.990),
+            ],
+        };
+        let proposals = vec![test_sword_proposal(
+            "unrelated.md",
+            "other.md",
+            0.99,
+            "no token overlap with the query",
+        )];
+
+        let summary = apply_sword_sidecar_boosts(&mut response, &proposals, 3);
+
+        assert_eq!(summary.boosted_results, 0);
+        assert_eq!(
+            response.results[0].path, "z-base-top.md",
+            "no-boost Sword search must not reorder equal-score base results by path"
+        );
     }
 
     #[test]

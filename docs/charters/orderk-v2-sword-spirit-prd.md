@@ -219,11 +219,12 @@ Digest 默认预算要先保守：embedding 邻居召回 top-30，BM25/topical �
 
 ### 11.1.3 本轮 real-battle 实测边界
 
-本轮实测把“量产车”拆成两档，避免把轻量工程跑成无上限长跑：
+本轮实测先暴露了两类边界，再在 `0.1.14` 修正版把“全程赛道”固化为可重复 gate：
 
-- **全库 remote embedding 尝试**：对 `/home/agent/obsidian-vault` 的 3,713-md 全库做远程 embedding/index 时，超过 10 分钟轻量阈值仍未完成；停机证据记录在 `/tmp/orderk-sword-full-vault-aborted-evidence.json`。该证据只说明全库 active/remote embedding 当前过重，需要降级/分批/缓存策略，不能当作全库通过。
-- **代表性 50-doc sample 赛道**：`scripts/sword_real_vault_bench.py` 从真实 3,713-md vault 按目录配额抽 50 篇复制到 `/tmp/orderk-sword-real-vault-bench/sample-vault`，只索引 sample vault，跑 50-query base-vs-sword bench。最新 `/tmp/orderk-sword-real-vault-bench/summary.json` 显示：base top1 34/50、hit@3 37/50、hit@10 48/50、MRR 0.7444；Sword top1 33/50、hit@3 42/50、hit@10 49/50、MRR 0.7663。结论只能写成“轻量代表性 sample 赛道基本通过，近邻/MRR 改善但 top1 小退 1 条”，不能写成“3,713-md 全库量产达标”。
-- **Search guard 回归**：sample bench 暴露 `orderk sword search` 的 sidecar boost 曾在 chunk 级排序里污染 topN；修复策略是 sidecar boost 只围绕 base top1 anchor 生效，并在最终 topN 做 file-level diversity，避免一个文件的多个 chunk 淹没不同文件。
+- **全库 remote embedding 旧失败证据**：早期对 `/home/agent/obsidian-vault` 的全库 remote embedding/index 尝试超过 10 分钟轻量阈值仍未完成；停机证据记录在 `/tmp/orderk-sword-full-vault-aborted-evidence.json`。该证据只说明旧路径过重，不能当作全库通过。
+- **代表性 50-doc sample 旧边界**：`scripts/sword_real_vault_bench.py` 只索引真实 3,713-md vault 的 50-doc sample。旧 `0.1.13` 数据可支持“sample 赛道 MRR/near-neighbor 改善”，但因为 Sword top1 曾从 34/50 小退到 33/50，不能写成“3,713-md 全库量产达标”。
+- **Search guard 回归修复**：sample bench 暴露 `orderk sword search` 的 sidecar boost 曾在 chunk 级排序里污染 topN；`0.1.14` 通过 top1 non-regression 回归测试锁住修复：无 sidecar boost 时保留 base 排序，sidecar boost 只在 evidence overlap 时小幅生效。
+- **0.1.14 全库 active gate 通过**：`scripts/sword_full_vault_active_gate.py` 每次先 rebuild 当前 `orderk` binary 并校验版本，再复制真实 vault 运行 `orderk sword run --thinking active --max-files 3713`。最新证据 `/tmp/orderk-sword-full-vault-active-gate-0.1.14-final-20260604T182359/summary.json`（sha256 `44a42773628ac4607e3d3b6f3e9187773e171bbc983d31d6505a1c303128e3d5`）：binary `0.1.14`，source/source considered/scanned `3713/3713/3713`，Qwen3 embedding `embedded_count=3713`，Qwen3 reranker `reranked_count=24`，MiniMax typed LLM `llm_invocation=called` / `llm_calls=2`，`fallback_invocation=not_used`，raw unchanged `true`，sidecar `neighbors=24/proposals=9/rejected=3/audit=1/report_exists=true`，wall `6:08.98`，max RSS `440368 KB`，warnings `[]`。
 
 ## 12. 检索链路
 

@@ -771,9 +771,11 @@ fn generate_active_proposals(
         documents,
         options.max_proposals,
     );
-    if proposals.is_empty() {
+    let used_reranker_fallback =
+        proposals.is_empty() && should_use_reranker_fallback(&llm_invocation);
+    if used_reranker_fallback {
         warnings.push(format!(
-            "active LLM kept zero candidates; falling back to high-confidence reranker neighbors as review-only proposals using threshold {:.2}",
+            "active LLM did not produce parseable candidate decisions; falling back to high-confidence reranker neighbors as review-only proposals using threshold {:.2}",
             budget.fallback_threshold
         ));
         proposals = llm_candidates
@@ -797,9 +799,7 @@ fn generate_active_proposals(
         accepted_count: proposals.len(),
         llm_calls: llm.calls,
         rejected_count: rejected.len(),
-        fallback_invocation: if proposals.is_empty() {
-            "not_used".to_string()
-        } else if llm_invocation != "called" || decisions.iter().all(|decision| !decision.keep) {
+        fallback_invocation: if used_reranker_fallback {
             "proposal_only_review".to_string()
         } else {
             "not_used".to_string()
@@ -958,9 +958,15 @@ fn generate_neighbor_candidates_with_limit(
         .iter()
         .map(|doc| (doc.path.clone(), document_tokens(doc)))
         .collect();
+    let candidate_pools = large_corpus_candidate_pools(documents, &features);
     let mut by_source: HashMap<String, Vec<SwordSpiritNeighborCandidate>> = HashMap::new();
     for (i, source) in documents.iter().enumerate() {
-        for (j, target) in documents.iter().enumerate() {
+        let target_indices: Vec<usize> = candidate_pools
+            .as_ref()
+            .map(|pools| pools[i].clone())
+            .unwrap_or_else(|| (0..documents.len()).filter(|j| *j != i).collect());
+        for j in target_indices {
+            let target = &documents[j];
             if i == j {
                 continue;
             }
@@ -1020,6 +1026,7 @@ fn generate_neighbor_candidates_with_limit(
             provider,
             &mut candidates,
             &mut seen,
+            candidate_pools.as_deref(),
         )?;
     }
 
@@ -1028,12 +1035,118 @@ fn generate_neighbor_candidates_with_limit(
     Ok(candidates)
 }
 
+fn large_corpus_candidate_pools(
+    documents: &[SwordSpiritDocument],
+    features: &[(String, HashSet<String>)],
+) -> Option<Vec<Vec<usize>>> {
+    const LARGE_CORPUS_THRESHOLD: usize = 256;
+    const TOKEN_CANDIDATE_CAP: usize = 96;
+    const TAG_CANDIDATE_CAP: usize = 64;
+    const TITLE_CANDIDATE_CAP: usize = 64;
+    if documents.len() < LARGE_CORPUS_THRESHOLD {
+        return None;
+    }
+
+    let mut token_index: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, (_path, tokens)) in features.iter().enumerate() {
+        for token in tokens {
+            if useful_pool_token(token) {
+                token_index.entry(token.as_str()).or_default().push(idx);
+            }
+        }
+    }
+
+    let mut tag_index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, doc) in documents.iter().enumerate() {
+        for tag in &doc.tags {
+            let tag = tag.trim().to_ascii_lowercase();
+            if !tag.is_empty() {
+                tag_index.entry(tag).or_default().push(idx);
+            }
+        }
+    }
+
+    let mut title_index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, doc) in documents.iter().enumerate() {
+        for token in doc
+            .title
+            .as_deref()
+            .map(lexical_tokens)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|token| useful_pool_token(token))
+        {
+            title_index.entry(token).or_default().push(idx);
+        }
+    }
+
+    let mut pools = Vec::with_capacity(documents.len());
+    for (idx, doc) in documents.iter().enumerate() {
+        let mut votes: HashMap<usize, usize> = HashMap::new();
+        for token in &features[idx].1 {
+            if !useful_pool_token(token) {
+                continue;
+            }
+            if let Some(rows) = token_index.get(token.as_str()) {
+                if rows.len() <= TOKEN_CANDIDATE_CAP {
+                    for row in rows {
+                        if *row != idx {
+                            *votes.entry(*row).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for tag in &doc.tags {
+            let tag = tag.trim().to_ascii_lowercase();
+            if let Some(rows) = tag_index.get(&tag) {
+                if rows.len() <= TAG_CANDIDATE_CAP {
+                    for row in rows {
+                        if *row != idx {
+                            *votes.entry(*row).or_default() += 3;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(title) = doc.title.as_deref() {
+            for token in lexical_tokens(title) {
+                if !useful_pool_token(&token) {
+                    continue;
+                }
+                if let Some(rows) = title_index.get(&token) {
+                    if rows.len() <= TITLE_CANDIDATE_CAP {
+                        for row in rows {
+                            if *row != idx {
+                                *votes.entry(*row).or_default() += 2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut ranked: Vec<(usize, usize)> = votes.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| documents[a.0].path.cmp(&documents[b.0].path))
+        });
+        pools.push(ranked.into_iter().take(160).map(|(row, _)| row).collect());
+    }
+    Some(pools)
+}
+
+fn useful_pool_token(token: &str) -> bool {
+    let len = token.chars().count();
+    (3..=48).contains(&len) && !is_stopword(token)
+}
+
 fn add_embedding_neighbors(
     documents: &[SwordSpiritDocument],
     candidate_limit: usize,
     provider: &dyn EmbeddingProvider,
     candidates: &mut Vec<SwordSpiritNeighborCandidate>,
     seen: &mut HashSet<(String, String)>,
+    candidate_pools: Option<&[Vec<usize>]>,
 ) -> Result<()> {
     if documents.len() < 2 {
         return Ok(());
@@ -1059,8 +1172,11 @@ fn add_embedding_neighbors(
     let per_source_limit = 8usize.min(candidate_limit.max(1));
     for (i, source) in documents.iter().enumerate() {
         let mut rows = Vec::new();
-        for (j, _target) in documents.iter().enumerate() {
-            if i == j {
+        let target_indices: Vec<usize> = candidate_pools
+            .map(|pools| pools[i].clone())
+            .unwrap_or_else(|| (0..documents.len()).filter(|j| *j != i).collect());
+        for j in target_indices {
+            if i == j || !scopes_compatible(source, &documents[j]) {
                 continue;
             }
             let score = cosine_similarity(&vectors[i], &vectors[j]).clamp(0.0, 1.0);
@@ -1251,6 +1367,10 @@ fn rerank_neighbors(
         }
     }
     Ok(())
+}
+
+fn should_use_reranker_fallback(llm_invocation: &str) -> bool {
+    llm_invocation != "called"
 }
 
 fn proposals_from_decisions(
@@ -1662,6 +1782,8 @@ impl AnthropicMiniMaxClient {
             "model": self.model,
             "max_tokens": 2600,
             "temperature": 0.1,
+            "thinking": {"type": "disabled"},
+            "system": "Return only the requested JSON. Do not include thinking, markdown, or explanation.",
             "messages": [{"role": "user", "content": prompt}]
         })
         .to_string();
@@ -1718,6 +1840,9 @@ fn parse_decisions(text: &str) -> Result<Vec<ActiveProposalDecision>> {
         .ok_or_else(|| anyhow!("LLM response did not contain a JSON array or object"))?;
     if let Ok(items) = serde_json::from_str::<Vec<ActiveProposalDecision>>(json_text) {
         return Ok(items);
+    }
+    if let Ok(item) = serde_json::from_str::<ActiveProposalDecision>(json_text) {
+        return Ok(vec![item]);
     }
     #[derive(Debug, Deserialize)]
     struct Envelope {
@@ -2719,5 +2844,42 @@ mod tests {
             candidates.is_empty(),
             "cross-project same-name docs should not auto-link without review-only override: {candidates:#?}"
         );
+    }
+
+    #[test]
+    fn sword_spirit_uses_reranker_fallback_only_when_llm_decisions_are_unparseable() {
+        assert!(!should_use_reranker_fallback("called"));
+        assert!(should_use_reranker_fallback("called_unparseable_fallback"));
+        assert!(should_use_reranker_fallback("not_called_no_candidates"));
+    }
+
+    #[test]
+    fn sword_spirit_llm_parser_accepts_thinking_plus_text_blocks() {
+        let body = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "internal reasoning must not block the final text"},
+                {"type": "text", "text": "[{\"candidate_id\":\"c1\",\"keep\":true,\"relation\":\"supports\",\"confidence\":0.9,\"rationale\":\"ok\"}]"}
+            ]
+        }"#;
+
+        let text = extract_anthropic_text(body).unwrap();
+        let decisions = parse_decisions(&text).unwrap();
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].candidate_id, "c1");
+        assert!(decisions[0].keep);
+        assert_eq!(decisions[0].relation.as_deref(), Some("supports"));
+    }
+
+    #[test]
+    fn sword_spirit_llm_parser_accepts_single_decision_object() {
+        let decisions = parse_decisions(
+            r#"{"candidate_id":"c1","keep":true,"relation":"supports","confidence":0.91,"rationale":"ok"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].candidate_id, "c1");
+        assert!(decisions[0].keep);
     }
 }
