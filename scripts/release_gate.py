@@ -45,6 +45,7 @@ COMMANDS = [
     ["python3", "scripts/smoke.py"],
     ["python3", "scripts/stress.py"],
     ["python3", "scripts/eval.py"],
+    ["python3", "scripts/sword_5topic_hs_vs_v2_bench.py"],
     ["npm", "install"],
     ["npm", "run", "build", "--workspaces", "--if-present"],
     ["npm", "test", "--workspaces", "--if-present"],

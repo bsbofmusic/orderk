@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use orderk_core::{
     classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
     index_vault_with_options, init, inspect_capsule_manifest, optimize_apply, optimize_dry_run,
-    optimize_reset, optimize_set, optimize_status, provider_from_name, query, query_with_options,
+    optimize_reset, optimize_set, optimize_status, provider_from_name, query_with_options,
     resolve_sword_model_profile_from_env, run_sword_spirit, status, sword_spirit_status,
     write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider, FeedbackEvent,
     FreshnessMode, IndexOptions, QueryOptions, QueryResponse, SearchIndexResponse,
@@ -402,7 +402,8 @@ fn sword_search_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let profile = resolve_embedding_profile(args, Some(&db))?;
     let context_chunks = take_usize(args, "--context-chunks", 0)?;
     let include_links = take_flag(args, "--include-links");
-    let retrieval_depth = take_usize(args, "--retrieval-depth", 1)?;
+    let filter = take_optional_string(args, "--filter")?;
+    let retrieval_depth = take_usize(args, "--retrieval-depth", 0)?;
     let explain = take_flag(args, "--explain");
     let rerank = !take_flag(args, "--no-rerank");
     let query_expansion = take_flag(args, "--query-expansion") || take_flag(args, "--expand-query");
@@ -426,7 +427,7 @@ fn sword_search_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         &query_text,
         &QueryOptions {
             limit,
-            filter: None,
+            filter,
             min_score: None,
             context_chunks,
             include_links,
@@ -498,12 +499,16 @@ fn load_latest_sword_sidecar(vault: &Path) -> Result<SwordSidecarLoad> {
         }
     }
     runs.sort();
-    let run_dir = runs.pop().ok_or_else(|| {
-        anyhow!(
-            "no Sword Spirit sidecar runs found under {}",
-            runs_dir.display()
-        )
-    })?;
+    let run_dir = runs
+        .into_iter()
+        .rev()
+        .find(|dir| dir.join("proposals.jsonl").is_file())
+        .ok_or_else(|| {
+            anyhow!(
+                "no complete Sword Spirit sidecar runs found under {}",
+                runs_dir.display()
+            )
+        })?;
     let run_id = run_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -554,6 +559,10 @@ fn apply_sword_sidecar_boosts(
     let query_tokens = sword_query_tokens(&response.query);
     let mut boosted_results = 0usize;
     let mut max_boost = 0.0_f32;
+    let original_top_chunk_id = response
+        .results
+        .first()
+        .map(|result| result.chunk_id.clone());
     for result in &mut response.results {
         let mut boost = 0.0_f32;
         for proposal in proposals {
@@ -577,6 +586,9 @@ fn apply_sword_sidecar_boosts(
             let connected_to_anchor = proposal_involves_anchor
                 && ((anchors.contains(&proposal.source_path) && target == result.path)
                     || (anchors.contains(target) && proposal.source_path == result.path));
+            if !proposal_evidence_overlaps_result(proposal, result, &anchors) {
+                continue;
+            }
             if connected_to_anchor {
                 boost = boost.max((proposal.confidence * 0.055).min(0.075));
             }
@@ -605,28 +617,40 @@ fn apply_sword_sidecar_boosts(
             max_boost = max_boost.max(boost);
         }
     }
-    let original_order: std::collections::HashMap<String, usize> = response
-        .results
-        .iter()
-        .enumerate()
-        .map(|(idx, result)| (result.chunk_id.clone(), idx))
-        .collect();
-    response.results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                original_order
-                    .get(&a.chunk_id)
-                    .unwrap_or(&usize::MAX)
-                    .cmp(original_order.get(&b.chunk_id).unwrap_or(&usize::MAX))
-            })
-            .then_with(|| a.path.cmp(&b.path))
-            .then_with(|| a.line_start.cmp(&b.line_start))
-            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
-    });
-    response.results = file_diverse_top_results(std::mem::take(&mut response.results), limit);
-    response.routing.returned = response.results.len();
+    if boosted_results > 0 {
+        let original_order: std::collections::HashMap<String, usize> = response
+            .results
+            .iter()
+            .enumerate()
+            .map(|(idx, result)| (result.chunk_id.clone(), idx))
+            .collect();
+        response.results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    original_order
+                        .get(&a.chunk_id)
+                        .unwrap_or(&usize::MAX)
+                        .cmp(original_order.get(&b.chunk_id).unwrap_or(&usize::MAX))
+                })
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.line_start.cmp(&b.line_start))
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
+        if let Some(original_top_chunk_id) = original_top_chunk_id.as_deref() {
+            if let Some(idx) = response
+                .results
+                .iter()
+                .position(|result| result.chunk_id == original_top_chunk_id)
+            {
+                let original_top = response.results.remove(idx);
+                response.results.insert(0, original_top);
+            }
+        }
+        response.results = file_diverse_top_results(std::mem::take(&mut response.results), limit);
+        response.routing.returned = response.results.len();
+    }
     SwordBoostSummary {
         boosted_results,
         max_boost,
@@ -669,6 +693,21 @@ fn sword_query_overlap(tokens: &[String], haystack: &str) -> usize {
         .filter(|token| token.chars().count() >= 3 || !token.is_ascii())
         .filter(|token| haystack.contains(token.as_str()))
         .count()
+}
+
+fn proposal_evidence_overlaps_result(
+    proposal: &SwordSpiritProposal,
+    result: &orderk_core::SearchResult,
+    anchors: &HashSet<String>,
+) -> bool {
+    proposal.evidence.iter().any(|evidence| {
+        let path = evidence.path.trim();
+        !path.is_empty()
+            && (path == result.path
+                || path == proposal.source_path
+                || proposal.target_path.as_deref() == Some(path)
+                || anchors.contains(path))
+    })
 }
 
 fn sword_query_tokens(query: &str) -> Vec<String> {
@@ -864,10 +903,12 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             }
         }
 
-        let resp = query(
+        let mut options = QueryOptions::new(limit);
+        options.filter = eval_scope_filter(case);
+        let resp = query_with_options(
             &db,
             &case.query,
-            limit,
+            &options,
             provider.as_ref(),
             profile.vector_backend.clone(),
         )?;
@@ -936,6 +977,8 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             expected_paths: case.expected_paths.clone(),
             expected_phrases: case.expected_phrases.clone(),
             matched_expected_phrases,
+            scope_tags: case.scope_tags.clone(),
+            llm_calls: 0,
             hit: found_rank.is_some(),
             rank: found_rank,
             top_path: resp.results.first().map(|r| r.path.clone()),
@@ -1028,6 +1071,26 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         }));
     }
     Ok(baseline)
+}
+
+fn eval_scope_filter(case: &EvalCase) -> Option<String> {
+    let clauses = case
+        .scope_tags
+        .iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .map(|tag| format!("tag == {}", filter_string_literal(tag)))
+        .collect::<Vec<_>>();
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(clauses.join(" && "))
+    }
+}
+
+fn filter_string_literal(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
 }
 
 fn eval_missing_expected_phrase_cases(value: &serde_json::Value) -> Vec<String> {
@@ -2090,6 +2153,8 @@ struct EvalCase {
     expected_paths: Vec<String>,
     #[serde(default)]
     expected_phrases: Vec<String>,
+    #[serde(default)]
+    scope_tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2101,6 +2166,9 @@ struct EvalCaseResult {
     expected_phrases: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     matched_expected_phrases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scope_tags: Vec<String>,
+    llm_calls: usize,
     hit: bool,
     rank: Option<usize>,
     top_path: Option<String>,
@@ -2952,6 +3020,99 @@ mod tests {
     }
 
     #[test]
+    fn eval_scope_tags_are_strict_and_never_trigger_llm_calls() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-eval-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(vault.join("scoped")).unwrap();
+        fs::write(
+            vault.join("scoped/expected.md"),
+            "---\ntags: [batch3-scope]\n---\n# Scoped\nbatch three strict scope needle expected local phrase.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("decoy.md"),
+            "# Decoy\nbatch three strict scope needle batch three strict scope needle batch three strict scope needle.\n",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let queries = root.join("queries.json");
+        fs::write(
+            &queries,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "orderk.eval_queries.v1",
+                "queries": [{
+                    "id": "strict-scope-tags",
+                    "query": "batch three strict scope needle",
+                    "scope_tags": ["batch3-scope"],
+                    "expected_paths": ["scoped/expected.md"],
+                    "expected_phrases": ["expected local phrase"]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let report = eval_command(&mut vec![
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--queries".into(),
+            queries.to_string_lossy().to_string(),
+            "--limit".into(),
+            "5".into(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let outcome = report["outcomes"]
+            .as_array()
+            .and_then(|outcomes| outcomes.first())
+            .expect("eval returns strict scope outcome");
+        assert_eq!(outcome.get("scope_tags"), Some(&json!(["batch3-scope"])));
+        assert_eq!(outcome.get("llm_calls").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            outcome.get("top_path").and_then(|v| v.as_str()),
+            Some("scoped/expected.md"),
+            "scope_tags must filter out untagged lexical decoys: {outcome}"
+        );
+        assert_eq!(outcome.get("rank").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            outcome.get("result_count").and_then(|v| v.as_u64()),
+            Some(1),
+            "strict scope must return only scoped results, not scoped hits plus unscoped decoys: {outcome}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn maintain_eval_fails_when_expected_phrase_evidence_is_missing() {
         let root = std::env::temp_dir().join(format!(
             "orderk-cli-maintain-phrase-{}-{}",
@@ -3189,6 +3350,80 @@ Temporal quality summary needle keeps evidence readable.
     }
 
     #[test]
+    fn sword_search_sidecar_loader_skips_incomplete_latest_run_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-cli-sidecar-loader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let runs = root.join(".orderk/sword_spirit/runs");
+        let complete = runs.join("sword-20260604T170659Z-1-1-0");
+        let incomplete = runs.join("sword-20260604T170700Z-2-2-0");
+        fs::create_dir_all(&complete).unwrap();
+        fs::create_dir_all(&incomplete).unwrap();
+        let proposal = test_sword_proposal(
+            "anchor.md",
+            "target.md",
+            0.9,
+            "complete older sidecar should survive a newer incomplete run dir",
+        );
+        fs::write(
+            complete.join("proposals.jsonl"),
+            format!("{}\n", serde_json::to_string(&proposal).unwrap()),
+        )
+        .unwrap();
+        fs::write(complete.join("rejected.jsonl"), "\n").unwrap();
+
+        let loaded = load_latest_sword_sidecar(&root).unwrap();
+
+        assert_eq!(loaded.run_id, "sword-20260604T170659Z-1-1-0");
+        assert_eq!(loaded.proposals.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sword_sidecar_relevant_boost_must_keep_original_base_top() {
+        let mut response = QueryResponse {
+            query: "karpathy engineering guardrail".to_string(),
+            query_id: "q_sword_top_guard".to_string(),
+            took_ms: 1,
+            mode: "hybrid".to_string(),
+            route: "short".to_string(),
+            routing: Default::default(),
+            vector_backend: "exact".to_string(),
+            explain: None,
+            optimizer: None,
+            results: vec![
+                test_result("expected.md", "expected-1", 1.000),
+                test_result("candidate.md", "candidate-1", 0.990),
+                test_result("other.md", "other-1", 0.970),
+            ],
+        };
+        let mut proposal = test_sword_proposal(
+            "expected.md",
+            "candidate.md",
+            0.99,
+            "karpathy engineering guardrail related sidecar hint",
+        );
+        proposal.evidence = vec![orderk_core::sword_spirit::SwordSpiritEvidence {
+            path: "candidate.md".to_string(),
+            kind: "test".to_string(),
+            value: "local sidecar evidence exists for the candidate".to_string(),
+        }];
+
+        let summary = apply_sword_sidecar_boosts(&mut response, &[proposal], 3);
+
+        assert!(summary.boosted_results > 0);
+        assert_eq!(
+            response.results[0].path, "expected.md",
+            "sidecar boosts are observational and must not demote the original base top hit"
+        );
+    }
+
+    #[test]
     fn sword_sidecar_boosts_must_not_demote_base_top_hit_or_collapse_file_diversity() {
         let mut response = QueryResponse {
             query: "exact target phrase".to_string(),
@@ -3259,6 +3494,54 @@ Temporal quality summary needle keeps evidence readable.
         assert_eq!(
             response.results[0].path, "z-base-top.md",
             "no-boost Sword search must not reorder equal-score base results by path"
+        );
+    }
+
+    #[test]
+    fn sword_sidecar_boost_requires_proposal_evidence_overlap_with_result() {
+        let mut response = QueryResponse {
+            query: "concept bridge cashflow asset".to_string(),
+            query_id: "q_sword_evidence_guard".to_string(),
+            took_ms: 1,
+            mode: "hybrid".to_string(),
+            route: "short".to_string(),
+            routing: Default::default(),
+            vector_backend: "exact".to_string(),
+            explain: None,
+            optimizer: None,
+            results: vec![
+                test_result("anchor.md", "anchor-1", 1.000),
+                test_result("candidate.md", "candidate-1", 0.980),
+                test_result("other.md", "other-1", 0.970),
+            ],
+        };
+        let mut proposal = test_sword_proposal(
+            "anchor.md",
+            "candidate.md",
+            0.99,
+            "concept bridge cashflow asset should not perturb ranking without local proposal evidence",
+        );
+        proposal.evidence = vec![orderk_core::sword_spirit::SwordSpiritEvidence {
+            path: "unrelated.md".to_string(),
+            kind: "test".to_string(),
+            value: "evidence disconnected from the current results".to_string(),
+        }];
+
+        let summary = apply_sword_sidecar_boosts(&mut response, &[proposal], 3);
+
+        assert_eq!(summary.boosted_results, 0, "proposal evidence must overlap with current result evidence before sidecar boost applies");
+        let candidate = response
+            .results
+            .iter()
+            .find(|result| result.path == "candidate.md")
+            .expect("candidate result remains present");
+        assert!(
+            !candidate
+                .evidence
+                .sources
+                .iter()
+                .any(|source| source == "sword_spirit_sidecar"),
+            "sidecar evidence marker must not be added for evidence-disconnected proposals: {candidate:#?}"
         );
     }
 

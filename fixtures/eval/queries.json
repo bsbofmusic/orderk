@@ -4,62 +4,112 @@
     {
       "id": "alpha-vector",
       "query": "alpha retrieval blade sqlite vec semantic search",
-      "expected_paths": ["projects/alpha.md"],
-      "expected_phrases": ["sqlite vec semantic search"]
+      "expected_paths": [
+        "projects/alpha.md"
+      ],
+      "expected_phrases": [
+        "sqlite vec semantic search"
+      ]
     },
     {
       "id": "bravo-npm-workspace",
       "query": "bravo obsidian plugin packaging npm workspace",
-      "expected_paths": ["projects/bravo.md"],
-      "expected_phrases": ["obsidian plugin packaging"]
+      "expected_paths": [
+        "projects/bravo.md"
+      ],
+      "expected_phrases": [
+        "obsidian plugin packaging"
+      ]
     },
     {
       "id": "quality-gates",
       "query": "retrieval quality eval gates maintenance reports recall ndcg mrr",
-      "expected_paths": ["quality/eval-gates.md"],
-      "expected_phrases": ["deterministic eval gates"]
+      "expected_paths": [
+        "quality/eval-gates.md"
+      ],
+      "expected_phrases": [
+        "deterministic eval gates"
+      ]
     },
     {
       "id": "release-resources",
       "query": "release gate resource baseline binary size daemon count",
-      "expected_paths": ["ops/release-gate.md"],
-      "expected_phrases": ["release gate resource baseline binary"]
+      "expected_paths": [
+        "ops/release-gate.md"
+      ],
+      "expected_phrases": [
+        "release gate resource baseline binary"
+      ]
     },
     {
       "id": "graph-depth",
       "query": "graph retrieval depth one hop wikilink expansion backlink joins",
-      "expected_paths": ["graph/link-depth.md"],
-      "expected_phrases": ["graph retrieval depth one hop wikilink expansion"]
+      "expected_paths": [
+        "graph/link-depth.md"
+      ],
+      "expected_phrases": [
+        "graph retrieval depth one hop wikilink expansion"
+      ]
     },
     {
       "id": "provider-surface",
       "query": "orderk provider surface scoped credentials redaction HERMES keys separate",
-      "expected_paths": ["provider/surface.md"],
-      "expected_phrases": ["orderk provider surface scoped credentials redaction"]
+      "expected_paths": [
+        "provider/surface.md"
+      ],
+      "expected_phrases": [
+        "orderk provider surface scoped credentials redaction"
+      ]
     },
     {
       "id": "query-py-smoke",
       "query": "query py vector smoke live marker user facing path",
-      "expected_paths": ["health/query-py-smoke.md"],
-      "expected_phrases": ["query.py through the user-facing path"]
+      "expected_paths": [
+        "health/query-py-smoke.md"
+      ],
+      "expected_phrases": [
+        "query.py through the user-facing path"
+      ]
     },
     {
       "id": "freshness-policy",
       "query": "freshness balanced as of stale metadata boost recency evidence",
-      "expected_paths": ["freshness/recency-policy.md"],
-      "expected_phrases": ["freshness balanced as of stale metadata boost"]
+      "expected_paths": [
+        "freshness/recency-policy.md"
+      ],
+      "expected_phrases": [
+        "freshness balanced as of stale metadata boost"
+      ]
     },
     {
       "id": "vector-degradation",
       "query": "vector layer unavailable explicit warning fallback text search",
-      "expected_paths": ["degradation/vector-fallback.md"],
-      "expected_phrases": ["vector layer unavailable explicit warning fallback"]
+      "expected_paths": [
+        "degradation/vector-fallback.md"
+      ],
+      "expected_phrases": [
+        "vector layer unavailable explicit warning fallback"
+      ]
     },
     {
       "id": "oral-query",
       "query": "chinese oral query second brain retrieval tea boss preference",
-      "expected_paths": ["oral/chinese-alias.md"],
-      "expected_phrases": ["chinese oral query second brain retrieval"]
+      "expected_paths": [
+        "oral/chinese-alias.md"
+      ],
+      "expected_phrases": [
+        "chinese oral query second brain retrieval"
+      ]
+    },
+    {
+      "id": "cashflow-concept-page",
+      "query": "现金流",
+      "expected_paths": [
+        "wiki/concepts/现金流.md"
+      ],
+      "expected_phrases": [
+        "现金流 是资金流入"
+      ]
     }
   ]
 }

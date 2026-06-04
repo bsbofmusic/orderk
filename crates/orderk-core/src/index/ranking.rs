@@ -350,13 +350,21 @@ pub(crate) fn refresh_result_summaries(result: &mut SearchResult) {
 
 pub(crate) fn sort_search_results(results: &mut [SearchResult]) {
     results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
+        finite_score_for_sort(b.score)
+            .partial_cmp(&finite_score_for_sort(a.score))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line_start.cmp(&b.line_start))
             .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
+}
+
+fn finite_score_for_sort(score: f32) -> f32 {
+    if score.is_finite() {
+        score
+    } else {
+        f32::NEG_INFINITY
+    }
 }
 
 pub(crate) fn apply_lexical_reranker(results: &mut [SearchResult], plan: &QueryPlan, query: &str) {
@@ -424,4 +432,57 @@ pub(crate) fn refresh_evidence_count(result: &mut SearchResult) {
         .map(|links| links.outgoing.len() + links.backlinks.len())
         .unwrap_or(0);
     result.evidence.evidence_count = result.evidence.sources.len() + link_count;
+}
+
+#[cfg(test)]
+mod ranking_tests {
+    use super::*;
+
+    fn test_result(path: &str, score: f32) -> SearchResult {
+        SearchResult {
+            chunk_id: format!("{path}#1"),
+            file_path: path.to_string(),
+            path: path.to_string(),
+            title: Some(path.to_string()),
+            heading: None,
+            line_start: 1,
+            line_end: 1,
+            evidence_uri: String::new(),
+            open_uri: String::new(),
+            snippet: path.to_string(),
+            score,
+            score_breakdown: Default::default(),
+            evidence: Default::default(),
+            quality: Default::default(),
+            evidence_summary: Default::default(),
+            context_chunks: Vec::new(),
+            tags: Vec::new(),
+            confidence: None,
+            status: None,
+            source_type: None,
+            validity: Default::default(),
+            valid_from: None,
+            valid_until: None,
+            supersedes: None,
+            superseded_by: None,
+            updated: None,
+            mtime: None,
+        }
+    }
+
+    #[test]
+    fn sort_search_results_demotes_non_finite_scores_below_finite_hits() {
+        let mut results = vec![
+            test_result("a-nan.md", f32::NAN),
+            test_result("b-inf.md", f32::INFINITY),
+            test_result("z-best-finite.md", 0.9),
+        ];
+
+        sort_search_results(&mut results);
+
+        assert_eq!(
+            results[0].path, "z-best-finite.md",
+            "non-finite scores must never win top rank through fallback path ordering: {results:#?}"
+        );
+    }
 }

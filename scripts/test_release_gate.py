@@ -21,6 +21,9 @@ class ReleaseGateStaticChecksTest(unittest.TestCase):
         self.assertIn("--all-targets", clippy_commands[0])
         self.assertIn("--all-features", clippy_commands[0])
 
+    def test_release_gate_runs_5topic_retrieval_non_regression_bench(self) -> None:
+        self.assertIn(["python3", "scripts/sword_5topic_hs_vs_v2_bench.py"], release_gate.COMMANDS)
+
     def test_npm_publish_workflow_checks_out_trigger_sha_for_workflow_run(self) -> None:
         workflow = RELEASE_GATE_MODULE_PATH.parents[1] / ".github" / "workflows" / "npm-publish.yml"
         text = workflow.read_text(encoding="utf-8")
