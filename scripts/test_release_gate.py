@@ -90,6 +90,18 @@ class ReleaseGateStaticChecksTest(unittest.TestCase):
         self.assertIn("packages/cli/vendor/orderk", result["stdout_tail"])
         self.assertIn("scripts/__pycache__/release_gate.cpython-312.pyc", result["stdout_tail"])
 
+    def test_package_cleanliness_allows_codegraph_local_index_but_not_other_logs(self) -> None:
+        repo = self.make_repo()
+        codegraph_log = repo / ".codegraph" / "daemon.log"
+        codegraph_log.parent.mkdir(parents=True)
+        codegraph_log.write_text("local codegraph daemon log\n", encoding="utf-8")
+        app_log = repo / "orderk.log"
+        app_log.write_text("runtime log\n", encoding="utf-8")
+        result = release_gate.check_package_cleanliness(repo)
+        self.assertFalse(result["ok"], result)
+        self.assertNotIn(".codegraph/daemon.log", result["stdout_tail"])
+        self.assertIn("orderk.log", result["stdout_tail"])
+
     def test_resource_baseline_rejects_oversized_binary(self) -> None:
         repo = self.make_repo()
         binary = repo / "target" / "release" / "orderk"

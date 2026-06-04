@@ -593,47 +593,70 @@ pub fn sword_spirit_status(vault: &Path) -> Result<SwordSpiritStatusResponse> {
 }
 
 pub fn default_sword_llm_provider() -> String {
-    env_string("ORDERK_SWORD_LLM_PROVIDER")
-        .or_else(|| env_string("HINDSIGHT_API_LLM_PROVIDER"))
-        .unwrap_or_else(|| DEFAULT_LLM_PROVIDER.to_string())
+    crate::profiles::resolve_sword_model_profile_from_env()
+        .map(|profile| profile.llm.provider)
+        .unwrap_or_else(|_| {
+            env_string("ORDERK_SWORD_LLM_PROVIDER")
+                .unwrap_or_else(|| DEFAULT_LLM_PROVIDER.to_string())
+        })
 }
 
 pub fn default_sword_llm_model() -> String {
-    env_string("ORDERK_SWORD_LLM_MODEL")
-        .or_else(|| env_string("HINDSIGHT_API_LLM_MODEL"))
-        .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string())
+    crate::profiles::resolve_sword_model_profile_from_env()
+        .map(|profile| profile.llm.model)
+        .unwrap_or_else(|_| {
+            env_string("ORDERK_SWORD_LLM_MODEL").unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string())
+        })
 }
 
 pub fn default_sword_reranker_provider() -> String {
-    env_string("ORDERK_SWORD_RERANKER_PROVIDER")
-        .or_else(|| env_string("HINDSIGHT_API_RERANKER_PROVIDER"))
-        .unwrap_or_else(|| DEFAULT_RERANKER_PROVIDER.to_string())
+    crate::profiles::resolve_sword_model_profile_from_env()
+        .map(|profile| profile.reranker.provider)
+        .unwrap_or_else(|_| {
+            env_string("ORDERK_SWORD_RERANKER_PROVIDER")
+                .unwrap_or_else(|| DEFAULT_RERANKER_PROVIDER.to_string())
+        })
 }
 
 pub fn default_sword_reranker_model() -> String {
-    env_string("ORDERK_SWORD_RERANKER_MODEL")
-        .or_else(|| env_string("HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL"))
-        .unwrap_or_else(|| DEFAULT_RERANKER_MODEL.to_string())
+    crate::profiles::resolve_sword_model_profile_from_env()
+        .map(|profile| profile.reranker.model)
+        .unwrap_or_else(|_| {
+            env_string("ORDERK_SWORD_RERANKER_MODEL")
+                .unwrap_or_else(|| DEFAULT_RERANKER_MODEL.to_string())
+        })
 }
 
 pub fn default_sword_embedding_provider() -> String {
-    env_string("ORDERK_SWORD_EMBEDDING_PROVIDER")
-        .or_else(|| env_string("ORDERK_EMBEDDING_PROVIDER"))
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_PROVIDER.to_string())
+    crate::profiles::resolve_sword_model_profile_from_env()
+        .map(|profile| profile.embedding.provider)
+        .unwrap_or_else(|_| {
+            env_string("ORDERK_SWORD_EMBEDDING_PROVIDER")
+                .or_else(|| env_string("ORDERK_EMBEDDING_PROVIDER"))
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_PROVIDER.to_string())
+        })
 }
 
 pub fn default_sword_embedding_model() -> String {
-    env_string("ORDERK_SWORD_EMBEDDING_MODEL")
-        .or_else(|| env_string("HINDSIGHT_API_EMBEDDING_SILICONFLOW_MODEL"))
-        .or_else(|| env_string("ORDERK_EMBEDDING_MODEL"))
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string())
+    crate::profiles::resolve_sword_model_profile_from_env()
+        .map(|profile| profile.embedding.model)
+        .unwrap_or_else(|_| {
+            env_string("ORDERK_SWORD_EMBEDDING_MODEL")
+                .or_else(|| env_string("ORDERK_EMBEDDING_MODEL"))
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string())
+        })
 }
 
 pub fn default_sword_embedding_dim() -> usize {
-    env_string("ORDERK_SWORD_EMBEDDING_DIM")
-        .or_else(|| env_string("ORDERK_EMBEDDING_DIM"))
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_EMBEDDING_DIM)
+    crate::profiles::resolve_sword_model_profile_from_env()
+        .ok()
+        .and_then(|profile| profile.embedding.dim)
+        .unwrap_or_else(|| {
+            env_string("ORDERK_SWORD_EMBEDDING_DIM")
+                .or_else(|| env_string("ORDERK_EMBEDDING_DIM"))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_EMBEDDING_DIM)
+        })
 }
 
 type SwordSpiritGeneratedOutput = (
@@ -1604,16 +1627,15 @@ impl SiliconFlowRerankerClient {
         Ok(Self {
             api_key: required_env_any(
                 &[
+                    "ORDERK_SWORD_RERANKER_SILICONFLOW_API_KEY",
                     "ORDERK_SWORD_RERANKER_API_KEY",
-                    "HERMES_SILICONFLOW_API_KEY",
                     "ORDERK_SILICONFLOW_API_KEY",
-                    "HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY",
                 ],
                 "SiliconFlow reranker",
             )?,
             model: model.trim().to_string(),
-            base_url: env_string("ORDERK_SWORD_RERANKER_BASE_URL")
-                .or_else(|| env_string("HINDSIGHT_API_RERANKER_SILICONFLOW_BASE_URL"))
+            base_url: env_string("ORDERK_SWORD_RERANKER_SILICONFLOW_BASE_URL")
+                .or_else(|| env_string("ORDERK_SWORD_RERANKER_BASE_URL"))
                 .unwrap_or_else(|| "https://api.siliconflow.cn/v1".to_string()),
         })
     }
@@ -1703,15 +1725,16 @@ impl AnthropicMiniMaxClient {
         Ok(Self {
             api_key: required_env_any(
                 &[
+                    "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY",
+                    "ORDERK_SWORD_LLM_MINIMAX_API_KEY",
                     "ORDERK_SWORD_LLM_API_KEY",
-                    "HERMES_MINIMAX_API_KEY",
-                    "HINDSIGHT_API_LLM_API_KEY",
                 ],
                 "Anthropic-compatible MiniMax M3",
             )?,
             model: model.trim().to_string(),
-            base_url: env_string("ORDERK_SWORD_LLM_BASE_URL")
-                .or_else(|| env_string("HINDSIGHT_API_LLM_BASE_URL"))
+            base_url: env_string("ORDERK_SWORD_LLM_ANTHROPIC_BASE_URL")
+                .or_else(|| env_string("ORDERK_SWORD_LLM_MINIMAX_BASE_URL"))
+                .or_else(|| env_string("ORDERK_SWORD_LLM_BASE_URL"))
                 .unwrap_or_else(|| "https://api.minimaxi.com/anthropic".to_string()),
             calls: 0,
         })
@@ -2467,7 +2490,70 @@ fn required_env_any(names: &[&str], label: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::scanner::scan_vault;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const SWORD_RUNTIME_ENV_NAMES: &[&str] = &[
+        "ORDERK_SWORD_LLM_PROVIDER",
+        "ORDERK_SWORD_LLM_MODEL",
+        "ORDERK_SWORD_LLM_API_KEY",
+        "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY",
+        "ORDERK_SWORD_LLM_ANTHROPIC_BASE_URL",
+        "ORDERK_SWORD_LLM_MINIMAX_API_KEY",
+        "ORDERK_SWORD_LLM_MINIMAX_BASE_URL",
+        "ORDERK_SWORD_LLM_BASE_URL",
+        "ORDERK_SWORD_RERANKER_PROVIDER",
+        "ORDERK_SWORD_RERANKER_MODEL",
+        "ORDERK_SWORD_RERANKER_API_KEY",
+        "ORDERK_SWORD_RERANKER_SILICONFLOW_API_KEY",
+        "ORDERK_SWORD_RERANKER_SILICONFLOW_BASE_URL",
+        "ORDERK_SWORD_RERANKER_BASE_URL",
+        "ORDERK_SWORD_EMBEDDING_PROVIDER",
+        "ORDERK_SWORD_EMBEDDING_MODEL",
+        "ORDERK_SWORD_EMBEDDING_DIM",
+        "ORDERK_EMBEDDING_PROVIDER",
+        "ORDERK_EMBEDDING_MODEL",
+        "ORDERK_EMBEDDING_DIM",
+        "ORDERK_SILICONFLOW_API_KEY",
+        "HERMES_MINIMAX_API_KEY",
+        "HERMES_SILICONFLOW_API_KEY",
+        "HINDSIGHT_API_LLM_API_KEY",
+        "HINDSIGHT_API_LLM_PROVIDER",
+        "HINDSIGHT_API_LLM_MODEL",
+        "HINDSIGHT_API_LLM_BASE_URL",
+        "HINDSIGHT_API_RERANKER_PROVIDER",
+        "HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY",
+        "HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL",
+        "HINDSIGHT_API_RERANKER_SILICONFLOW_BASE_URL",
+        "HINDSIGHT_API_EMBEDDING_SILICONFLOW_MODEL",
+    ];
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn with_clean_sword_runtime_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = env_lock();
+        let saved = SWORD_RUNTIME_ENV_NAMES
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in SWORD_RUNTIME_ENV_NAMES {
+            std::env::remove_var(name);
+        }
+        let result = f();
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        result
+    }
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2480,6 +2566,89 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn sword_spirit_runtime_ignores_non_orderk_provider_env_names() {
+        with_clean_sword_runtime_env(|| {
+            std::env::set_var("HERMES_MINIMAX_API_KEY", "hermes-minimax-secret");
+            std::env::set_var("HERMES_SILICONFLOW_API_KEY", "hermes-sf-secret");
+            std::env::set_var("HINDSIGHT_API_LLM_API_KEY", "hindsight-llm-secret");
+            std::env::set_var("HINDSIGHT_API_LLM_PROVIDER", "disabled");
+            std::env::set_var("HINDSIGHT_API_LLM_MODEL", "hindsight-llm-model");
+            std::env::set_var(
+                "HINDSIGHT_API_LLM_BASE_URL",
+                "https://hindsight.example/llm",
+            );
+            std::env::set_var("HINDSIGHT_API_RERANKER_PROVIDER", "disabled");
+            std::env::set_var(
+                "HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY",
+                "hindsight-reranker-secret",
+            );
+            std::env::set_var(
+                "HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL",
+                "hindsight-reranker-model",
+            );
+            std::env::set_var(
+                "HINDSIGHT_API_RERANKER_SILICONFLOW_BASE_URL",
+                "https://hindsight.example/reranker",
+            );
+            std::env::set_var(
+                "HINDSIGHT_API_EMBEDDING_SILICONFLOW_MODEL",
+                "hindsight-embedding-model",
+            );
+
+            assert_eq!(default_sword_llm_provider(), DEFAULT_LLM_PROVIDER);
+            assert_eq!(default_sword_llm_model(), DEFAULT_LLM_MODEL);
+            assert_eq!(default_sword_reranker_provider(), DEFAULT_RERANKER_PROVIDER);
+            assert_eq!(default_sword_reranker_model(), DEFAULT_RERANKER_MODEL);
+            assert_eq!(default_sword_embedding_model(), DEFAULT_EMBEDDING_MODEL);
+
+            let llm_err = AnthropicMiniMaxClient::from_env("fixture-model")
+                .expect_err("LLM client must not consume Hermes/Hindsight env keys")
+                .to_string();
+            assert!(llm_err.contains("ORDERK_SWORD_LLM_API_KEY"), "{llm_err}");
+            assert!(!llm_err.contains("HERMES"), "{llm_err}");
+            assert!(!llm_err.contains("HINDSIGHT"), "{llm_err}");
+
+            let reranker_err = SiliconFlowRerankerClient::from_env("fixture-model")
+                .expect_err("reranker client must not consume Hermes/Hindsight env keys")
+                .to_string();
+            assert!(
+                reranker_err.contains("ORDERK_SWORD_RERANKER_API_KEY")
+                    || reranker_err.contains("ORDERK_SILICONFLOW_API_KEY"),
+                "{reranker_err}"
+            );
+            assert!(!reranker_err.contains("HERMES"), "{reranker_err}");
+            assert!(!reranker_err.contains("HINDSIGHT"), "{reranker_err}");
+        });
+    }
+
+    #[test]
+    fn sword_spirit_active_clients_accept_profile_specific_orderk_key_names() {
+        with_clean_sword_runtime_env(|| {
+            std::env::set_var(
+                "ORDERK_SWORD_RERANKER_SILICONFLOW_API_KEY",
+                "profile-reranker-key",
+            );
+            std::env::set_var(
+                "ORDERK_SWORD_RERANKER_SILICONFLOW_BASE_URL",
+                "https://sf.example/v1",
+            );
+            std::env::set_var("ORDERK_SWORD_LLM_ANTHROPIC_API_KEY", "profile-llm-key");
+            std::env::set_var(
+                "ORDERK_SWORD_LLM_ANTHROPIC_BASE_URL",
+                "https://llm.example/anthropic",
+            );
+
+            let reranker = SiliconFlowRerankerClient::from_env("rerank-model").unwrap();
+            assert_eq!(reranker.api_key, "profile-reranker-key");
+            assert_eq!(reranker.base_url, "https://sf.example/v1");
+
+            let llm = AnthropicMiniMaxClient::from_env("llm-model").unwrap();
+            assert_eq!(llm.api_key, "profile-llm-key");
+            assert_eq!(llm.base_url, "https://llm.example/anthropic");
+        });
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::scanner::scan_vault;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
@@ -44,6 +45,7 @@ fn build_query_explain_trace(
         route: routing.route.clone(),
         strategy: routing.strategy.clone(),
         vector_backend: vector_backend.to_string(),
+        embedding_profile_fingerprint: routing.embedding_profile_fingerprint.clone(),
         limit,
         returned: results.len(),
         filter: routing.filter.clone(),
@@ -96,6 +98,23 @@ fn build_query_explain_trace(
             })
             .collect(),
     }
+}
+
+fn compute_embedding_profile_fingerprint(
+    provider_id: &str,
+    model_id: &str,
+    dimension: usize,
+    vector_backend: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(provider_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(model_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(dimension.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(vector_backend.as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 pub struct IndexStore {
@@ -424,6 +443,12 @@ impl IndexStore {
             provider.model_id(),
             vector_backend,
         )?;
+        let embedding_profile_fingerprint = compute_embedding_profile_fingerprint(
+            provider.provider_id(),
+            provider.model_id(),
+            provider.dimension(),
+            vector_backend.as_str(),
+        );
         let (mut results, mut routing) = match vector_backend {
             VectorBackend::SqliteVec => query_hybrid(
                 conn,
@@ -444,6 +469,7 @@ impl IndexStore {
                 options.rerank,
             )?,
         };
+        routing.embedding_profile_fingerprint = Some(embedding_profile_fingerprint);
         routing.query_expansion = options.query_expansion;
         routing.query_expansion_terms = plan.expanded_terms.clone();
         routing.external_reranker = options.external_reranker;
@@ -871,6 +897,7 @@ mod tests {
             &VectorBackend::Exact,
         )
         .unwrap();
+        let routing_fingerprint = with_explain.routing.embedding_profile_fingerprint.clone();
         let explain = with_explain
             .explain
             .expect("--explain should include a trace");
@@ -879,6 +906,11 @@ mod tests {
         assert!(explain.stages.iter().any(|stage| stage.name == "merge"));
         assert_eq!(explain.returned, with_explain.results.len());
         assert_eq!(explain.route, with_explain.route);
+        assert_eq!(explain.embedding_profile_fingerprint, routing_fingerprint);
+        assert!(explain
+            .embedding_profile_fingerprint
+            .as_deref()
+            .is_some_and(|value| value.starts_with("sha256:")));
 
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);

@@ -184,7 +184,7 @@ pub fn health_report(
             if status_ref.embedding_dim != embedding_dim {
                 checks.push(HealthCheck::fail(
                     "embedding_dim",
-                    ErrorCode::EProfileMismatch,
+                    ErrorCode::EEmbeddingDimensionMismatch,
                     format!(
                         "embedding dimension mismatch: existing {}, expected {}",
                         status_ref.embedding_dim, embedding_dim

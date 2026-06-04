@@ -75,6 +75,16 @@ DANGEROUS_PACKAGE_PREFIXES = (
     "node_modules/",
     "packages/cli/vendor/",
 )
+LOCAL_TOOLING_PREFIX_EXCLUDES = (
+    ".git/",
+    ".codegraph/",
+    "target/",
+    "node_modules/",
+)
+PACKAGE_DIRECT_PREFIX_EXCLUDES = (
+    ".git/",
+    ".codegraph/",
+)
 DANGEROUS_PACKAGE_PARTS = {"__pycache__"}
 
 
@@ -192,7 +202,7 @@ def check_secret_scan(repo: pathlib.Path = REPO, files: Iterable[pathlib.Path] |
     for rel in scan_files:
         rel = pathlib.Path(rel)
         rel_text = rel.as_posix()
-        if rel.name in SECRET_SCAN_EXCLUDES or rel_text.startswith(("target/", "node_modules/", ".git/")):
+        if rel.name in SECRET_SCAN_EXCLUDES or rel_text.startswith(LOCAL_TOOLING_PREFIX_EXCLUDES):
             continue
         path = repo / rel
         if not path.is_file():
@@ -219,6 +229,8 @@ def check_package_cleanliness(repo: pathlib.Path = REPO, files: Iterable[pathlib
     for rel in scan_files:
         rel_path = pathlib.Path(rel)
         rel_text = rel_path.as_posix()
+        if rel_text.startswith(PACKAGE_DIRECT_PREFIX_EXCLUDES):
+            continue
         if (
             rel_text.startswith(DANGEROUS_PACKAGE_PREFIXES)
             or rel_text.endswith(DANGEROUS_PACKAGE_SUFFIXES)
@@ -234,7 +246,7 @@ def check_package_cleanliness(repo: pathlib.Path = REPO, files: Iterable[pathlib
         for pattern in ("*.sqlite", "*.sqlite-shm", "*.sqlite-wal", "*.log"):
             for path in repo.rglob(pattern):
                 rel_text = path.relative_to(repo).as_posix()
-                if not rel_text.startswith((".git/", "target/", "node_modules/")):
+                if not rel_text.startswith(LOCAL_TOOLING_PREFIX_EXCLUDES):
                     dangerous.append(rel_text)
     return make_result(
         "package_cleanliness",

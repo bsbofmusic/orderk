@@ -511,6 +511,8 @@ pub struct QueryRoutingEvidence {
     pub strategy: String,
     pub route: String,
     pub routes_attempted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile_fingerprint: Option<String>,
     pub filter: Option<String>,
     pub filter_mode: Option<String>,
     pub filtered_candidates: Option<usize>,
@@ -560,6 +562,8 @@ pub struct QueryExplainTrace {
     pub route: String,
     pub strategy: String,
     pub vector_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile_fingerprint: Option<String>,
     pub limit: usize,
     pub returned: usize,
     pub filter: Option<String>,

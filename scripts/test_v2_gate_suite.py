@@ -268,10 +268,145 @@ class V2GateSuiteTests(unittest.TestCase):
             self.assertIn("search_required_mismatch", joined)
             self.assertIn("proposal_required_mismatch", joined)
 
+    def test_raw_secret_safety_gate_rejects_literal_secret_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            leaked = root / "leaked.py"
+            token = "sk-" + "test-secret-value-1234567890"
+            leaked.write_text(f'API_KEY = "{token}"\n', encoding="utf-8")
+            result = v2_gate_suite.raw_secret_safety_gate(root, [pathlib.Path("leaked.py")])
+            self.assertFalse(result["ok"], result)
+            self.assertTrue(any("secret_assignment" in item or "provider_token" in item for item in result["failures"]), result)
+
+    def test_raw_secret_safety_gate_allows_explicit_test_fixture_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            fixture = root / "fixture.py"
+            token = "sk-" + "test-secret-value-1234567890"
+            fixture.write_text(
+                f'API_KEY = "{token}"  # ALLOW_RAW_SECRET_TEST_FIXTURE\n',
+                encoding="utf-8",
+            )
+            result = v2_gate_suite.raw_secret_safety_gate(root, [pathlib.Path("fixture.py")])
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["metrics"]["findings"], [])
+
+
+    def test_raw_secret_safety_gate_rejects_raw_hash_markers_in_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            artifact = root / "audit-report.json"
+            artifact.write_text(
+                '{"raw_sha256":"' + ("a" * 64) + '"}\n',
+                encoding="utf-8",
+            )
+            result = v2_gate_suite.raw_secret_safety_gate(root, [pathlib.Path("audit-report.json")])
+            self.assertFalse(result["ok"], result)
+            self.assertGreaterEqual(result["metrics"]["artifact_files_scanned"], 1)
+            self.assertEqual(result["metrics"]["raw_hash_markers"], 1)
+            self.assertTrue(any("raw_hash_marker" in item for item in result["failures"]), result)
+
     def test_unknown_gate_name_fails_even_when_mixed_with_known_gate(self) -> None:
         suite = v2_gate_suite.run_requested_gates({"fixture-integrity", "typo"}, DEFAULT_FOR_TEST=True)
         self.assertFalse(suite["ok"], suite)
         self.assertIn("unknown_gate", suite["claims_denied"])
+
+    def test_batch2_plan_gate_names_are_supported_without_unknown_gate(self) -> None:
+        suite = v2_gate_suite.run_requested_gates({"profile", "raw-secret", "doctor"}, DEFAULT_FOR_TEST=True)
+        self.assertNotIn("unknown_gate", suite["claims_denied"], suite)
+        self.assertEqual(
+            [gate["gate_id"] for gate in suite["gates"]],
+            ["profile", "raw_secret_safety", "doctor"],
+        )
+
+    def test_gate_aliases_normalize_plan_and_cli_spellings(self) -> None:
+        self.assertEqual(v2_gate_suite.normalize_gate_name("raw_secret"), "raw-secret-safety")
+        self.assertEqual(v2_gate_suite.normalize_gate_name("model-profile"), "profile")
+        self.assertEqual(v2_gate_suite.normalize_gate_name("doctor-status"), "doctor")
+
+    def test_rust_runtime_text_strips_cfg_test_items_only(self) -> None:
+        source = """
+fn runtime_before() { let _ = \"ORDERK_SWORD_LLM_API_KEY\"; }
+#[cfg(test)]
+fn test_helper() { let _ = \"HERMES_MINIMAX_API_KEY\"; }
+fn runtime_after() { let _ = \"ORDERK_SWORD_RERANKER_API_KEY\"; }
+#[cfg(test)]
+const TEST_ONLY_OLD_ENV: &str = \"HINDSIGHT_API_RERANKER_PROVIDER\";
+fn runtime_after_const() { let _ = \"ORDERK_SWORD_EMBEDDING_MODEL\"; }
+#[cfg(test)]
+mod tests { fn keeps_forbidden_only_in_tests() { let _ = \"HINDSIGHT_API_LLM_API_KEY\"; } }
+"""
+        runtime = v2_gate_suite.rust_runtime_text(source)
+        self.assertIn("runtime_before", runtime)
+        self.assertIn("runtime_after", runtime)
+        self.assertIn("runtime_after_const", runtime)
+        self.assertNotIn("HERMES_", runtime)
+        self.assertNotIn("HINDSIGHT_API_", runtime)
+
+    def test_profile_gate_rejects_forbidden_runtime_env_names_but_allows_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "crates/orderk-core/src").mkdir(parents=True)
+            (root / "crates/orderk-cli/src").mkdir(parents=True)
+            (root / "crates/orderk-core/src/profiles.rs").write_text(
+                "\n".join(
+                    [
+                        "pub enum SwordModelKind { Embedding, Reranker, Llm }",
+                        "pub struct SwordModelSlot; pub struct SwordModelProfile;",
+                        "fn resolve_sword_model_profile_from_env() {}",
+                        "fn resolve_sword_model_slot_from_env() {}",
+                        "const _: &str = \"ORDERK_SWORD_EMBEDDING_PROVIDER\";",
+                        "const _: &str = \"ORDERK_SWORD_RERANKER_PROVIDER\";",
+                        "const _: &str = \"ORDERK_SWORD_LLM_PROVIDER\";",
+                        "fn profile_fingerprint() {}",
+                        "const _: &str = \"unknown embedding provider\";",
+                        "const _: &str = \"unknown reranker provider\";",
+                        "const _: &str = \"unknown llm provider\";",
+                        "fn slot_provider_resolves_siliconflow_embedding_with_explicit_env() {}",
+                        "fn slot_provider_resolves_openai_embedding_when_provider_openai() {}",
+                        "fn slot_provider_errors_on_unknown_provider() {}",
+                        "fn slot_provider_default_falls_back_to_legacy_default_sword_paths() {}",
+                        "fn slot_profile_ignores_non_orderk_provider_env_names() {}",
+                        "fn slot_provider_independent_per_kind() {}",
+                        "#[cfg(test)] fn negative_test_can_name_old_env() { let _ = \"HERMES_MINIMAX_API_KEY\"; }",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (root / "crates/orderk-core/src/sword_spirit.rs").write_text(
+                "\n".join(
+                    [
+                        "const _: &str = \"ORDERK_SWORD_RERANKER_SILICONFLOW_API_KEY\";",
+                        "const _: &str = \"ORDERK_SWORD_RERANKER_SILICONFLOW_BASE_URL\";",
+                        "const _: &str = \"ORDERK_SWORD_LLM_ANTHROPIC_API_KEY\";",
+                        "const _: &str = \"ORDERK_SWORD_LLM_MINIMAX_API_KEY\";",
+                        "const _: &str = \"ORDERK_SWORD_LLM_ANTHROPIC_BASE_URL\";",
+                        "const _: &str = \"ORDERK_SWORD_LLM_MINIMAX_BASE_URL\";",
+                        "fn sword_spirit_active_clients_accept_profile_specific_orderk_key_names() {}",
+                        "#[cfg(test)] const TEST_ONLY_OLD_ENV: &str = \"HERMES_SILICONFLOW_API_KEY\";",
+                        'fn runtime() { let _ = "HINDSIGHT_API_LLM_PROVIDER"; }',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (root / "crates/orderk-core/src/api.rs").write_text(
+                '#[cfg(test)] fn api_negative_test() { let _ = "HERMES_SILICONFLOW_API_KEY"; }\n',
+                encoding="utf-8",
+            )
+            (root / "crates/orderk-core/src/lib.rs").write_text(
+                "pub mod profiles; use profiles::resolve_sword_model_profile_from_env;\n",
+                encoding="utf-8",
+            )
+            (root / "crates/orderk-cli/src/main.rs").write_text(
+                "resolve_sword_model_profile_from_env sword_run_defaults_use_sword_model_profile_slots cli_profile_uses_sword_vendor_specific_model_dim_and_vector_backend\n",
+                encoding="utf-8",
+            )
+            result = v2_gate_suite.profile_gate(root)
+            self.assertFalse(result["ok"], result)
+            self.assertIn(
+                "runtime_forbidden_env_namespace:sword_spirit.rs:HINDSIGHT_API_",
+                "\n".join(result["failures"]),
+            )
 
 
 if __name__ == "__main__":

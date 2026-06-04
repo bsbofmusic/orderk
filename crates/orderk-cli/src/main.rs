@@ -1,11 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use orderk_core::{
-    classify_error_message, default_sword_embedding_dim, default_sword_embedding_model,
-    default_sword_embedding_provider, default_sword_llm_model, default_sword_llm_provider,
-    default_sword_reranker_model, default_sword_reranker_provider, export_capsule_manifest,
-    feedback, get_chunks, health_report, index_vault_with_options, init, inspect_capsule_manifest,
-    optimize_apply, optimize_dry_run, optimize_reset, optimize_set, optimize_status,
-    provider_from_name, query, query_with_options, run_sword_spirit, status, sword_spirit_status,
+    classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
+    index_vault_with_options, init, inspect_capsule_manifest, optimize_apply, optimize_dry_run,
+    optimize_reset, optimize_set, optimize_status, provider_from_name, query, query_with_options,
+    resolve_sword_model_profile_from_env, run_sword_spirit, status, sword_spirit_status,
     write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider, FeedbackEvent,
     FreshnessMode, IndexOptions, QueryOptions, QueryResponse, SearchIndexResponse,
     SwordSpiritBudgetProfile, SwordSpiritOptions, SwordSpiritProposal, SwordSpiritThinkingMode,
@@ -327,21 +325,26 @@ fn sword_spirit_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                 "--thinking",
                 "heuristic".to_string(),
             )?)?;
+            let sword_profile = resolve_sword_model_profile_from_env()?;
             let llm_provider = take_optional_string(args, "--llm-provider")?
                 .or(take_optional_string(args, "--model-provider")?)
-                .unwrap_or_else(default_sword_llm_provider);
+                .unwrap_or_else(|| sword_profile.llm.provider.clone());
             let llm_model = take_optional_string(args, "--llm-model")?
                 .or(take_optional_string(args, "--model")?)
-                .unwrap_or_else(default_sword_llm_model);
+                .unwrap_or_else(|| sword_profile.llm.model.clone());
             let reranker_provider = take_optional_string(args, "--reranker-provider")?
-                .unwrap_or_else(default_sword_reranker_provider);
+                .unwrap_or_else(|| sword_profile.reranker.provider.clone());
             let reranker_model = take_optional_string(args, "--reranker-model")?
-                .unwrap_or_else(default_sword_reranker_model);
+                .unwrap_or_else(|| sword_profile.reranker.model.clone());
             let embedding_provider = take_optional_string(args, "--embedding-provider")?
-                .unwrap_or_else(default_sword_embedding_provider);
+                .unwrap_or_else(|| sword_profile.embedding.provider.clone());
             let embedding_model = take_optional_string(args, "--embedding-model")?
-                .unwrap_or_else(default_sword_embedding_model);
-            let embedding_dim = take_usize(args, "--embedding-dim", default_sword_embedding_dim())?;
+                .unwrap_or_else(|| sword_profile.embedding.model.clone());
+            let embedding_dim = take_usize(
+                args,
+                "--embedding-dim",
+                sword_profile.embedding.dim.unwrap_or(DEFAULT_EMBEDDING_DIM),
+            )?;
             let budget_profile = SwordSpiritBudgetProfile::parse(&take_string(
                 args,
                 "--budget-profile",
@@ -733,7 +736,7 @@ fn capsule_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     }
 }
 
-fn health_like_command(args: &mut Vec<String>, _doctor: bool) -> Result<serde_json::Value> {
+fn health_like_command(args: &mut Vec<String>, doctor: bool) -> Result<serde_json::Value> {
     let db = take_path(args, "--db")?;
     let vault = take_optional_string(args, "--vault")?.map(PathBuf::from);
     let profile = resolve_embedding_profile(args, Some(&db))?;
@@ -754,7 +757,17 @@ fn health_like_command(args: &mut Vec<String>, _doctor: bool) -> Result<serde_js
         &profile.vector_backend,
         smoke_query.as_deref(),
     );
-    Ok(serde_json::to_value(report)?)
+    let mut value = serde_json::to_value(report)?;
+    if doctor {
+        value["doctor_schema_version"] = json!("orderk.doctor.v1");
+        value["model_profile"] = serde_json::to_value(resolve_sword_model_profile_from_env()?)?;
+        value["model_profile_redaction"] = json!({
+            "secret_values": "never_serialized",
+            "api_key_env": "env_name_only",
+            "profile_fingerprint": "hash_excludes_secret_values"
+        });
+    }
+    Ok(value)
 }
 
 fn optimize_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
@@ -1746,6 +1759,7 @@ fn resolve_embedding_profile(
 ) -> Result<CliEmbeddingProfile> {
     let db_profile = db.and_then(existing_db_profile);
     let embedding_provider = take_optional_string(args, "--embedding-provider")?
+        .or_else(|| env_string("ORDERK_SWORD_EMBEDDING_PROVIDER"))
         .or_else(|| env_string("ORDERK_EMBEDDING_PROVIDER"))
         .or_else(|| {
             db_profile
@@ -1753,11 +1767,23 @@ fn resolve_embedding_profile(
                 .map(|profile| profile.embedding_provider.clone())
         })
         .unwrap_or_else(|| DEFAULT_EMBEDDING_PROVIDER.to_string());
+    let provider_env_suffix = embedding_provider
+        .trim()
+        .to_ascii_uppercase()
+        .replace('-', "_");
     let embedding_dim = take_optional_usize(args, "--embedding-dim")?
+        .or_else(|| env_usize(&format!("ORDERK_SWORD_EMBEDDING_{provider_env_suffix}_DIM")))
+        .or_else(|| env_usize("ORDERK_SWORD_EMBEDDING_DIM"))
         .or_else(|| env_usize("ORDERK_EMBEDDING_DIM"))
         .or_else(|| db_profile.as_ref().map(|profile| profile.embedding_dim))
         .unwrap_or(DEFAULT_EMBEDDING_DIM);
     let embedding_model = take_optional_string(args, "--embedding-model")?
+        .or_else(|| {
+            env_string(&format!(
+                "ORDERK_SWORD_EMBEDDING_{provider_env_suffix}_MODEL"
+            ))
+        })
+        .or_else(|| env_string("ORDERK_SWORD_EMBEDDING_MODEL"))
         .or_else(|| env_string("ORDERK_EMBEDDING_MODEL"))
         .or_else(|| {
             db_profile
@@ -1766,6 +1792,7 @@ fn resolve_embedding_profile(
         })
         .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
     let vector_backend = take_optional_string(args, "--vector-backend")?
+        .or_else(|| env_string("ORDERK_SWORD_VECTOR_BACKEND"))
         .or_else(|| env_string("ORDERK_VECTOR_BACKEND"))
         .or_else(|| {
             db_profile
@@ -2021,6 +2048,8 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                 },
             )?)?)
         }
+        "health" => health_like_command(&mut args, false),
+        "doctor" => health_like_command(&mut args, true),
         "optimize" => optimize_command(&mut args),
         "capsule" => capsule_command(&mut args),
         "sword" | "sword-spirit" => sword_spirit_command(&mut args),
@@ -2112,6 +2141,359 @@ struct EvalResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    const DOCTOR_ENV_NAMES: &[&str] = &[
+        "ORDERK_SWORD_EMBEDDING_PROVIDER",
+        "ORDERK_SWORD_EMBEDDING_MODEL",
+        "ORDERK_SWORD_EMBEDDING_DIM",
+        "ORDERK_SWORD_EMBEDDING_SILICONFLOW_MODEL",
+        "ORDERK_SWORD_EMBEDDING_SILICONFLOW_DIM",
+        "ORDERK_SWORD_EMBEDDING_SILICONFLOW_API_KEY",
+        "ORDERK_SWORD_EMBEDDING_OPENAI_MODEL",
+        "ORDERK_SWORD_EMBEDDING_OPENAI_DIM",
+        "ORDERK_SWORD_EMBEDDING_OPENAI_API_KEY",
+        "ORDERK_SWORD_VECTOR_BACKEND",
+        "ORDERK_EMBEDDING_PROVIDER",
+        "ORDERK_EMBEDDING_MODEL",
+        "ORDERK_EMBEDDING_DIM",
+        "ORDERK_EMBEDDING_API_KEY",
+        "ORDERK_EMBEDDING_BASE_URL",
+        "ORDERK_SILICONFLOW_API_KEY",
+        "ORDERK_SILICONFLOW_BASE_URL",
+        "ORDERK_OPENAI_API_KEY",
+        "ORDERK_OPENAI_BASE_URL",
+        "ORDERK_VECTOR_BACKEND",
+        "ORDERK_SWORD_RERANKER_PROVIDER",
+        "ORDERK_SWORD_RERANKER_SILICONFLOW_API_KEY",
+        "ORDERK_SWORD_LLM_PROVIDER",
+        "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY",
+        "ORDERK_SWORD_LLM_MINIMAX_API_KEY",
+    ];
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn with_clean_doctor_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = env_lock();
+        let saved = DOCTOR_ENV_NAMES
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in DOCTOR_ENV_NAMES {
+            std::env::remove_var(name);
+        }
+        let result = f();
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        result
+    }
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "orderk-{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_minimal_vault(root: &Path) -> (PathBuf, PathBuf) {
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("wealth.md"),
+            "# Wealth\nCashflow assets compound when profits buy more productive assets.\n",
+        )
+        .unwrap();
+        (vault, root.join("orderk.sqlite"))
+    }
+
+    fn index_mock_vault(vault: &Path, db: &Path, dim: usize, model: &str) {
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            dim.to_string(),
+            "--embedding-model".into(),
+            model.to_string(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn sword_run_defaults_use_sword_model_profile_slots() {
+        with_clean_doctor_env(|| {
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_PROVIDER", "mock");
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_MODEL", "mock-13");
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_DIM", "13");
+            std::env::set_var("ORDERK_SWORD_RERANKER_PROVIDER", "disabled");
+            std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "disabled");
+
+            let root = temp_root("sword-run-profile-slots");
+            let (vault, _db) = write_minimal_vault(&root);
+            let report = run_with_args(vec![
+                "sword".into(),
+                "run".into(),
+                "--vault".into(),
+                vault.to_string_lossy().to_string(),
+                "--max-files".into(),
+                "1".into(),
+                "--max-proposals".into(),
+                "1".into(),
+                "--thinking".into(),
+                "heuristic".into(),
+            ])
+            .unwrap();
+            assert_eq!(
+                report
+                    .pointer("/thinking/embedding_provider")
+                    .and_then(|v| v.as_str()),
+                Some("mock")
+            );
+            assert_eq!(
+                report
+                    .pointer("/thinking/embedding_model")
+                    .and_then(|v| v.as_str()),
+                Some("mock-13")
+            );
+            assert_eq!(
+                report
+                    .pointer("/thinking/embedding_dim")
+                    .and_then(|v| v.as_u64()),
+                Some(13)
+            );
+            assert_eq!(
+                report
+                    .pointer("/thinking/reranker_provider")
+                    .and_then(|v| v.as_str()),
+                Some("disabled")
+            );
+            assert_eq!(
+                report.pointer("/llm/provider").and_then(|v| v.as_str()),
+                Some("disabled")
+            );
+            let _ = fs::remove_dir_all(root);
+        });
+    }
+
+    #[test]
+    fn cli_profile_uses_sword_vendor_specific_model_dim_and_vector_backend() {
+        with_clean_doctor_env(|| {
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_PROVIDER", "siliconflow");
+            std::env::set_var(
+                "ORDERK_SWORD_EMBEDDING_SILICONFLOW_MODEL",
+                "fixture-sf-model",
+            );
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_SILICONFLOW_DIM", "19");
+            std::env::set_var("ORDERK_SWORD_VECTOR_BACKEND", "exact");
+            let mut args = Vec::<String>::new();
+            let profile = resolve_embedding_profile(&mut args, None)
+                .expect("SWORD vendor-specific profile should resolve");
+            assert_eq!(profile.embedding_provider, "siliconflow");
+            assert_eq!(profile.embedding_model, "fixture-sf-model");
+            assert_eq!(profile.embedding_dim, 19);
+            assert_eq!(profile.vector_backend, VectorBackend::Exact);
+        });
+    }
+
+    #[test]
+    fn doctor_surfaces_missing_sword_provider_key_without_secret_values() {
+        with_clean_doctor_env(|| {
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_PROVIDER", "siliconflow");
+            std::env::set_var(
+                "ORDERK_SWORD_EMBEDDING_SILICONFLOW_MODEL",
+                "fixture-sf-model",
+            );
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_SILICONFLOW_DIM", "8");
+            std::env::set_var("ORDERK_SWORD_RERANKER_PROVIDER", "disabled");
+            std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "disabled");
+
+            let root = temp_root("doctor-missing-provider-key");
+            let (vault, db) = write_minimal_vault(&root);
+            index_mock_vault(&vault, &db, 8, "mock-8");
+
+            let report = run_with_args(vec![
+                "doctor".into(),
+                "--db".into(),
+                db.to_string_lossy().to_string(),
+            ])
+            .unwrap();
+            assert_eq!(report.get("ok").and_then(|v| v.as_bool()), Some(false));
+            let serialized = serde_json::to_string(&report).unwrap();
+            assert!(serialized.contains("ORDERK_SWORD_EMBEDDING_SILICONFLOW_API_KEY"));
+            assert!(!serialized.contains("fixture-secret"));
+            let codes = report
+                .get("error_codes")
+                .and_then(|v| v.as_array())
+                .expect("doctor should expose error_codes");
+            assert!(codes
+                .iter()
+                .any(|code| code.as_str() == Some("E_PROVIDER_DOWN")));
+            let _ = fs::remove_dir_all(root);
+        });
+    }
+
+    #[test]
+    fn doctor_reports_redacted_model_profile_without_secret_values() {
+        with_clean_doctor_env(|| {
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_PROVIDER", "mock");
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_MODEL", "mock-8");
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_DIM", "8");
+            std::env::set_var("ORDERK_SWORD_RERANKER_PROVIDER", "disabled");
+            std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "disabled");
+            std::env::set_var(
+                "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY",
+                "super-secret-do-not-serialize",
+            );
+
+            let root = temp_root("doctor-redacted");
+            let (vault, db) = write_minimal_vault(&root);
+            index_mock_vault(&vault, &db, 8, "mock-8");
+
+            let report = run_with_args(vec![
+                "doctor".into(),
+                "--db".into(),
+                db.to_string_lossy().to_string(),
+            ])
+            .unwrap();
+            assert_eq!(
+                report
+                    .pointer("/doctor_schema_version")
+                    .and_then(|v| v.as_str()),
+                Some("orderk.doctor.v1")
+            );
+            assert_eq!(
+                report
+                    .pointer("/model_profile/embedding/provider")
+                    .and_then(|v| v.as_str()),
+                Some("mock")
+            );
+            assert_eq!(
+                report
+                    .pointer("/model_profile_redaction/secret_values")
+                    .and_then(|v| v.as_str()),
+                Some("never_serialized")
+            );
+            let serialized = serde_json::to_string(&report).unwrap();
+            assert!(!serialized.contains("super-secret-do-not-serialize"));
+            assert!(serialized.contains("profile_fingerprint"));
+            let _ = fs::remove_dir_all(root);
+        });
+    }
+
+    #[test]
+    fn doctor_surfaces_embedding_profile_mismatch() {
+        with_clean_doctor_env(|| {
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_PROVIDER", "mock");
+            std::env::set_var("ORDERK_SWORD_RERANKER_PROVIDER", "disabled");
+            std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "disabled");
+
+            let root = temp_root("doctor-mismatch");
+            let (vault, db) = write_minimal_vault(&root);
+            index_mock_vault(&vault, &db, 8, "mock-8");
+
+            let report = run_with_args(vec![
+                "doctor".into(),
+                "--db".into(),
+                db.to_string_lossy().to_string(),
+                "--embedding-provider".into(),
+                "mock".into(),
+                "--embedding-dim".into(),
+                "16".into(),
+                "--embedding-model".into(),
+                "mock-16".into(),
+                "--vector-backend".into(),
+                "exact".into(),
+            ])
+            .unwrap();
+            assert_eq!(report.get("ok").and_then(|v| v.as_bool()), Some(false));
+            let codes = report
+                .get("error_codes")
+                .and_then(|v| v.as_array())
+                .expect("doctor should expose error_codes");
+            assert!(codes
+                .iter()
+                .any(|code| code.as_str() == Some("E_PROFILE_MISMATCH")));
+            let checks = report
+                .get("checks")
+                .and_then(|v| v.as_array())
+                .expect("doctor should expose checks");
+            assert!(checks.iter().any(|check| {
+                check
+                    .get("component")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|component| {
+                        component == "embedding_dim" || component == "embedding_model"
+                    })
+            }));
+            let _ = fs::remove_dir_all(root);
+        });
+    }
+
+    #[test]
+    fn doctor_surfaces_embedding_dim_mismatch() {
+        with_clean_doctor_env(|| {
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_PROVIDER", "mock");
+            std::env::set_var("ORDERK_SWORD_RERANKER_PROVIDER", "disabled");
+            std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "disabled");
+
+            let root = temp_root("doctor-dim-mismatch");
+            let (vault, db) = write_minimal_vault(&root);
+            index_mock_vault(&vault, &db, 8, "mock-8");
+
+            let report = run_with_args(vec![
+                "doctor".into(),
+                "--db".into(),
+                db.to_string_lossy().to_string(),
+                "--embedding-provider".into(),
+                "mock".into(),
+                "--embedding-dim".into(),
+                "16".into(),
+                "--embedding-model".into(),
+                "mock-8".into(),
+                "--vector-backend".into(),
+                "exact".into(),
+            ])
+            .unwrap();
+            assert_eq!(report.get("ok").and_then(|v| v.as_bool()), Some(false));
+            let codes = report
+                .get("error_codes")
+                .and_then(|v| v.as_array())
+                .expect("doctor should expose error_codes");
+            assert!(codes
+                .iter()
+                .any(|code| code.as_str() == Some("E_EMBEDDING_DIMENSION_MISMATCH")));
+            let checks = report
+                .get("checks")
+                .and_then(|v| v.as_array())
+                .expect("doctor should expose checks");
+            assert!(checks.iter().any(|check| {
+                check.get("component").and_then(|v| v.as_str()) == Some("embedding_dim")
+                    && check.get("error_code").and_then(|v| v.as_str())
+                        == Some("E_EMBEDDING_DIMENSION_MISMATCH")
+            }));
+            let _ = fs::remove_dir_all(root);
+        });
+    }
 
     #[test]
     fn search_without_profile_flags_inherits_existing_db_profile() {

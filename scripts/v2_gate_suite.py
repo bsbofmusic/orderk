@@ -28,7 +28,43 @@ ALLOWED_FALLBACK_INVOCATIONS = {
     "not_called_no_candidates",
     "not_used",
 }
-SUPPORTED_GATES = {"fixture-integrity", "schema-contract"}
+SUPPORTED_GATES = {"fixture-integrity", "schema-contract", "raw-secret-safety", "profile", "doctor"}
+GATE_ALIASES = {
+    "fixture": "fixture-integrity",
+    "fixtures": "fixture-integrity",
+    "schema": "schema-contract",
+    "contract": "schema-contract",
+    "raw-secret": "raw-secret-safety",
+    "raw-secret-scan": "raw-secret-safety",
+    "raw-secrets": "raw-secret-safety",
+    "profile-slots": "profile",
+    "profiles": "profile",
+    "model-profile": "profile",
+    "model-profiles": "profile",
+    "doctor-status": "doctor",
+}
+RAW_SECRET_SCAN_EXCLUDES = {
+    "Cargo.lock",
+    "package-lock.json",
+}
+RAW_SECRET_SCAN_PREFIX_EXCLUDES = (
+    ".git/",
+    "target/",
+    "node_modules/",
+    "packages/cli/vendor/",
+)
+RAW_SECRET_PATTERNS = [
+    ("private_key", re.compile(r"BEGIN (?:RSA|OPENSSH|EC|DSA) PRIVATE KEY")),
+    ("provider_token", re.compile(r"(?:sk|ghp|github_pat|xox[baprs]?)-[A-Za-z0-9_\-]{20,}")),
+    (
+        "secret_assignment",
+        re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*['\"][^'\"]{12,}['\"]"),
+    ),
+]
+RAW_HASH_FIELD_PATTERN = re.compile(
+    r'(?i)"?(?:raw|source|secret|api[_-]?key|token)[_-]?(?:sha256|hash)"?\s*[:=]\s*["\'][0-9a-f]{64}["\']'
+)
+ARTIFACT_SECRET_PATH_PATTERN = re.compile(r"(?i)(?:sidecar|audit|report|artifact).*\.(?:json|jsonl|md|txt|log)$")
 SEARCH_REQUIRED = {
     "schema_version",
     "query",
@@ -528,6 +564,261 @@ def schema_contract_gate(schema_dir: pathlib.Path = DEFAULT_SCHEMA_DIR) -> dict[
     return gate_result("schema_contract", not failures, metrics, thresholds, failures, warnings)
 
 
+def list_repo_files(repo: pathlib.Path) -> list[pathlib.Path]:
+    if (repo / ".git").exists():
+        proc = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return [pathlib.Path(line) for line in proc.stdout.splitlines() if line.strip()]
+    return [path.relative_to(repo) for path in repo.rglob("*") if path.is_file() and ".git" not in path.parts]
+
+
+def raw_secret_safety_gate(repo: pathlib.Path = REPO, files: list[pathlib.Path] | None = None) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    scan_files = list(files) if files is not None else list_repo_files(repo)
+    scanned = 0
+    artifact_files_scanned = 0
+    raw_hash_markers = 0
+    skipped_binary = 0
+    for rel in scan_files:
+        rel = pathlib.Path(rel)
+        rel_text = rel.as_posix()
+        if rel.name in RAW_SECRET_SCAN_EXCLUDES or rel_text.startswith(RAW_SECRET_SCAN_PREFIX_EXCLUDES):
+            continue
+        path = repo / rel
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as err:
+            failures.append(f"{rel_text}:0:read_error:{err}")
+            continue
+        if b"\0" in data or len(data) > 2_000_000:
+            skipped_binary += 1
+            continue
+        text = data.decode("utf-8", errors="ignore")
+        scanned += 1
+        artifact_like = bool(ARTIFACT_SECRET_PATH_PATTERN.search(rel_text))
+        if artifact_like:
+            artifact_files_scanned += 1
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            if "ALLOW_RAW_SECRET_TEST_FIXTURE" in line:
+                continue
+            if RAW_HASH_FIELD_PATTERN.search(line):
+                raw_hash_markers += 1
+                failures.append(f"{rel_text}:{line_no}:raw_hash_marker")
+            for name, pattern in RAW_SECRET_PATTERNS:
+                if pattern.search(line):
+                    failures.append(f"{rel_text}:{line_no}:{name}")
+    metrics = {
+        "files_scanned": scanned,
+        "artifact_files_scanned": artifact_files_scanned,
+        "raw_hash_markers": raw_hash_markers,
+        "files_skipped_binary_or_large": skipped_binary,
+        "findings": failures,
+    }
+    thresholds = {"raw_secret_findings": 0, "raw_hash_markers": 0, "max_file_bytes": 2_000_000}
+    return gate_result("raw_secret_safety", not failures, metrics, thresholds, failures, warnings)
+
+
+def read_repo_text(rel: str, repo: pathlib.Path = REPO) -> str:
+    path = repo / rel
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def require_markers(text: str, markers: list[str], scope: str) -> list[str]:
+    return [f"{scope}:missing:{marker}" for marker in markers if marker not in text]
+
+
+def rust_runtime_text(text: str) -> str:
+    """Return Rust source with #[cfg(test)] annotated items removed.
+
+    Some modules keep #[cfg(test)] helpers before later runtime impls, so a naive
+    split on the first #[cfg(test)] would miss real runtime code. This scanner
+    drops only the annotated item and keeps subsequent source visible to
+    namespace gates. It handles both braced items (`fn`, `mod`) and semicolon
+    items (`use`, `type`, `const`).
+    """
+    lines = text.splitlines()
+    kept: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() != "#[cfg(test)]":
+            kept.append(line)
+            i += 1
+            continue
+        i += 1
+        while i < len(lines) and lines[i].strip().startswith("#"):
+            i += 1
+        brace_depth = 0
+        saw_open = False
+        while i < len(lines):
+            current = lines[i]
+            open_pos = current.find("{")
+            semi_pos = current.find(";")
+            if not saw_open and semi_pos != -1 and (open_pos == -1 or semi_pos < open_pos):
+                i += 1
+                break
+            brace_depth += current.count("{") - current.count("}")
+            if open_pos != -1:
+                saw_open = True
+            i += 1
+            if saw_open and brace_depth <= 0:
+                break
+        continue
+    return "\n".join(kept)
+
+
+def profile_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    profiles_rs = read_repo_text("crates/orderk-core/src/profiles.rs", repo)
+    sword_spirit_rs = read_repo_text("crates/orderk-core/src/sword_spirit.rs", repo)
+    api_rs = read_repo_text("crates/orderk-core/src/api.rs", repo)
+    lib_rs = read_repo_text("crates/orderk-core/src/lib.rs", repo)
+    cli_rs = read_repo_text("crates/orderk-cli/src/main.rs", repo)
+    required_profile_markers = [
+        "SwordModelKind",
+        "SwordModelSlot",
+        "SwordModelProfile",
+        "resolve_sword_model_profile_from_env",
+        "resolve_sword_model_slot_from_env",
+        "ORDERK_SWORD_EMBEDDING_PROVIDER",
+        "ORDERK_SWORD_RERANKER_PROVIDER",
+        "ORDERK_SWORD_LLM_PROVIDER",
+        "profile_fingerprint",
+        "unknown embedding provider",
+        "unknown reranker provider",
+        "unknown llm provider",
+        "slot_provider_resolves_siliconflow_embedding_with_explicit_env",
+        "slot_provider_resolves_openai_embedding_when_provider_openai",
+        "slot_provider_errors_on_unknown_provider",
+        "slot_provider_default_falls_back_to_legacy_default_sword_paths",
+        "slot_profile_ignores_non_orderk_provider_env_names",
+        "slot_provider_independent_per_kind",
+    ]
+    forbidden_runtime_env_markers = ["HERMES_", "HINDSIGHT_API_"]
+    runtime_namespace_sources = {
+        "profiles.rs": rust_runtime_text(profiles_rs),
+        "sword_spirit.rs": rust_runtime_text(sword_spirit_rs),
+        "api.rs": rust_runtime_text(api_rs),
+    }
+    forbidden_runtime_env_hits = [
+        f"{scope}:{marker}"
+        for scope, source in runtime_namespace_sources.items()
+        for marker in forbidden_runtime_env_markers
+        if marker in source
+    ]
+    required_lib_markers = ["pub mod profiles", "resolve_sword_model_profile_from_env"]
+    required_sword_markers = [
+        "ORDERK_SWORD_RERANKER_SILICONFLOW_API_KEY",
+        "ORDERK_SWORD_RERANKER_SILICONFLOW_BASE_URL",
+        "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY",
+        "ORDERK_SWORD_LLM_MINIMAX_API_KEY",
+        "ORDERK_SWORD_LLM_ANTHROPIC_BASE_URL",
+        "ORDERK_SWORD_LLM_MINIMAX_BASE_URL",
+        "sword_spirit_active_clients_accept_profile_specific_orderk_key_names",
+    ]
+    required_cli_markers = [
+        "resolve_sword_model_profile_from_env",
+        "sword_run_defaults_use_sword_model_profile_slots",
+        "cli_profile_uses_sword_vendor_specific_model_dim_and_vector_backend",
+    ]
+    failures.extend(require_markers(profiles_rs, required_profile_markers, "profiles.rs"))
+    failures.extend(require_markers(sword_spirit_rs, required_sword_markers, "sword_spirit.rs"))
+    failures.extend(require_markers(lib_rs, required_lib_markers, "lib.rs"))
+    failures.extend(require_markers(cli_rs, required_cli_markers, "main.rs"))
+    failures.extend(
+        f"runtime_forbidden_env_namespace:{hit}"
+        for hit in forbidden_runtime_env_hits
+    )
+    metrics = {
+        "profiles_rs_present": bool(profiles_rs),
+        "profile_markers_checked": len(required_profile_markers),
+        "sword_runtime_markers_checked": len(required_sword_markers),
+        "lib_markers_checked": len(required_lib_markers),
+        "cli_markers_checked": len(required_cli_markers),
+        "slot_test_markers": [
+            marker
+            for marker in required_profile_markers
+            if marker.startswith("slot_provider_") or marker.startswith("slot_profile_")
+        ],
+        "runtime_forbidden_env_hits": forbidden_runtime_env_hits,
+    }
+    thresholds = {
+        "missing_required_markers": 0,
+        "required_slot_tests": 6,
+        "runtime_forbidden_env_hits": 0,
+        "required_namespaces": [
+            "ORDERK_SWORD_EMBEDDING_PROVIDER",
+            "ORDERK_SWORD_RERANKER_PROVIDER",
+            "ORDERK_SWORD_LLM_PROVIDER",
+        ],
+    }
+    return gate_result("profile", not failures, metrics, thresholds, failures, warnings)
+
+
+def doctor_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    cli_rs = read_repo_text("crates/orderk-cli/src/main.rs", repo)
+    health_rs = read_repo_text("crates/orderk-core/src/health.rs", repo)
+    models_rs = read_repo_text("crates/orderk-core/src/models.rs", repo)
+    required_cli_markers = [
+        '"doctor"',
+        "doctor_schema_version",
+        "model_profile",
+        "model_profile_redaction",
+        "secret_values",
+        "env_name_only",
+        "doctor_surfaces_missing_sword_provider_key_without_secret_values",
+        "doctor_reports_redacted_model_profile_without_secret_values",
+        "doctor_surfaces_embedding_profile_mismatch",
+        "doctor_surfaces_embedding_dim_mismatch",
+    ]
+    required_health_markers = [
+        "ErrorCode::EProfileMismatch",
+        "ErrorCode::EEmbeddingDimensionMismatch",
+        "embedding_model",
+        "embedding dimension mismatch",
+        "profile_check",
+    ]
+    required_model_markers = [
+        "EProfileMismatch",
+        "EEmbeddingDimensionMismatch",
+    ]
+    failures.extend(require_markers(cli_rs, required_cli_markers, "main.rs"))
+    failures.extend(require_markers(health_rs, required_health_markers, "health.rs"))
+    failures.extend(require_markers(models_rs, required_model_markers, "models.rs"))
+    metrics = {
+        "doctor_cli_markers_checked": len(required_cli_markers),
+        "doctor_health_markers_checked": len(required_health_markers),
+        "doctor_model_markers_checked": len(required_model_markers),
+        "redaction_contract": "env_name_only/no_secret_values",
+    }
+    thresholds = {
+        "missing_required_markers": 0,
+        "required_doctor_schema": "orderk.doctor.v1",
+        "secret_values_serialized": "never",
+    }
+    return gate_result("doctor", not failures, metrics, thresholds, failures, warnings)
+
+
+def normalize_gate_name(name: str) -> str:
+    normalized = name.strip().replace("_", "-")
+    return GATE_ALIASES.get(normalized, normalized)
+
+
 def repo_context() -> dict[str, Any]:
     def run(cmd: list[str]) -> str:
         proc = subprocess.run(cmd, cwd=REPO, text=True, capture_output=True, check=False)
@@ -570,16 +861,26 @@ def run_requested_gates(
     DEFAULT_FOR_TEST: bool = False,
 ) -> dict[str, Any]:
     del DEFAULT_FOR_TEST  # Test hook: this function intentionally remains side-effect-free either way.
-    normalized = {part.strip().replace("_", "-") for part in requested if part.strip()}
+    normalized = {normalize_gate_name(part) for part in requested if part.strip()}
     gates_to_run = set(SUPPORTED_GATES) if "all" in normalized else {gate for gate in normalized if gate in SUPPORTED_GATES}
     unknown = sorted(normalized - SUPPORTED_GATES - {"all"})
     gates: list[dict[str, Any]] = []
     if unknown:
         gates.append(gate_result("unknown_gate", False, {"requested": unknown}, {"supported": sorted(SUPPORTED_GATES)}, [f"unsupported gates: {unknown}"]))
-    if "fixture-integrity" in gates_to_run:
-        gates.append(fixture_integrity_gate(golden, digest, vault))
-    if "schema-contract" in gates_to_run:
-        gates.append(schema_contract_gate(schema_dir))
+    gate_order = ["fixture-integrity", "schema-contract", "profile", "raw-secret-safety", "doctor"]
+    for gate_id in gate_order:
+        if gate_id not in gates_to_run:
+            continue
+        if gate_id == "fixture-integrity":
+            gates.append(fixture_integrity_gate(golden, digest, vault))
+        elif gate_id == "schema-contract":
+            gates.append(schema_contract_gate(schema_dir))
+        elif gate_id == "profile":
+            gates.append(profile_gate(REPO))
+        elif gate_id == "raw-secret-safety":
+            gates.append(raw_secret_safety_gate(REPO))
+        elif gate_id == "doctor":
+            gates.append(doctor_gate(REPO))
     if not gates:
         gates.append(gate_result("unknown_gate", False, {}, {"supported": sorted(SUPPORTED_GATES)}, ["no supported gates requested"]))
     return gate_suite(gates)

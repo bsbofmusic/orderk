@@ -162,8 +162,14 @@ pub fn feedback(db_path: &Path, event: &FeedbackEvent) -> Result<FeedbackRespons
 }
 
 pub fn provider_from_env(dim: usize, model: Option<String>) -> Result<Box<dyn EmbeddingProvider>> {
-    let name = env_string("ORDERK_EMBEDDING_PROVIDER").unwrap_or_else(|| "siliconflow".to_string());
-    let model = model.or_else(|| env_string("ORDERK_EMBEDDING_MODEL"));
+    let name = env_string("ORDERK_SWORD_EMBEDDING_PROVIDER")
+        .or_else(|| env_string("ORDERK_EMBEDDING_PROVIDER"))
+        .unwrap_or_else(|| "siliconflow".to_string());
+    let normalized = normalize_provider_name(&name);
+    let model = model
+        .or_else(|| env_string(&vendor_env_name(&normalized, "MODEL")))
+        .or_else(|| env_string("ORDERK_SWORD_EMBEDDING_MODEL"))
+        .or_else(|| env_string("ORDERK_EMBEDDING_MODEL"));
     provider_from_name(&name, dim, model)
 }
 
@@ -172,16 +178,23 @@ pub fn provider_from_name(
     dim: usize,
     model: Option<String>,
 ) -> Result<Box<dyn EmbeddingProvider>> {
-    let normalized = name.trim().to_ascii_lowercase();
+    let normalized = normalize_provider_name(name);
     match normalized.as_str() {
         "mock" => Ok(Box::new(MockEmbeddingProvider::new(dim))),
         "siliconflow" => {
-            let key = required_env("ORDERK_SILICONFLOW_API_KEY", "SiliconFlow")?;
+            let key = required_env_any(
+                &[
+                    "ORDERK_SWORD_EMBEDDING_SILICONFLOW_API_KEY",
+                    "ORDERK_SILICONFLOW_API_KEY",
+                ],
+                "SiliconFlow",
+            )?;
             Ok(Box::new(SiliconFlowM3Provider::new(
                 key,
                 model,
                 dim,
-                env_string("ORDERK_SILICONFLOW_BASE_URL"),
+                env_string("ORDERK_SWORD_EMBEDDING_SILICONFLOW_BASE_URL")
+                    .or_else(|| env_string("ORDERK_SILICONFLOW_BASE_URL")),
             )))
         }
         "openai" => Ok(Box::new(OpenAiCompatibleEmbeddingProvider::new(
@@ -189,14 +202,19 @@ pub fn provider_from_name(
                 provider_id: "openai".to_string(),
                 label: "OpenAI".to_string(),
                 api_key: required_env_any(
-                    &["ORDERK_OPENAI_API_KEY", "ORDERK_EMBEDDING_API_KEY"],
+                    &[
+                        "ORDERK_SWORD_EMBEDDING_OPENAI_API_KEY",
+                        "ORDERK_OPENAI_API_KEY",
+                        "ORDERK_EMBEDDING_API_KEY",
+                    ],
                     "OpenAI",
                 )?,
-                key_hint: "ORDERK_OPENAI_API_KEY or ORDERK_EMBEDDING_API_KEY".to_string(),
+                key_hint: "ORDERK_SWORD_EMBEDDING_OPENAI_API_KEY or ORDERK_OPENAI_API_KEY or ORDERK_EMBEDDING_API_KEY".to_string(),
                 model,
                 default_model: "text-embedding-3-small".to_string(),
                 dim,
-                base_url: env_string("ORDERK_OPENAI_BASE_URL"),
+                base_url: env_string("ORDERK_SWORD_EMBEDDING_OPENAI_BASE_URL")
+                    .or_else(|| env_string("ORDERK_OPENAI_BASE_URL")),
                 default_base_url: "https://api.openai.com/v1/embeddings".to_string(),
             },
         ))),
@@ -204,13 +222,26 @@ pub fn provider_from_name(
             OpenAiCompatibleEmbeddingConfig {
                 provider_id: normalized.clone(),
                 label: "OpenAI-compatible".to_string(),
-                api_key: required_env("ORDERK_EMBEDDING_API_KEY", "OpenAI-compatible")?,
-                key_hint: "ORDERK_EMBEDDING_API_KEY".to_string(),
+                api_key: required_env_any(
+                    &[
+                        "ORDERK_SWORD_EMBEDDING_OPENAI_COMPATIBLE_API_KEY",
+                        "ORDERK_SWORD_EMBEDDING_GENERIC_API_KEY",
+                        "ORDERK_SWORD_EMBEDDING_API_KEY",
+                        "ORDERK_EMBEDDING_API_KEY",
+                    ],
+                    "OpenAI-compatible",
+                )?,
+                key_hint: "ORDERK_SWORD_EMBEDDING_OPENAI_COMPATIBLE_API_KEY or ORDERK_SWORD_EMBEDDING_GENERIC_API_KEY or ORDERK_SWORD_EMBEDDING_API_KEY or ORDERK_EMBEDDING_API_KEY".to_string(),
                 model,
                 default_model: "text-embedding-3-small".to_string(),
                 dim,
-                base_url: Some(required_env(
-                    "ORDERK_EMBEDDING_BASE_URL",
+                base_url: Some(required_env_any(
+                    &[
+                        "ORDERK_SWORD_EMBEDDING_OPENAI_COMPATIBLE_BASE_URL",
+                        "ORDERK_SWORD_EMBEDDING_GENERIC_BASE_URL",
+                        "ORDERK_SWORD_EMBEDDING_BASE_URL",
+                        "ORDERK_EMBEDDING_BASE_URL",
+                    ],
                     "OpenAI-compatible embedding base URL",
                 )?),
                 default_base_url: String::new(),
@@ -220,16 +251,20 @@ pub fn provider_from_name(
     }
 }
 
+fn normalize_provider_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn vendor_env_name(provider: &str, suffix: &str) -> String {
+    let vendor = provider.trim().to_ascii_uppercase().replace('-', "_");
+    format!("ORDERK_SWORD_EMBEDDING_{vendor}_{suffix}")
+}
+
 fn env_string(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn required_env(name: &str, label: &str) -> Result<String> {
-    env_string(name)
-        .ok_or_else(|| anyhow::anyhow!("{label} embedding API key is missing; set {name}"))
 }
 
 fn required_env_any(names: &[&str], label: &str) -> Result<String> {
@@ -265,6 +300,23 @@ mod provider_resolution_tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     const PROVIDER_ENV_NAMES: &[&str] = &[
+        "ORDERK_SWORD_EMBEDDING_PROVIDER",
+        "ORDERK_SWORD_EMBEDDING_MODEL",
+        "ORDERK_SWORD_EMBEDDING_DIM",
+        "ORDERK_SWORD_EMBEDDING_API_KEY",
+        "ORDERK_SWORD_EMBEDDING_BASE_URL",
+        "ORDERK_SWORD_EMBEDDING_SILICONFLOW_MODEL",
+        "ORDERK_SWORD_EMBEDDING_SILICONFLOW_DIM",
+        "ORDERK_SWORD_EMBEDDING_SILICONFLOW_API_KEY",
+        "ORDERK_SWORD_EMBEDDING_SILICONFLOW_BASE_URL",
+        "ORDERK_SWORD_EMBEDDING_OPENAI_MODEL",
+        "ORDERK_SWORD_EMBEDDING_OPENAI_DIM",
+        "ORDERK_SWORD_EMBEDDING_OPENAI_API_KEY",
+        "ORDERK_SWORD_EMBEDDING_OPENAI_BASE_URL",
+        "ORDERK_SWORD_EMBEDDING_OPENAI_COMPATIBLE_API_KEY",
+        "ORDERK_SWORD_EMBEDDING_OPENAI_COMPATIBLE_BASE_URL",
+        "ORDERK_SWORD_EMBEDDING_GENERIC_API_KEY",
+        "ORDERK_SWORD_EMBEDDING_GENERIC_BASE_URL",
         "ORDERK_EMBEDDING_PROVIDER",
         "ORDERK_EMBEDDING_API_KEY",
         "ORDERK_EMBEDDING_BASE_URL",
@@ -330,7 +382,55 @@ mod provider_resolution_tests {
             };
             assert!(err.contains("ORDERK_SILICONFLOW_API_KEY"), "{err}");
             assert!(!err.contains("HERMES"), "{err}");
-            assert!(!err.contains("SILICONFLOW_API_KEY or"), "{err}");
+            assert!(!err.contains("HERMES"), "{err}");
+            assert!(!err.contains("ambiguous-legacy-key"), "{err}");
+        });
+    }
+
+    #[test]
+    fn provider_from_env_honors_sword_vendor_specific_model_and_key() {
+        with_clean_provider_env(|| {
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_PROVIDER", "openai");
+            std::env::set_var(
+                "ORDERK_SWORD_EMBEDDING_OPENAI_MODEL",
+                "fixture-openai-model",
+            );
+            std::env::set_var(
+                "ORDERK_SWORD_EMBEDDING_OPENAI_API_KEY",
+                "orderk-sword-openai-key",
+            );
+            std::env::set_var(
+                "ORDERK_SWORD_EMBEDDING_OPENAI_BASE_URL",
+                "http://127.0.0.1:1/v1/embeddings",
+            );
+            let provider = provider_from_env(17, None)
+                .expect("provider_from_env should use SWORD vendor-specific env");
+            assert_eq!(provider.provider_id(), "openai");
+            assert_eq!(provider.model_id(), "fixture-openai-model");
+            assert_eq!(provider.dimension(), 17);
+        });
+    }
+
+    #[test]
+    fn openai_compatible_provider_uses_sword_generic_key_and_base_url() {
+        with_clean_provider_env(|| {
+            std::env::set_var(
+                "ORDERK_SWORD_EMBEDDING_OPENAI_COMPATIBLE_API_KEY",
+                "orderk-sword-generic-key",
+            );
+            std::env::set_var(
+                "ORDERK_SWORD_EMBEDDING_OPENAI_COMPATIBLE_BASE_URL",
+                "http://127.0.0.1:1/v1/embeddings",
+            );
+            let provider = provider_from_name(
+                "openai-compatible",
+                6,
+                Some("fixture-online-model".to_string()),
+            )
+            .expect("openai-compatible provider should use SWORD-scoped key/base_url");
+            assert_eq!(provider.provider_id(), "openai-compatible");
+            assert_eq!(provider.model_id(), "fixture-online-model");
+            assert_eq!(provider.dimension(), 6);
         });
     }
 
