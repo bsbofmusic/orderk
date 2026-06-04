@@ -1,13 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use orderk_core::{
-    classify_error_message, export_capsule_manifest, feedback, get_chunks, health_report,
-    index_vault_with_options, init, inspect_capsule_manifest, optimize_apply, optimize_dry_run,
-    optimize_reset, optimize_set, optimize_status, provider_from_name, query_with_options,
-    resolve_sword_model_profile_from_env, run_sword_spirit, status, sword_spirit_status,
-    write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, EmbeddingProvider, FeedbackEvent,
-    FreshnessMode, IndexOptions, QueryOptions, QueryResponse, SearchIndexResponse,
-    SwordSpiritBudgetProfile, SwordSpiritOptions, SwordSpiritProposal, SwordSpiritThinkingMode,
-    SwordSpiritTraceLevel, VectorBackend,
+    approve_proposal, classify_error_message, export_capsule_manifest, feedback, get_chunks,
+    health_report, index_vault_with_options, init, inspect_capsule_manifest, list_proposals,
+    optimize_apply, optimize_dry_run, optimize_reset, optimize_set, optimize_status,
+    provider_from_name, query_with_options, reject_proposal, resolve_sword_model_profile_from_env,
+    run_sword_spirit, show_proposal, status, sword_spirit_status, write_capsule_manifest,
+    ChunkGetDetail, ChunkGetOptions, EmbeddingProvider, FeedbackEvent, FreshnessMode, IndexOptions,
+    QueryOptions, QueryResponse, SearchIndexResponse, SwordSpiritBudgetProfile, SwordSpiritOptions,
+    SwordSpiritProposal, SwordSpiritThinkingMode, SwordSpiritTraceLevel, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -267,6 +267,10 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let resp = sword_spirit_command(&mut args)?;
             print_json(&resp)?;
         }
+        "proposals" => {
+            let resp = proposals_command(&mut args)?;
+            print_json(&resp)?;
+        }
         "mcp" => {
             run_mcp_server(&mut args)?;
         }
@@ -308,6 +312,69 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn proposals_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    if args.is_empty() {
+        return Err(anyhow!(
+            "proposals requires a subcommand: list, show, approve, or reject"
+        ));
+    }
+    let subcommand = args.remove(0);
+    match subcommand.as_str() {
+        "list" => {
+            let vault = take_path(args, "--vault")?;
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unknown proposals list flag(s): {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(list_proposals(&vault)?)?)
+        }
+        "show" => {
+            let id = take_positional(args, "proposal id")?;
+            let vault = take_path(args, "--vault")?;
+            let _diff = take_flag(args, "--diff");
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unknown proposals show flag(s): {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(show_proposal(&vault, &id)?)?)
+        }
+        "approve" => {
+            let id = take_positional(args, "proposal id")?;
+            let vault = take_path(args, "--vault")?;
+            let dry_run = take_flag(args, "--dry-run");
+            let apply = take_flag(args, "--apply");
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unknown proposals approve flag(s): {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(approve_proposal(
+                &vault, &id, dry_run, apply,
+            )?)?)
+        }
+        "reject" => {
+            let id = take_positional(args, "proposal id")?;
+            let vault = take_path(args, "--vault")?;
+            let reason = take_required_string(args, "--reason")?;
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unknown proposals reject flag(s): {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(reject_proposal(
+                &vault, &id, &reason,
+            )?)?)
+        }
+        other => Err(anyhow!("unknown proposals subcommand: {other}")),
+    }
 }
 
 fn sword_spirit_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
@@ -1801,6 +1868,16 @@ fn take_required_string(args: &mut Vec<String>, name: &str) -> Result<String> {
     take_optional_string(args, name)?.ok_or_else(|| anyhow!("{} is required", name))
 }
 
+fn take_positional(args: &mut Vec<String>, label: &str) -> Result<String> {
+    let Some(first) = args.first() else {
+        return Err(anyhow!("{label} is required"));
+    };
+    if first.starts_with('-') {
+        return Err(anyhow!("{label} is required before flags"));
+    }
+    Ok(args.remove(0))
+}
+
 fn take_usize(args: &mut Vec<String>, name: &str, default: usize) -> Result<usize> {
     let raw = take_string(args, name, default.to_string())?;
     raw.parse()
@@ -2275,6 +2352,115 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn test_sword_sidecar_proposal(id: &str, target: &str) -> SwordSpiritProposal {
+        SwordSpiritProposal {
+            schema_version: "orderk.sword_spirit.proposal.v1".to_string(),
+            id: id.to_string(),
+            proposal_type: "semantic_neighbor".to_string(),
+            relation: Some("supports".to_string()),
+            source_path: "source.md".to_string(),
+            target_path: Some(target.to_string()),
+            confidence: 0.91,
+            risk: "review".to_string(),
+            auto_apply: false,
+            human_review_required: true,
+            evidence: vec![orderk_core::sword_spirit::SwordSpiritEvidence {
+                path: target.to_string(),
+                kind: "test".to_string(),
+                value: "target evidence".to_string(),
+            }],
+            rationale: "test rationale".to_string(),
+        }
+    }
+
+    fn write_proposal_sidecar(vault: &Path, run_id: &str, proposals: &[SwordSpiritProposal]) {
+        let run_dir = vault
+            .join(".orderk")
+            .join("sword_spirit")
+            .join("runs")
+            .join(run_id);
+        fs::create_dir_all(&run_dir).unwrap();
+        let body = proposals
+            .iter()
+            .map(|proposal| serde_json::to_string(proposal).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(run_dir.join("proposals.jsonl"), format!("{body}\n")).unwrap();
+    }
+
+    #[test]
+    fn proposals_cli_lists_shows_dry_runs_and_rejects_without_raw_writes() {
+        let root = temp_root("proposals-cli");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("source.md"), "# Source\n").unwrap();
+        fs::write(vault.join("target.md"), "# Target\n").unwrap();
+        write_proposal_sidecar(
+            &vault,
+            "run-1",
+            &[test_sword_sidecar_proposal("p1", "target.md")],
+        );
+
+        let mut list_args = vec![
+            "list".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+        ];
+        let list = proposals_command(&mut list_args).unwrap();
+        assert_eq!(list["proposals"].as_array().unwrap().len(), 1);
+
+        let mut show_args = vec![
+            "show".into(),
+            "p1".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--diff".into(),
+        ];
+        let show = proposals_command(&mut show_args).unwrap();
+        assert!(show["diff"]
+            .as_str()
+            .unwrap()
+            .contains("semantic proposal p1"));
+
+        let mut dry_args = vec![
+            "approve".into(),
+            "p1".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--dry-run".into(),
+        ];
+        let dry = proposals_command(&mut dry_args).unwrap();
+        assert_eq!(dry["audit_written"], false);
+        assert_eq!(
+            fs::read_to_string(vault.join("target.md")).unwrap(),
+            "# Target\n"
+        );
+
+        let mut apply_args = vec![
+            "approve".into(),
+            "p1".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--apply".into(),
+        ];
+        let err = proposals_command(&mut apply_args).unwrap_err();
+        assert!(err.to_string().contains("fail-closed"), "{err:#}");
+
+        let mut reject_args = vec![
+            "reject".into(),
+            "p1".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--reason".into(),
+            "duplicate".into(),
+        ];
+        let reject = proposals_command(&mut reject_args).unwrap();
+        assert_eq!(reject["status"], "rejected");
+        let audit = fs::read_to_string(vault.join(".orderk/proposals/audit.jsonl")).unwrap();
+        assert!(audit.contains("duplicate"));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn write_minimal_vault(root: &Path) -> (PathBuf, PathBuf) {

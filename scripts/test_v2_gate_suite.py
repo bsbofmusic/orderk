@@ -319,10 +319,19 @@ class V2GateSuiteTests(unittest.TestCase):
             ["profile", "raw_secret_safety", "doctor"],
         )
 
+    def test_batch4_plan_gate_names_are_supported_without_unknown_gate(self) -> None:
+        suite = v2_gate_suite.run_requested_gates({"proposals", "raw-secret", "doctor"}, DEFAULT_FOR_TEST=True)
+        self.assertNotIn("unknown_gate", suite["claims_denied"], suite)
+        self.assertEqual(
+            [gate["gate_id"] for gate in suite["gates"]],
+            ["proposals", "raw_secret_safety", "doctor"],
+        )
+
     def test_gate_aliases_normalize_plan_and_cli_spellings(self) -> None:
         self.assertEqual(v2_gate_suite.normalize_gate_name("raw_secret"), "raw-secret-safety")
         self.assertEqual(v2_gate_suite.normalize_gate_name("model-profile"), "profile")
         self.assertEqual(v2_gate_suite.normalize_gate_name("doctor-status"), "doctor")
+        self.assertEqual(v2_gate_suite.normalize_gate_name("proposal-governance"), "proposals")
 
     def test_rust_runtime_text_strips_cfg_test_items_only(self) -> None:
         source = """

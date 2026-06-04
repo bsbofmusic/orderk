@@ -9,6 +9,7 @@ pub mod markdown;
 pub mod models;
 pub mod optimizer;
 pub mod profiles;
+pub mod proposals;
 pub mod scanner;
 pub mod sword_spirit;
 pub mod v2_schema;
@@ -29,6 +30,7 @@ pub use profiles::{
     resolve_sword_model_profile_from_env, resolve_sword_model_slot_from_env, SwordModelKind,
     SwordModelProfile, SwordModelSlot,
 };
+pub use proposals::{approve_proposal, list_proposals, reject_proposal, show_proposal};
 pub use sword_spirit::{
     default_sword_embedding_dim, default_sword_embedding_model, default_sword_embedding_provider,
     default_sword_llm_model, default_sword_llm_provider, default_sword_reranker_model,

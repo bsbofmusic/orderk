@@ -28,7 +28,7 @@ ALLOWED_FALLBACK_INVOCATIONS = {
     "not_called_no_candidates",
     "not_used",
 }
-SUPPORTED_GATES = {"fixture-integrity", "schema-contract", "raw-secret-safety", "profile", "doctor"}
+SUPPORTED_GATES = {"fixture-integrity", "schema-contract", "raw-secret-safety", "profile", "doctor", "proposals"}
 GATE_ALIASES = {
     "fixture": "fixture-integrity",
     "fixtures": "fixture-integrity",
@@ -42,6 +42,8 @@ GATE_ALIASES = {
     "model-profile": "profile",
     "model-profiles": "profile",
     "doctor-status": "doctor",
+    "proposal-governance": "proposals",
+    "write-allowlist": "proposals",
 }
 RAW_SECRET_SCAN_EXCLUDES = {
     "Cargo.lock",
@@ -814,6 +816,72 @@ def doctor_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
     return gate_result("doctor", not failures, metrics, thresholds, failures, warnings)
 
 
+def proposals_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    cli_rs = read_repo_text("crates/orderk-cli/src/main.rs", repo)
+    core_rs = read_repo_text("crates/orderk-core/src/proposals.rs", repo)
+    lib_rs = read_repo_text("crates/orderk-core/src/lib.rs", repo)
+    required_cli_markers = [
+        '"proposals"',
+        "proposals_command",
+        '"list"',
+        '"show"',
+        '"approve"',
+        '"reject"',
+        "--dry-run",
+        "--apply",
+        "--reason",
+        "approve_proposal",
+        "reject_proposal",
+    ]
+    required_core_markers = [
+        "MAX_BACKLOG",
+        "duplicates_deduped",
+        "audit.jsonl",
+        "allowlist.json",
+        "append_audit",
+        "ensure_allowlisted",
+        "ensure_evidence_gate",
+        "target_path_in_evidence_set",
+        "outside candidate evidence set",
+        "proposal apply is fail-closed",
+        "normalize_vault_relative_path",
+        "unsafe proposal target_path",
+        "refusing to read audit through symlink",
+        "refusing to append audit through symlink",
+        "refusing to read allowlist through symlink",
+    ]
+    required_lib_markers = ["pub mod proposals", "approve_proposal", "reject_proposal"]
+    failures.extend(require_markers(cli_rs, required_cli_markers, "main.rs"))
+    failures.extend(require_markers(core_rs, required_core_markers, "proposals.rs"))
+    failures.extend(require_markers(lib_rs, required_lib_markers, "lib.rs"))
+
+    mcp_match = re.search(r"fn mcp_tool_definitions\(\).*?(?=\nfn )", cli_rs, flags=re.S)
+    if not mcp_match:
+        failures.append("mcp_tool_definitions_missing")
+        mcp_tool_names: set[str] = set()
+    else:
+        mcp_tool_names = set(re.findall(r'"name"\s*:\s*"([^"]+)"', mcp_match.group(0)))
+        forbidden_mcp_write_tools = sorted(mcp_tool_names & {"proposals", "approve", "reject", "apply", "write", "patch"})
+        if forbidden_mcp_write_tools:
+            failures.append(f"mcp_write_tools_enabled_by_default:{forbidden_mcp_write_tools}")
+    metrics = {
+        "proposal_cli_markers_checked": len(required_cli_markers),
+        "proposal_core_markers_checked": len(required_core_markers),
+        "mcp_tool_names": sorted(mcp_tool_names),
+        "mcp_write_tools_default": "disabled",
+        "apply_policy": "local_allowlist_fail_closed",
+        "audit_policy": "append_only_jsonl",
+    }
+    thresholds = {
+        "missing_required_markers": 0,
+        "mcp_write_tools_enabled_by_default": 0,
+        "required_apply_policy": "local_allowlist_fail_closed",
+    }
+    return gate_result("proposals", not failures, metrics, thresholds, failures, warnings)
+
+
 def normalize_gate_name(name: str) -> str:
     normalized = name.strip().replace("_", "-")
     return GATE_ALIASES.get(normalized, normalized)
@@ -867,7 +935,7 @@ def run_requested_gates(
     gates: list[dict[str, Any]] = []
     if unknown:
         gates.append(gate_result("unknown_gate", False, {"requested": unknown}, {"supported": sorted(SUPPORTED_GATES)}, [f"unsupported gates: {unknown}"]))
-    gate_order = ["fixture-integrity", "schema-contract", "profile", "raw-secret-safety", "doctor"]
+    gate_order = ["fixture-integrity", "schema-contract", "profile", "proposals", "raw-secret-safety", "doctor"]
     for gate_id in gate_order:
         if gate_id not in gates_to_run:
             continue
@@ -877,6 +945,8 @@ def run_requested_gates(
             gates.append(schema_contract_gate(schema_dir))
         elif gate_id == "profile":
             gates.append(profile_gate(REPO))
+        elif gate_id == "proposals":
+            gates.append(proposals_gate(REPO))
         elif gate_id == "raw-secret-safety":
             gates.append(raw_secret_safety_gate(REPO))
         elif gate_id == "doctor":
