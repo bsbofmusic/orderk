@@ -1,0 +1,115 @@
+{
+  "$id": "https://orderk.local/schemas/orderk.v2.proposal.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "confidence": {
+      "type": "number"
+    },
+    "evidence": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "chunk_id": {
+            "type": "string"
+          },
+          "line_range": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "quote_hash": {
+            "type": "string"
+          },
+          "source_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_path",
+          "chunk_id"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "from": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "id": {
+      "type": "string"
+    },
+    "relation": {
+      "enum": [
+        "supports",
+        "refines",
+        "contradicts",
+        "replaces",
+        "depends_on",
+        "part_of"
+      ]
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "orderk.v2.proposal.v1"
+    },
+    "status": {
+      "enum": [
+        "proposal",
+        "active",
+        "rejected",
+        "superseded",
+        "conflict"
+      ]
+    },
+    "suggested_patch": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "to": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "id",
+    "run_id",
+    "relation",
+    "from",
+    "to",
+    "confidence",
+    "evidence",
+    "status"
+  ],
+  "title": "orderk V2 proposal contract",
+  "type": "object"
+}

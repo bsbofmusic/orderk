@@ -1,0 +1,64 @@
+{
+  "$id": "https://orderk.local/schemas/orderk.v2.search_result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "fallback_invocation": {
+      "enum": [
+        "not_called",
+        "called",
+        "called_unparseable_fallback",
+        "called_failed_degraded",
+        "called_timeout_degraded",
+        "not_called_no_candidates",
+        "not_used"
+      ]
+    },
+    "metrics": {
+      "type": "object"
+    },
+    "mode": {
+      "type": "string"
+    },
+    "query": {
+      "type": "string"
+    },
+    "reasoning_triggered": {
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": "orderk.v2.search_contract.v1"
+    },
+    "trace_level": {
+      "enum": [
+        "off",
+        "compact",
+        "full"
+      ]
+    },
+    "trigger_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "warnings": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "query",
+    "mode",
+    "reasoning_triggered",
+    "trace_level",
+    "fallback_invocation",
+    "warnings",
+    "metrics"
+  ],
+  "title": "orderk V2 search contract",
+  "type": "object"
+}

@@ -1,0 +1,31 @@
+{
+  "$id": "https://orderk.local/schemas/orderk.v2.digest_run.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "raw_unchanged": {
+      "type": "boolean"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "orderk.v2.digest_run.v1"
+    },
+    "sidecars": {
+      "type": "object"
+    },
+    "thinking": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "run_id",
+    "thinking",
+    "sidecars",
+    "raw_unchanged"
+  ],
+  "title": "orderk V2 digest run contract",
+  "type": "object"
+}

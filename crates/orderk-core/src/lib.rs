@@ -10,6 +10,7 @@ pub mod models;
 pub mod optimizer;
 pub mod scanner;
 pub mod sword_spirit;
+pub mod v2_schema;
 
 pub use api::{
     feedback, get_chunks, index_vault, index_vault_with_options, init, optimize_apply,
@@ -30,6 +31,7 @@ pub use sword_spirit::{
     SwordSpiritBudgetProfile, SwordSpiritOptions, SwordSpiritProposal, SwordSpiritThinkingMode,
     SwordSpiritTraceLevel,
 };
+pub use v2_schema::*;
 
 #[cfg(test)]
 mod capsule_contract_tests {
