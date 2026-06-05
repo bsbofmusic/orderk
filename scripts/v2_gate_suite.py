@@ -28,10 +28,21 @@ ALLOWED_FALLBACK_INVOCATIONS = {
     "not_called_no_candidates",
     "not_used",
 }
-SUPPORTED_GATES = {"fixture-integrity", "schema-contract", "raw-secret-safety", "profile", "doctor", "proposals"}
+SUPPORTED_GATES = {
+    "fixture-integrity",
+    "schema-contract",
+    "raw-secret-safety",
+    "profile",
+    "doctor",
+    "proposals",
+    "graph",
+    "base-non-regression",
+}
 GATE_ALIASES = {
     "fixture": "fixture-integrity",
     "fixtures": "fixture-integrity",
+    "digest-fixture": "fixture-integrity",
+    "digest-fixtures": "fixture-integrity",
     "schema": "schema-contract",
     "contract": "schema-contract",
     "raw-secret": "raw-secret-safety",
@@ -44,6 +55,8 @@ GATE_ALIASES = {
     "doctor-status": "doctor",
     "proposal-governance": "proposals",
     "write-allowlist": "proposals",
+    "base-nonregression": "base-non-regression",
+    "base-regression": "base-non-regression",
 }
 RAW_SECRET_SCAN_EXCLUDES = {
     "Cargo.lock",
@@ -882,6 +895,125 @@ def proposals_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
     return gate_result("proposals", not failures, metrics, thresholds, failures, warnings)
 
 
+def graph_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    graph_rs = read_repo_text("crates/orderk-core/src/graph.rs", repo)
+    digest_rs = read_repo_text("crates/orderk-core/src/digest.rs", repo)
+    cli_rs = read_repo_text("crates/orderk-cli/src/main.rs", repo)
+    lib_rs = read_repo_text("crates/orderk-core/src/lib.rs", repo)
+    test_rs = read_repo_text("crates/orderk-core/tests/batch5_graph_digest_contract.rs", repo)
+    required_graph_markers = [
+        "GraphEdgeRelation",
+        "Supports",
+        "Refines",
+        "Contradicts",
+        "Replaces",
+        "DependsOn",
+        "PartOf",
+        "GraphEdgeState",
+        "Proposal",
+        "Active",
+        "Rejected",
+        "Superseded",
+        "Conflict",
+        "rebuild_graph",
+        "explain_graph",
+        "edges.jsonl",
+        "markdown_wikilink",
+        "sword_sidecar",
+        "relation_not_in_prd_allowlist",
+        "normalize_vault_relative_path",
+        "existing_vault_rel_path",
+        "target_path_not_in_evidence_set",
+        "ensure_plain_sidecar_dir",
+        "ensure_plain_output_file",
+    ]
+    required_digest_markers = [
+        "digest_vault",
+        "DigestOptions",
+        "state.json",
+        "digest.lock",
+        "--resume",
+        "changed_paths",
+        "create_digest_lock",
+        "create_new(true)",
+        "prepare_digest_root",
+        "ensure_plain_output_file",
+    ]
+    required_cli_markers = [
+        '"graph"',
+        '"digest"',
+        '"rebuild"',
+        '"explain"',
+        '"run"',
+        "only one of --dry-run or --apply",
+        "unknown graph rebuild flag",
+        "unknown graph explain flag",
+        "unknown digest run flag",
+    ]
+    required_lib_markers = ["pub mod graph", "pub mod digest", "GraphEdgeRelation", "DigestOptions"]
+    required_test_markers = [
+        "graph_rebuild_accepts_only_prd_relations",
+        "graph_rebuild_applies_audit_states",
+        "graph_rejects_non_prd_sidecar_relation_unsafe_paths_and_missing_evidence_overlap",
+        "graph_and_digest_apply_reject_symlinked_sidecar_paths",
+        "digest_dry_run_detects_changes_apply_records_state",
+    ]
+    failures.extend(require_markers(graph_rs, required_graph_markers, "graph.rs"))
+    failures.extend(require_markers(digest_rs, required_digest_markers, "digest.rs"))
+    failures.extend(require_markers(cli_rs, required_cli_markers, "main.rs"))
+    failures.extend(require_markers(lib_rs, required_lib_markers, "lib.rs"))
+    failures.extend(require_markers(test_rs, required_test_markers, "batch5_graph_digest_contract.rs"))
+    if "made_up_relation" not in test_rs:
+        failures.append("graph_contract_missing_invalid_relation_fixture")
+    if '"supports" | "wikilink"' in graph_rs or '"wikilink" => Some' in graph_rs:
+        failures.append("graph_sidecar_relation_parser_allows_wikilink_alias")
+    metrics = {
+        "graph_markers_checked": len(required_graph_markers),
+        "digest_markers_checked": len(required_digest_markers),
+        "cli_markers_checked": len(required_cli_markers),
+        "allowed_relations": sorted(ALLOWED_RELATIONS),
+        "allowed_states": sorted(ALLOWED_STATUSES),
+        "store_policy": ".orderk/graph only; raw markdown untouched",
+        "digest_policy": "dry-run no state write; apply writes .orderk/digest state with lock/resume",
+    }
+    thresholds = {
+        "missing_required_markers": 0,
+        "allowed_relation_count": 6,
+        "allowed_state_count": 5,
+    }
+    return gate_result("graph", not failures, metrics, thresholds, failures, warnings)
+
+
+def base_non_regression_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    graph_rs = read_repo_text("crates/orderk-core/src/graph.rs", repo)
+    cli_rs = read_repo_text("crates/orderk-cli/src/main.rs", repo)
+    release_gate_py = read_repo_text("scripts/release_gate.py", repo)
+    contract_rs = read_repo_text("crates/orderk-core/tests/batch5_graph_digest_contract.rs", repo)
+    required_markers = [
+        "bounded_graph_boost",
+        "0.03",
+        "base_score >= 0.95",
+        "graph_boost_is_bounded_and_cannot_demote_base_top",
+    ]
+    failures.extend(require_markers(graph_rs + contract_rs, required_markers, "graph non-regression contract"))
+    if "sword_5topic_hs_vs_v2_bench.py" not in release_gate_py:
+        failures.append("release_gate_missing_5topic_retrieval_non_regression")
+    if "original_top_chunk_id" not in cli_rs:
+        failures.append("sword_sidecar_base_top_guard_missing")
+    metrics = {
+        "graph_boost_cap": 0.03,
+        "high_confidence_base_score_boost": 0.0,
+        "release_gate_has_5topic_bench": "sword_5topic_hs_vs_v2_bench.py" in release_gate_py,
+        "sword_sidecar_base_top_guard": "original_top_chunk_id" in cli_rs,
+    }
+    thresholds = {"max_graph_boost": 0.03, "base_top_regression_allowed": 0}
+    return gate_result("base_non_regression", not failures, metrics, thresholds, failures, warnings)
+
+
 def normalize_gate_name(name: str) -> str:
     normalized = name.strip().replace("_", "-")
     return GATE_ALIASES.get(normalized, normalized)
@@ -935,7 +1067,16 @@ def run_requested_gates(
     gates: list[dict[str, Any]] = []
     if unknown:
         gates.append(gate_result("unknown_gate", False, {"requested": unknown}, {"supported": sorted(SUPPORTED_GATES)}, [f"unsupported gates: {unknown}"]))
-    gate_order = ["fixture-integrity", "schema-contract", "profile", "proposals", "raw-secret-safety", "doctor"]
+    gate_order = [
+        "fixture-integrity",
+        "schema-contract",
+        "profile",
+        "proposals",
+        "graph",
+        "base-non-regression",
+        "raw-secret-safety",
+        "doctor",
+    ]
     for gate_id in gate_order:
         if gate_id not in gates_to_run:
             continue
@@ -947,6 +1088,10 @@ def run_requested_gates(
             gates.append(profile_gate(REPO))
         elif gate_id == "proposals":
             gates.append(proposals_gate(REPO))
+        elif gate_id == "graph":
+            gates.append(graph_gate(REPO))
+        elif gate_id == "base-non-regression":
+            gates.append(base_non_regression_gate(REPO))
         elif gate_id == "raw-secret-safety":
             gates.append(raw_secret_safety_gate(REPO))
         elif gate_id == "doctor":

@@ -1,8 +1,10 @@
 pub mod api;
 pub mod capsule;
 pub mod chunker;
+pub mod digest;
 pub mod embedding;
 pub mod filter;
+pub mod graph;
 pub mod health;
 pub mod index;
 pub mod markdown;
@@ -20,9 +22,14 @@ pub use api::{
     provider_from_name, query, query_with_filter, query_with_options, status,
 };
 pub use capsule::{export_capsule_manifest, inspect_capsule_manifest, write_capsule_manifest};
+pub use digest::{digest_vault, DigestOptions, DigestReport, DigestState};
 pub use embedding::{
     EmbeddingProvider, MockEmbeddingProvider, OpenAiCompatibleEmbeddingConfig,
     OpenAiCompatibleEmbeddingProvider, SiliconFlowM3Provider,
+};
+pub use graph::{
+    bounded_graph_boost, explain_graph, rebuild_graph, GraphBuildOptions, GraphEdge,
+    GraphEdgeRelation, GraphEdgeState, GraphExplain, GraphStore,
 };
 pub use health::{classify_error_message, health_report};
 pub use models::*;

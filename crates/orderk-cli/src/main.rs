@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use orderk_core::{
-    approve_proposal, classify_error_message, export_capsule_manifest, feedback, get_chunks,
-    health_report, index_vault_with_options, init, inspect_capsule_manifest, list_proposals,
-    optimize_apply, optimize_dry_run, optimize_reset, optimize_set, optimize_status,
-    provider_from_name, query_with_options, reject_proposal, resolve_sword_model_profile_from_env,
-    run_sword_spirit, show_proposal, status, sword_spirit_status, write_capsule_manifest,
-    ChunkGetDetail, ChunkGetOptions, EmbeddingProvider, FeedbackEvent, FreshnessMode, IndexOptions,
-    QueryOptions, QueryResponse, SearchIndexResponse, SwordSpiritBudgetProfile, SwordSpiritOptions,
+    approve_proposal, classify_error_message, digest_vault, explain_graph, export_capsule_manifest,
+    feedback, get_chunks, health_report, index_vault_with_options, init, inspect_capsule_manifest,
+    list_proposals, optimize_apply, optimize_dry_run, optimize_reset, optimize_set,
+    optimize_status, provider_from_name, query_with_options, rebuild_graph, reject_proposal,
+    resolve_sword_model_profile_from_env, run_sword_spirit, show_proposal, status,
+    sword_spirit_status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, DigestOptions,
+    EmbeddingProvider, FeedbackEvent, FreshnessMode, GraphBuildOptions, IndexOptions, QueryOptions,
+    QueryResponse, SearchIndexResponse, SwordSpiritBudgetProfile, SwordSpiritOptions,
     SwordSpiritProposal, SwordSpiritThinkingMode, SwordSpiritTraceLevel, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
@@ -267,6 +268,14 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let resp = sword_spirit_command(&mut args)?;
             print_json(&resp)?;
         }
+        "graph" => {
+            let resp = graph_command(&mut args)?;
+            print_json(&resp)?;
+        }
+        "digest" => {
+            let resp = digest_command(&mut args)?;
+            print_json(&resp)?;
+        }
         "proposals" => {
             let resp = proposals_command(&mut args)?;
             print_json(&resp)?;
@@ -312,6 +321,75 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn graph_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    if args.is_empty() {
+        return Err(anyhow!("graph requires a subcommand: rebuild or explain"));
+    }
+    let sub = args.remove(0);
+    match sub.as_str() {
+        "rebuild" => {
+            let vault = take_path(args, "--vault")?;
+            let apply = take_flag(args, "--apply");
+            let dry_run = take_flag(args, "--dry-run");
+            if apply && dry_run {
+                return Err(anyhow!(
+                    "graph rebuild accepts only one of --dry-run or --apply"
+                ));
+            }
+            if !args.is_empty() {
+                return Err(anyhow!("unknown graph rebuild flag(s): {}", args.join(" ")));
+            }
+            Ok(serde_json::to_value(rebuild_graph(
+                &vault,
+                GraphBuildOptions { apply },
+            )?)?)
+        }
+        "explain" => {
+            let target = take_positional(args, "graph explain <id|path>")?;
+            let vault = take_path(args, "--vault")?;
+            let _json = take_flag(args, "--json");
+            if !args.is_empty() {
+                return Err(anyhow!("unknown graph explain flag(s): {}", args.join(" ")));
+            }
+            Ok(serde_json::to_value(explain_graph(&vault, &target)?)?)
+        }
+        other => Err(anyhow!("unknown graph subcommand: {other}")),
+    }
+}
+
+fn digest_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    if args.is_empty() {
+        return Err(anyhow!("digest requires a subcommand: run"));
+    }
+    let sub = args.remove(0);
+    match sub.as_str() {
+        "run" => {
+            let vault = take_path(args, "--vault")?;
+            let profile = take_string(args, "--profile", "default".to_string())?;
+            let apply = take_flag(args, "--apply");
+            let dry_run = take_flag(args, "--dry-run");
+            if apply && dry_run {
+                return Err(anyhow!(
+                    "digest run accepts only one of --dry-run or --apply"
+                ));
+            }
+            let resume = take_flag(args, "--resume");
+            if !args.is_empty() {
+                return Err(anyhow!("unknown digest run flag(s): {}", args.join(" ")));
+            }
+            Ok(serde_json::to_value(digest_vault(
+                &vault,
+                DigestOptions {
+                    profile,
+                    apply,
+                    resume,
+                },
+            )?)?)
+        }
+        other => Err(anyhow!("unknown digest subcommand: {other}")),
+    }
 }
 
 fn proposals_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
@@ -2193,13 +2271,15 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
         "optimize" => optimize_command(&mut args),
         "capsule" => capsule_command(&mut args),
         "sword" | "sword-spirit" => sword_spirit_command(&mut args),
+        "graph" => graph_command(&mut args),
+        "digest" => digest_command(&mut args),
         other => Err(anyhow!("unsupported test command: {other}")),
     }
 }
 
 fn print_usage() {
     eprintln!(
-        "orderk <init|index|search|get|status|health|doctor|eval|maintain|optimize|capsule|sword|sword-spirit|mcp|feedback> [--flags]"
+        "orderk <init|index|search|get|status|health|doctor|eval|maintain|optimize|capsule|sword|sword-spirit|graph|digest|mcp|feedback> [--flags]"
     );
     eprintln!(
         "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--query-expansion] [--reranker lexical|none] [--json-lines] [--explain] [--no-rerank]"
@@ -2213,6 +2293,10 @@ fn print_usage() {
     eprintln!("capsule inspect flags: --file <capsule.json> [--db <orderk.sqlite>]");
     eprintln!("sword run flags: --vault <path> [--max-files <n>] [--max-proposals <n>] [--llm-provider <provider>] [--llm-model <model>]");
     eprintln!("sword status flags: --vault <path>");
+    eprintln!("graph flags: graph rebuild --vault <path> [--dry-run|--apply]; graph explain <id|path> --vault <path> --json");
+    eprintln!(
+        "digest flags: digest run --vault <path> [--profile <name>] [--dry-run|--apply] [--resume]"
+    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -2460,6 +2544,114 @@ mod tests {
         assert_eq!(reject["status"], "rejected");
         let audit = fs::read_to_string(vault.join(".orderk/proposals/audit.jsonl")).unwrap();
         assert!(audit.contains("duplicate"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_and_digest_cli_rebuild_explain_and_increment_without_raw_writes() {
+        let root = temp_root("graph-digest-cli");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("alpha.md"), "# Alpha\nSee [[Bravo]].\n").unwrap();
+        fs::write(vault.join("bravo.md"), "# Bravo\n").unwrap();
+        let before = fs::read_to_string(vault.join("alpha.md")).unwrap();
+
+        let rebuild = run_with_args(vec![
+            "graph".into(),
+            "rebuild".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--apply".into(),
+        ])
+        .unwrap();
+        assert_eq!(rebuild["applied"], true);
+        assert!(vault.join(".orderk/graph/edges.jsonl").is_file());
+
+        let explain = run_with_args(vec![
+            "graph".into(),
+            "explain".into(),
+            "alpha.md".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--json".into(),
+        ])
+        .unwrap();
+        assert!(explain["outgoing"].as_array().unwrap().iter().any(|edge| {
+            edge.get("target_path").and_then(|value| value.as_str()) == Some("bravo.md")
+        }));
+
+        let dry = run_with_args(vec![
+            "digest".into(),
+            "run".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--profile".into(),
+            "default".into(),
+            "--dry-run".into(),
+        ])
+        .unwrap();
+        assert_eq!(dry["state_written"], false);
+        assert!(!vault.join(".orderk/digest/state.json").exists());
+
+        let applied = run_with_args(vec![
+            "digest".into(),
+            "run".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--profile".into(),
+            "default".into(),
+            "--apply".into(),
+        ])
+        .unwrap();
+        assert_eq!(applied["state_written"], true);
+        let graph_flag_conflict = run_with_args(vec![
+            "graph".into(),
+            "rebuild".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--apply".into(),
+            "--dry-run".into(),
+        ])
+        .unwrap_err();
+        assert!(
+            graph_flag_conflict
+                .to_string()
+                .contains("only one of --dry-run or --apply"),
+            "{graph_flag_conflict:#}"
+        );
+        let graph_unknown = run_with_args(vec![
+            "graph".into(),
+            "explain".into(),
+            "alpha.md".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--json".into(),
+            "--surprise".into(),
+        ])
+        .unwrap_err();
+        assert!(
+            graph_unknown
+                .to_string()
+                .contains("unknown graph explain flag"),
+            "{graph_unknown:#}"
+        );
+        let digest_unknown = run_with_args(vec![
+            "digest".into(),
+            "run".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--dry-run".into(),
+            "--surprise".into(),
+        ])
+        .unwrap_err();
+        assert!(
+            digest_unknown
+                .to_string()
+                .contains("unknown digest run flag"),
+            "{digest_unknown:#}"
+        );
+        assert_eq!(fs::read_to_string(vault.join("alpha.md")).unwrap(), before);
+
         let _ = fs::remove_dir_all(root);
     }
 

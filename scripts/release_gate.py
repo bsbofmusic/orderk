@@ -33,6 +33,7 @@ COMMANDS = [
         "scripts/test_eval_gate.py",
         "scripts/test_feedback_to_eval.py",
         "scripts/test_v2_gate_suite.py",
+        "scripts/test_sword_hs_bench.py",
     ],
     ["python3", "scripts/v2_gate_suite.py", "--only", "all", "--json"],
     ["cargo", "test", "-p", "orderk-core", "--all-features", "query_options_"],
