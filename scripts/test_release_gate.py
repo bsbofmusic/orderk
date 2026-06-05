@@ -24,6 +24,51 @@ class ReleaseGateStaticChecksTest(unittest.TestCase):
     def test_release_gate_runs_5topic_retrieval_non_regression_bench(self) -> None:
         self.assertIn(["python3", "scripts/sword_5topic_hs_vs_v2_bench.py"], release_gate.COMMANDS)
 
+    def test_quality_effect_gate_rejects_ok_bench_without_quantified_deltas(self) -> None:
+        bench = {
+            "ok": True,
+            "schema_version": "orderk.sword_5topic_hs_vs_v2_bench.v1",
+            "aggregate": {
+                "orderk_base": {"top1": 5, "hit_at_3": 5, "hit_at_5": 5, "mrr_avg": 1.0, "n": 5},
+                "orderk_sword": {"top1": 5, "hit_at_3": 5, "hit_at_5": 5, "mrr_avg": 1.0, "n": 5},
+            },
+            "failures": [],
+        }
+        result = release_gate.check_quality_effect_comparison(bench)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("quality_effect missing", result["stderr_tail"])
+
+    def test_quality_effect_gate_accepts_quantified_base_vs_sword_deltas(self) -> None:
+        bench = {
+            "ok": True,
+            "schema_version": "orderk.sword_5topic_hs_vs_v2_bench.v1",
+            "aggregate": {
+                "orderk_base": {"top1": 5, "hit_at_3": 5, "hit_at_5": 5, "mrr_avg": 0.8, "n": 5},
+                "orderk_sword": {"top1": 5, "hit_at_3": 5, "hit_at_5": 5, "mrr_avg": 0.9, "n": 5},
+            },
+            "quality_effect": {
+                "comparison_type": "base_vs_sword",
+                "metrics": {
+                    "top1_delta": 0,
+                    "hit_at_3_delta": 0,
+                    "hit_at_5_delta": 0,
+                    "mrr_avg_delta": 0.1,
+                    "query_count": 5,
+                },
+                "thresholds": {
+                    "min_query_count": 5,
+                    "min_top1_delta": 0,
+                    "min_hit_at_3_delta": 0,
+                    "min_hit_at_5_delta": 0,
+                    "min_mrr_avg_delta": 0.0,
+                },
+            },
+            "failures": [],
+        }
+        result = release_gate.check_quality_effect_comparison(bench)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("mrr_avg_delta", result["stdout_tail"])
+
     def test_npm_publish_workflow_checks_out_trigger_sha_for_workflow_run(self) -> None:
         workflow = RELEASE_GATE_MODULE_PATH.parents[1] / ".github" / "workflows" / "npm-publish.yml"
         text = workflow.read_text(encoding="utf-8")

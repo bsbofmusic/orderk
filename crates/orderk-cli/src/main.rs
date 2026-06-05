@@ -2237,26 +2237,36 @@ fn resolve_embedding_profile(
     db: Option<&Path>,
 ) -> Result<CliEmbeddingProfile> {
     let db_profile = db.and_then(existing_db_profile);
-    let embedding_provider = take_optional_string(args, "--embedding-provider")?
-        .or_else(|| env_string("ORDERK_SWORD_EMBEDDING_PROVIDER"))
-        .or_else(|| env_string("ORDERK_EMBEDDING_PROVIDER"))
+    let explicit_embedding_provider = take_optional_string(args, "--embedding-provider")?;
+    let explicit_embedding_dim = take_optional_usize(args, "--embedding-dim")?;
+    let explicit_embedding_model = take_optional_string(args, "--embedding-model")?;
+    let explicit_vector_backend = take_optional_string(args, "--vector-backend")?;
+
+    let embedding_provider = explicit_embedding_provider
         .or_else(|| {
             db_profile
                 .as_ref()
                 .map(|profile| profile.embedding_provider.clone())
         })
+        .or_else(|| env_string("ORDERK_SWORD_EMBEDDING_PROVIDER"))
+        .or_else(|| env_string("ORDERK_EMBEDDING_PROVIDER"))
         .unwrap_or_else(|| DEFAULT_EMBEDDING_PROVIDER.to_string());
     let provider_env_suffix = embedding_provider
         .trim()
         .to_ascii_uppercase()
         .replace('-', "_");
-    let embedding_dim = take_optional_usize(args, "--embedding-dim")?
+    let embedding_dim = explicit_embedding_dim
+        .or_else(|| db_profile.as_ref().map(|profile| profile.embedding_dim))
         .or_else(|| env_usize(&format!("ORDERK_SWORD_EMBEDDING_{provider_env_suffix}_DIM")))
         .or_else(|| env_usize("ORDERK_SWORD_EMBEDDING_DIM"))
         .or_else(|| env_usize("ORDERK_EMBEDDING_DIM"))
-        .or_else(|| db_profile.as_ref().map(|profile| profile.embedding_dim))
         .unwrap_or(DEFAULT_EMBEDDING_DIM);
-    let embedding_model = take_optional_string(args, "--embedding-model")?
+    let embedding_model = explicit_embedding_model
+        .or_else(|| {
+            db_profile
+                .as_ref()
+                .map(|profile| profile.embedding_model.clone())
+        })
         .or_else(|| {
             env_string(&format!(
                 "ORDERK_SWORD_EMBEDDING_{provider_env_suffix}_MODEL"
@@ -2264,20 +2274,15 @@ fn resolve_embedding_profile(
         })
         .or_else(|| env_string("ORDERK_SWORD_EMBEDDING_MODEL"))
         .or_else(|| env_string("ORDERK_EMBEDDING_MODEL"))
-        .or_else(|| {
-            db_profile
-                .as_ref()
-                .map(|profile| profile.embedding_model.clone())
-        })
         .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
-    let vector_backend = take_optional_string(args, "--vector-backend")?
-        .or_else(|| env_string("ORDERK_SWORD_VECTOR_BACKEND"))
-        .or_else(|| env_string("ORDERK_VECTOR_BACKEND"))
+    let vector_backend = explicit_vector_backend
         .or_else(|| {
             db_profile
                 .as_ref()
                 .map(|profile| profile.vector_backend.as_str().to_string())
         })
+        .or_else(|| env_string("ORDERK_SWORD_VECTOR_BACKEND"))
+        .or_else(|| env_string("ORDERK_VECTOR_BACKEND"))
         .unwrap_or_else(|| DEFAULT_VECTOR_BACKEND.to_string());
     Ok(CliEmbeddingProfile {
         embedding_provider,
@@ -3104,12 +3109,6 @@ mod tests {
     #[test]
     fn doctor_surfaces_missing_sword_provider_key_without_secret_values() {
         with_clean_doctor_env(|| {
-            std::env::set_var("ORDERK_SWORD_EMBEDDING_PROVIDER", "siliconflow");
-            std::env::set_var(
-                "ORDERK_SWORD_EMBEDDING_SILICONFLOW_MODEL",
-                "fixture-sf-model",
-            );
-            std::env::set_var("ORDERK_SWORD_EMBEDDING_SILICONFLOW_DIM", "8");
             std::env::set_var("ORDERK_SWORD_RERANKER_PROVIDER", "disabled");
             std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "disabled");
 
@@ -3121,6 +3120,14 @@ mod tests {
                 "doctor".into(),
                 "--db".into(),
                 db.to_string_lossy().to_string(),
+                "--embedding-provider".into(),
+                "siliconflow".into(),
+                "--embedding-model".into(),
+                "fixture-sf-model".into(),
+                "--embedding-dim".into(),
+                "8".into(),
+                "--vector-backend".into(),
+                "exact".into(),
             ])
             .unwrap();
             assert_eq!(report.get("ok").and_then(|v| v.as_bool()), Some(false));
@@ -3283,53 +3290,60 @@ mod tests {
 
     #[test]
     fn search_without_profile_flags_inherits_existing_db_profile() {
-        let root = std::env::temp_dir().join(format!(
-            "orderk-cli-profile-inherit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let vault = root.join("vault");
-        fs::create_dir_all(&vault).unwrap();
-        fs::write(
-            vault.join("wealth.md"),
-            "# Wealth\nCashflow assets compound when profits buy more productive assets.\n",
-        )
-        .unwrap();
-        let db = root.join("orderk.sqlite");
-        run_with_args(vec![
-            "index".into(),
-            "--vault".into(),
-            vault.to_string_lossy().to_string(),
-            "--db".into(),
-            db.to_string_lossy().to_string(),
-            "--embedding-provider".into(),
-            "mock".into(),
-            "--embedding-dim".into(),
-            "8".into(),
-            "--embedding-model".into(),
-            "mock-8".into(),
-            "--vector-backend".into(),
-            "exact".into(),
-        ])
-        .unwrap();
+        with_clean_doctor_env(|| {
+            let root = std::env::temp_dir().join(format!(
+                "orderk-cli-profile-inherit-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let vault = root.join("vault");
+            fs::create_dir_all(&vault).unwrap();
+            fs::write(
+                vault.join("wealth.md"),
+                "# Wealth\nCashflow assets compound when profits buy more productive assets.\n",
+            )
+            .unwrap();
+            let db = root.join("orderk.sqlite");
+            run_with_args(vec![
+                "index".into(),
+                "--vault".into(),
+                vault.to_string_lossy().to_string(),
+                "--db".into(),
+                db.to_string_lossy().to_string(),
+                "--embedding-provider".into(),
+                "mock".into(),
+                "--embedding-dim".into(),
+                "8".into(),
+                "--embedding-model".into(),
+                "mock-8".into(),
+                "--vector-backend".into(),
+                "exact".into(),
+            ])
+            .unwrap();
 
-        run_cli_args(vec![
-            "search".into(),
-            "--db".into(),
-            db.to_string_lossy().to_string(),
-            "--query".into(),
-            "cashflow compound".into(),
-            "--limit".into(),
-            "3".into(),
-            "--view".into(),
-            "index".into(),
-        ])
-        .expect("bare search should reuse provider/model/dim/backend stored in the DB profile");
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_PROVIDER", "mock");
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_MODEL", "mock-13");
+            std::env::set_var("ORDERK_SWORD_EMBEDDING_DIM", "13");
+            std::env::set_var("ORDERK_SWORD_VECTOR_BACKEND", "exact");
 
-        let _ = fs::remove_dir_all(root);
+            run_cli_args(vec![
+                "search".into(),
+                "--db".into(),
+                db.to_string_lossy().to_string(),
+                "--query".into(),
+                "cashflow compound".into(),
+                "--limit".into(),
+                "3".into(),
+                "--view".into(),
+                "index".into(),
+            ])
+            .expect("bare search should reuse provider/model/dim/backend stored in the DB profile despite ambient env defaults");
+
+            let _ = fs::remove_dir_all(root);
+        });
     }
 
     #[test]

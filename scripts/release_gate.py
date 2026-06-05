@@ -114,6 +114,8 @@ def run(cmd: list[str]) -> dict[str, object]:
         "ok": proc.returncode == 0,
         "exit_code": proc.returncode,
         "took_ms": took_ms,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
         "stdout_tail": proc.stdout[-4000:],
         "stderr_tail": proc.stderr[-4000:],
     }
@@ -375,6 +377,84 @@ def check_stress_resource_baseline(
     return make_result("stress_resource_baseline", ok, started, stdout, stderr)
 
 
+def check_quality_effect_comparison(bench_report: dict[str, Any]) -> dict[str, object]:
+    """Require quantified base-vs-new effect metrics before release closure.
+
+    Passing tests prove the system runs. Release closure also needs scorekeeping:
+    explicit top1 / hit@k / MRR deltas against a baseline. Without this object a
+    green benchmark is treated as incomplete evidence.
+    """
+    started = time.time()
+    failures: list[str] = []
+    details: dict[str, Any] = {
+        "schema_version": "orderk.quality_effect_gate.v1",
+        "bench_schema_version": bench_report.get("schema_version"),
+        "bench_ok": bench_report.get("ok"),
+    }
+    if bench_report.get("ok") is not True:
+        failures.append("bench ok is not true")
+    effect = bench_report.get("quality_effect")
+    if not isinstance(effect, dict):
+        failures.append("quality_effect missing")
+    else:
+        metrics = effect.get("metrics")
+        thresholds = effect.get("thresholds")
+        details["comparison_type"] = effect.get("comparison_type")
+        details["metrics"] = metrics
+        details["thresholds"] = thresholds
+        if effect.get("comparison_type") != "base_vs_sword":
+            failures.append(f"quality_effect comparison_type invalid: {effect.get('comparison_type')!r}")
+        if not isinstance(metrics, dict):
+            failures.append("quality_effect metrics missing")
+            metrics = {}
+        if not isinstance(thresholds, dict):
+            failures.append("quality_effect thresholds missing")
+            thresholds = {}
+
+        def metric_float(name: str) -> float | None:
+            raw = metrics.get(name)
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                failures.append(f"quality_effect metric {name} invalid: {raw!r}")
+                return None
+            if not math.isfinite(value):
+                failures.append(f"quality_effect metric {name} non-finite: {raw!r}")
+                return None
+            return value
+
+        def threshold_float(name: str, default: float) -> float:
+            raw = thresholds.get(name)
+            if raw is None:
+                raw = default
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                failures.append(f"quality_effect threshold {name} invalid: {raw!r}")
+                return default
+            return value
+
+        query_count = metric_float("query_count")
+        top1_delta = metric_float("top1_delta")
+        hit_at_3_delta = metric_float("hit_at_3_delta")
+        hit_at_5_delta = metric_float("hit_at_5_delta")
+        mrr_avg_delta = metric_float("mrr_avg_delta")
+        if query_count is not None and query_count < threshold_float("min_query_count", 1.0):
+            failures.append(f"quality_effect query_count {query_count:g} below threshold")
+        if top1_delta is not None and top1_delta < threshold_float("min_top1_delta", 0.0):
+            failures.append(f"quality_effect top1_delta {top1_delta:g} below threshold")
+        if hit_at_3_delta is not None and hit_at_3_delta < threshold_float("min_hit_at_3_delta", 0.0):
+            failures.append(f"quality_effect hit_at_3_delta {hit_at_3_delta:g} below threshold")
+        if hit_at_5_delta is not None and hit_at_5_delta < threshold_float("min_hit_at_5_delta", 0.0):
+            failures.append(f"quality_effect hit_at_5_delta {hit_at_5_delta:g} below threshold")
+        if mrr_avg_delta is not None and mrr_avg_delta < threshold_float("min_mrr_avg_delta", 0.0):
+            failures.append(f"quality_effect mrr_avg_delta {mrr_avg_delta:g} below threshold")
+    ok = not failures
+    stdout = json.dumps(details, indent=2, sort_keys=True)
+    stderr = "" if ok else "\n".join(failures)
+    return make_result("quality_effect_comparison", ok, started, stdout, stderr)
+
+
 def check_resource_baseline(
     repo: pathlib.Path = REPO,
     baseline: dict[str, Any] | None = None,
@@ -439,7 +519,7 @@ def main() -> int:
                 return emit_failure(resource_result, results)
         if cmd == ["python3", "scripts/stress.py"]:
             try:
-                stress_report = json.loads(str(result.get("stdout_tail", "{}")))
+                stress_report = json.loads(str(result.get("stdout", result.get("stdout_tail", "{}"))))
             except json.JSONDecodeError as err:
                 stress_resource_result = make_result(
                     "stress_resource_baseline",
@@ -452,6 +532,21 @@ def main() -> int:
             results.append(stress_resource_result)
             if not stress_resource_result["ok"]:
                 return emit_failure(stress_resource_result, results)
+        if cmd == ["python3", "scripts/sword_5topic_hs_vs_v2_bench.py"]:
+            try:
+                bench_report = json.loads(str(result.get("stdout", result.get("stdout_tail", "{}"))))
+            except json.JSONDecodeError as err:
+                quality_result = make_result(
+                    "quality_effect_comparison",
+                    False,
+                    time.time(),
+                    stderr=f"5-topic bench JSON parse failed: {err}",
+                )
+            else:
+                quality_result = check_quality_effect_comparison(bench_report)
+            results.append(quality_result)
+            if not quality_result["ok"]:
+                return emit_failure(quality_result, results)
     print(json.dumps({"ok": True, "schema_version": "orderk.release_gate.v1", "results": results}, indent=2))
     return 0
 

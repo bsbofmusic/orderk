@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-06-05
+
+### Added
+- Complete the V2 full-PRD local release-ready evidence loop with deterministic gates, proposal governance, graph/digest hardening, evidence-only reasoning, read-only adapters, and full-vault active Sword Spirit verification.
+
+### Fixed
+- Harden release evidence boundaries so blocked active runs, sample benches, and full-vault active gates are reported separately instead of being conflated.
+- Reuse the stored embedding profile for existing index databases before ambient embedding environment defaults, while still allowing explicit CLI profile flags to override it.
+
 ## [0.1.14] - 2026-06-04
 
 ### Added
@@ -149,7 +158,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/bsbofmusic/orderk/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/bsbofmusic/orderk/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/bsbofmusic/orderk/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/bsbofmusic/orderk/compare/v0.1.11...v0.1.12

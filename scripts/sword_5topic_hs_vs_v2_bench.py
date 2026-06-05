@@ -217,6 +217,40 @@ def aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
     }
 
 
+def quality_effect(base: dict[str, Any], sword: dict[str, Any]) -> dict[str, Any]:
+    """Quantified quality comparison required for release closure.
+
+    A green command only proves the harness ran. This object proves the new Sword
+    path was compared against base retrieval with explicit effect metrics.
+    """
+    return {
+        "comparison_type": "base_vs_sword",
+        "metrics": {
+            "query_count": sword["n"],
+            "top1_delta": sword["top1"] - base["top1"],
+            "hit_at_3_delta": sword["hit_at_3"] - base["hit_at_3"],
+            "hit_at_5_delta": sword["hit_at_5"] - base["hit_at_5"],
+            "mrr_avg_delta": round(float(sword["mrr_avg"]) - float(base["mrr_avg"]), 4),
+            "base_top1": base["top1"],
+            "sword_top1": sword["top1"],
+            "base_hit_at_3": base["hit_at_3"],
+            "sword_hit_at_3": sword["hit_at_3"],
+            "base_hit_at_5": base["hit_at_5"],
+            "sword_hit_at_5": sword["hit_at_5"],
+            "base_mrr_avg": base["mrr_avg"],
+            "sword_mrr_avg": sword["mrr_avg"],
+        },
+        "thresholds": {
+            "min_query_count": 5,
+            "min_top1_delta": 0,
+            "min_hit_at_3_delta": 0,
+            "min_hit_at_5_delta": 0,
+            "min_mrr_avg_delta": 0.0,
+        },
+        "note": "Release closure requires quantified effect, not only pass/fail. Non-negative deltas are the deterministic no-regression floor; positive deltas are reported when present.",
+    }
+
+
 def scope_filter(tags: list[str]) -> list[str]:
     if not tags:
         return []
@@ -326,6 +360,10 @@ def main() -> None:
         )
     summary["orderk_eval"] = rows
     summary["aggregate"] = {"orderk_base": aggregate(rows, "base"), "orderk_sword": aggregate(rows, "sword")}
+    summary["quality_effect"] = quality_effect(
+        summary["aggregate"]["orderk_base"],
+        summary["aggregate"]["orderk_sword"],
+    )
     summary["hindsight_reference"] = maybe_hindsight_reference()
     failures: list[str] = []
     for row in rows:
@@ -352,6 +390,7 @@ def main() -> None:
         "root": str(ROOT),
         "summary": str(ROOT / "summary.json"),
         "aggregate": summary["aggregate"],
+        "quality_effect": summary["quality_effect"],
         "failures": failures,
         "hindsight_reference": summary["hindsight_reference"],
     }

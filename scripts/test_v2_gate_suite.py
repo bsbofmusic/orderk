@@ -357,6 +357,12 @@ class V2GateSuiteTests(unittest.TestCase):
             ["adapters_cockpit", "raw_secret_safety"],
         )
 
+    def test_batch8_quality_effect_gate_is_supported_without_unknown_gate(self) -> None:
+        suite = v2_gate_suite.run_requested_gates({"quality-effect"}, DEFAULT_FOR_TEST=True)
+        self.assertNotIn("unknown_gate", suite["claims_denied"], suite)
+        self.assertEqual([gate["gate_id"] for gate in suite["gates"]], ["quality_effect"])
+        self.assertTrue(suite["gates"][0]["metrics"]["release_gate_validates_quality_effect"], suite)
+
     def test_gate_aliases_normalize_plan_and_cli_spellings(self) -> None:
         self.assertEqual(v2_gate_suite.normalize_gate_name("raw_secret"), "raw-secret-safety")
         self.assertEqual(v2_gate_suite.normalize_gate_name("model-profile"), "profile")

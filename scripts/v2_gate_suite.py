@@ -37,6 +37,7 @@ SUPPORTED_GATES = {
     "proposals",
     "graph",
     "base-non-regression",
+    "quality-effect",
     "reasoning",
     "golden-retrieval",
     "resource-fallback",
@@ -61,6 +62,10 @@ GATE_ALIASES = {
     "write-allowlist": "proposals",
     "base-nonregression": "base-non-regression",
     "base-regression": "base-non-regression",
+    "quality": "quality-effect",
+    "quality-effect-comparison": "quality-effect",
+    "scoreboard": "quality-effect",
+    "effect": "quality-effect",
     "active-reasoning": "reasoning",
     "reason": "reasoning",
     "golden": "golden-retrieval",
@@ -1226,6 +1231,55 @@ def base_non_regression_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
     return gate_result("base_non_regression", not failures, metrics, thresholds, failures, warnings)
 
 
+def quality_effect_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    """Static guard that release closure includes a quantified scoreboard.
+
+    This does not replace the live release-gate benchmark; it prevents the V2 gate
+    suite from accepting a PRD/release loop that only proves commands are green.
+    """
+    failures: list[str] = []
+    warnings: list[str] = []
+    release_gate_py = read_repo_text("scripts/release_gate.py", repo)
+    bench_py = read_repo_text("scripts/sword_5topic_hs_vs_v2_bench.py", repo)
+    required_release_markers = [
+        "check_quality_effect_comparison",
+        "quality_effect_comparison",
+        "top1_delta",
+        "hit_at_3_delta",
+        "hit_at_5_delta",
+        "mrr_avg_delta",
+        "min_mrr_avg_delta",
+    ]
+    required_bench_markers = [
+        "quality_effect",
+        "base_vs_sword",
+        "top1_delta",
+        "hit_at_3_delta",
+        "hit_at_5_delta",
+        "mrr_avg_delta",
+        "base_top1",
+        "sword_top1",
+    ]
+    failures.extend(require_markers(release_gate_py, required_release_markers, "release_gate quality effect"))
+    failures.extend(require_markers(bench_py, required_bench_markers, "5-topic bench quality effect"))
+    if "check_quality_effect_comparison(bench_report)" not in release_gate_py:
+        failures.append("release_gate_does_not_validate_5topic_quality_effect")
+    metrics = {
+        "release_gate_validates_quality_effect": "check_quality_effect_comparison(bench_report)" in release_gate_py,
+        "bench_reports_quality_effect": "summary[\"quality_effect\"]" in bench_py,
+        "required_metric_names": ["top1_delta", "hit_at_3_delta", "hit_at_5_delta", "mrr_avg_delta"],
+        "completion_rule": "green gates without quantified baseline-vs-new deltas are not closed",
+    }
+    thresholds = {
+        "min_query_count": 5,
+        "min_top1_delta": 0,
+        "min_hit_at_3_delta": 0,
+        "min_hit_at_5_delta": 0,
+        "min_mrr_avg_delta": 0.0,
+    }
+    return gate_result("quality_effect", not failures, metrics, thresholds, failures, warnings)
+
+
 def reasoning_fixture_rows(repo: pathlib.Path = REPO) -> list[dict[str, Any]]:
     root = repo / "fixtures" / "golden_queries" / "reasoning"
     rows: list[dict[str, Any]] = []
@@ -1397,6 +1451,7 @@ def run_requested_gates(
         "resource-fallback",
         "adapters-cockpit",
         "base-non-regression",
+        "quality-effect",
         "raw-secret-safety",
         "doctor",
     ]
@@ -1423,6 +1478,8 @@ def run_requested_gates(
             gates.append(adapters_cockpit_gate(REPO))
         elif gate_id == "base-non-regression":
             gates.append(base_non_regression_gate(REPO))
+        elif gate_id == "quality-effect":
+            gates.append(quality_effect_gate(REPO))
         elif gate_id == "raw-secret-safety":
             gates.append(raw_secret_safety_gate(REPO))
         elif gate_id == "doctor":
