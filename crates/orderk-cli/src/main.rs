@@ -3,12 +3,13 @@ use orderk_core::{
     approve_proposal, classify_error_message, digest_vault, explain_graph, export_capsule_manifest,
     feedback, get_chunks, health_report, index_vault_with_options, init, inspect_capsule_manifest,
     list_proposals, optimize_apply, optimize_dry_run, optimize_reset, optimize_set,
-    optimize_status, provider_from_name, query_with_options, rebuild_graph, reject_proposal,
-    resolve_sword_model_profile_from_env, run_sword_spirit, show_proposal, status,
+    optimize_status, provider_from_name, query_with_options, reason_about_vault, rebuild_graph,
+    reject_proposal, resolve_sword_model_profile_from_env, run_sword_spirit, show_proposal, status,
     sword_spirit_status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, DigestOptions,
     EmbeddingProvider, FeedbackEvent, FreshnessMode, GraphBuildOptions, IndexOptions, QueryOptions,
-    QueryResponse, SearchIndexResponse, SwordSpiritBudgetProfile, SwordSpiritOptions,
-    SwordSpiritProposal, SwordSpiritThinkingMode, SwordSpiritTraceLevel, VectorBackend,
+    QueryResponse, ReasoningOptions, SearchIndexResponse, SwordSpiritBudgetProfile,
+    SwordSpiritOptions, SwordSpiritProposal, SwordSpiritThinkingMode, SwordSpiritTraceLevel,
+    VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -280,6 +281,10 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let resp = proposals_command(&mut args)?;
             print_json(&resp)?;
         }
+        "reason" => {
+            let resp = reason_command(&mut args)?;
+            print_json(&resp)?;
+        }
         "mcp" => {
             run_mcp_server(&mut args)?;
         }
@@ -390,6 +395,31 @@ fn digest_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         }
         other => Err(anyhow!("unknown digest subcommand: {other}")),
     }
+}
+
+fn reason_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
+    let vault = take_path(args, "--vault")?;
+    let query = take_required_string(args, "--query")?;
+    let context_paths = take_repeated_strings(args, "--context")?;
+    let allow_llm = take_flag(args, "--allow-llm");
+    let confidence_hint = take_optional_f32(args, "--confidence")?;
+    if let Some(value) = confidence_hint {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(anyhow!("--confidence must be between 0 and 1"));
+        }
+    }
+    if !args.is_empty() {
+        return Err(anyhow!("unknown reason flag(s): {}", args.join(" ")));
+    }
+    Ok(serde_json::to_value(reason_about_vault(
+        &vault,
+        ReasoningOptions {
+            query,
+            context_paths,
+            allow_llm,
+            confidence_hint,
+        },
+    )?)?)
 }
 
 fn proposals_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
@@ -1946,6 +1976,18 @@ fn take_required_string(args: &mut Vec<String>, name: &str) -> Result<String> {
     take_optional_string(args, name)?.ok_or_else(|| anyhow!("{} is required", name))
 }
 
+fn take_repeated_strings(args: &mut Vec<String>, name: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    while let Some(pos) = args.iter().position(|arg| arg == name) {
+        args.remove(pos);
+        if pos >= args.len() {
+            return Err(anyhow!("{} requires a value", name));
+        }
+        out.push(args.remove(pos));
+    }
+    Ok(out)
+}
+
 fn take_positional(args: &mut Vec<String>, label: &str) -> Result<String> {
     let Some(first) = args.first() else {
         return Err(anyhow!("{label} is required"));
@@ -2273,6 +2315,7 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
         "sword" | "sword-spirit" => sword_spirit_command(&mut args),
         "graph" => graph_command(&mut args),
         "digest" => digest_command(&mut args),
+        "reason" => reason_command(&mut args),
         other => Err(anyhow!("unsupported test command: {other}")),
     }
 }
@@ -2652,6 +2695,80 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(vault.join("alpha.md")).unwrap(), before);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reason_cli_outputs_evidence_only_without_raw_writes() {
+        let root = temp_root("reason-cli");
+        let vault = root.join("vault");
+        fs::create_dir_all(vault.join("wiki/concepts")).unwrap();
+        fs::write(
+            vault.join("wiki/concepts/cashflow.md"),
+            "# Cashflow\nCashflow supports durable decisions.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("wiki/concepts/moat.md"),
+            "# Moat\nMoat and cashflow should be compared before strategy changes.\n",
+        )
+        .unwrap();
+        let before = fs::read_to_string(vault.join("wiki/concepts/cashflow.md")).unwrap();
+        let resp = run_with_args(vec![
+            "reason".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--query".into(),
+            "judge cashflow versus moat architecture tradeoff".into(),
+            "--context".into(),
+            "wiki/concepts/cashflow.md".into(),
+            "--context".into(),
+            "wiki/concepts/moat.md".into(),
+            "--allow-llm".into(),
+            "--confidence".into(),
+            "0.42".into(),
+        ])
+        .unwrap();
+        assert_eq!(resp["schema_version"], "orderk.reasoning.result.v1");
+        assert_eq!(resp["reasoning_triggered"], true);
+        assert_eq!(resp["llm_calls"], 0);
+        assert_eq!(resp["boundary"]["direct_write_allowed"], false);
+        assert_eq!(resp["suggested_patch"]["route"], "proposal_flow_only");
+        assert_eq!(
+            fs::read_to_string(vault.join("wiki/concepts/cashflow.md")).unwrap(),
+            before
+        );
+
+        let err = run_with_args(vec![
+            "reason".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--query".into(),
+            "judge".into(),
+            "--surprise".into(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown reason flag"), "{err:#}");
+        let bad_confidence = run_with_args(vec![
+            "reason".into(),
+            "--vault".into(),
+            vault.display().to_string(),
+            "--query".into(),
+            "判断 cashflow".into(),
+            "--confidence".into(),
+            "NaN".into(),
+        ]);
+        assert!(bad_confidence.is_err());
+        let bad_confidence = run_with_args(vec![
+            "reason".into(),
+            "--vault".into(),
+            vault.display().to_string(),
+            "--query".into(),
+            "判断 cashflow".into(),
+            "--confidence".into(),
+            "1.5".into(),
+        ]);
+        assert!(bad_confidence.is_err());
         let _ = fs::remove_dir_all(root);
     }
 

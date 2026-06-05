@@ -12,6 +12,7 @@ pub mod models;
 pub mod optimizer;
 pub mod profiles;
 pub mod proposals;
+pub mod reasoning;
 pub mod scanner;
 pub mod sword_spirit;
 pub mod v2_schema;
@@ -38,6 +39,10 @@ pub use profiles::{
     SwordModelProfile, SwordModelSlot,
 };
 pub use proposals::{approve_proposal, list_proposals, reject_proposal, show_proposal};
+pub use reasoning::{
+    reason_about_vault, ReasoningBoundary, ReasoningEvidence, ReasoningOptions, ReasoningRelation,
+    ReasoningReport, SuggestedPatch,
+};
 pub use sword_spirit::{
     default_sword_embedding_dim, default_sword_embedding_model, default_sword_embedding_provider,
     default_sword_llm_model, default_sword_llm_provider, default_sword_reranker_model,

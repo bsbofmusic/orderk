@@ -1,0 +1,72 @@
+{
+  "$id": "https://orderk.local/schemas/orderk.v2.reasoning_result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "boundary": {
+      "additionalProperties": false,
+      "properties": {
+        "direct_write_allowed": {"const": false},
+        "evidence_only": {"const": true},
+        "graph_write_allowed": {"const": false},
+        "raw_write_allowed": {"const": false},
+        "suggested_patch_route": {"const": "proposals"},
+        "wiki_write_allowed": {"const": false}
+      },
+      "required": ["evidence_only", "direct_write_allowed", "raw_write_allowed", "wiki_write_allowed", "graph_write_allowed", "suggested_patch_route"],
+      "type": "object"
+    },
+    "confidence": {"type": "number"},
+    "conclusion": {"type": "string"},
+    "evidence_used": {"type": "array"},
+    "llm_allowed": {"type": "boolean"},
+    "llm_calls": {"type": "integer"},
+    "llm_invocation": {"enum": ["not_called_no_trigger", "not_called_evidence_only", "not_allowed_evidence_only"]},
+    "mode": {"const": "evidence_only"},
+    "mutation_policy": {"const": "no_direct_writes"},
+    "ok": {"const": true},
+    "query": {"type": "string"},
+    "raw_unchanged": {"const": true},
+    "reasoning_triggered": {"type": "boolean"},
+    "relations_activated": {"type": "array"},
+    "schema_version": {"const": "orderk.reasoning.result.v1"},
+    "suggested_patch": {
+      "additionalProperties": false,
+      "properties": {
+        "apply_allowed": {"const": false},
+        "patch_text": {"type": ["string", "null"]},
+        "relation": {"type": ["string", "null"]},
+        "route": {"const": "proposal_flow_only"},
+        "status": {"enum": ["proposal_required", "not_suggested_no_trigger"]},
+        "summary": {"type": "string"},
+        "target_path": {"type": ["string", "null"]}
+      },
+      "required": ["status", "route", "apply_allowed", "target_path", "relation", "summary", "patch_text"],
+      "type": "object"
+    },
+    "trigger_reasons": {"type": "array"},
+    "warnings": {"type": "array"}
+  },
+  "required": [
+    "ok",
+    "schema_version",
+    "mode",
+    "query",
+    "reasoning_triggered",
+    "trigger_reasons",
+    "llm_allowed",
+    "llm_calls",
+    "llm_invocation",
+    "evidence_used",
+    "relations_activated",
+    "conclusion",
+    "confidence",
+    "boundary",
+    "suggested_patch",
+    "mutation_policy",
+    "raw_unchanged",
+    "warnings"
+  ],
+  "title": "orderk V2 reasoning result contract",
+  "type": "object"
+}

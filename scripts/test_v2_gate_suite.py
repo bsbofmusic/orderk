@@ -338,6 +338,17 @@ class V2GateSuiteTests(unittest.TestCase):
             ["fixture_integrity", "graph", "base_non_regression", "raw_secret_safety"],
         )
 
+    def test_batch6_plan_gate_names_are_supported_without_unknown_gate(self) -> None:
+        suite = v2_gate_suite.run_requested_gates(
+            {"reasoning", "golden-retrieval", "resource-fallback"},
+            DEFAULT_FOR_TEST=True,
+        )
+        self.assertNotIn("unknown_gate", suite["claims_denied"], suite)
+        self.assertEqual(
+            [gate["gate_id"] for gate in suite["gates"]],
+            ["reasoning", "golden_retrieval", "resource_fallback"],
+        )
+
     def test_gate_aliases_normalize_plan_and_cli_spellings(self) -> None:
         self.assertEqual(v2_gate_suite.normalize_gate_name("raw_secret"), "raw-secret-safety")
         self.assertEqual(v2_gate_suite.normalize_gate_name("model-profile"), "profile")
@@ -345,6 +356,23 @@ class V2GateSuiteTests(unittest.TestCase):
         self.assertEqual(v2_gate_suite.normalize_gate_name("proposal-governance"), "proposals")
         self.assertEqual(v2_gate_suite.normalize_gate_name("digest-fixture"), "fixture-integrity")
         self.assertEqual(v2_gate_suite.normalize_gate_name("base-nonregression"), "base-non-regression")
+        self.assertEqual(v2_gate_suite.normalize_gate_name("active-reasoning"), "reasoning")
+        self.assertEqual(v2_gate_suite.normalize_gate_name("golden"), "golden-retrieval")
+        self.assertEqual(v2_gate_suite.normalize_gate_name("fallback"), "resource-fallback")
+
+    def test_extract_rust_pub_struct_fields_detects_reasoning_schema_drift(self) -> None:
+        source = """
+#[derive(Serialize)]
+pub struct ReasoningReport {
+    pub ok: bool,
+    pub llm_allowed: bool,
+    pub evidence_used: Vec<String>,
+}
+"""
+        self.assertEqual(
+            v2_gate_suite.extract_rust_pub_struct_fields(source, "ReasoningReport"),
+            {"ok", "llm_allowed", "evidence_used"},
+        )
 
     def test_rust_runtime_text_strips_cfg_test_items_only(self) -> None:
         source = """

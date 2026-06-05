@@ -37,6 +37,9 @@ SUPPORTED_GATES = {
     "proposals",
     "graph",
     "base-non-regression",
+    "reasoning",
+    "golden-retrieval",
+    "resource-fallback",
 }
 GATE_ALIASES = {
     "fixture": "fixture-integrity",
@@ -57,6 +60,12 @@ GATE_ALIASES = {
     "write-allowlist": "proposals",
     "base-nonregression": "base-non-regression",
     "base-regression": "base-non-regression",
+    "active-reasoning": "reasoning",
+    "reason": "reasoning",
+    "golden": "golden-retrieval",
+    "retrieval": "golden-retrieval",
+    "fallback": "resource-fallback",
+    "resource": "resource-fallback",
 }
 RAW_SECRET_SCAN_EXCLUDES = {
     "Cargo.lock",
@@ -92,6 +101,26 @@ SEARCH_REQUIRED = {
 }
 PROPOSAL_REQUIRED = {"schema_version", "id", "run_id", "relation", "from", "to", "confidence", "evidence", "status"}
 DIGEST_REQUIRED = {"schema_version", "run_id", "thinking", "sidecars", "raw_unchanged"}
+REASONING_REQUIRED = {
+    "ok",
+    "schema_version",
+    "mode",
+    "query",
+    "reasoning_triggered",
+    "trigger_reasons",
+    "llm_allowed",
+    "llm_calls",
+    "llm_invocation",
+    "evidence_used",
+    "relations_activated",
+    "conclusion",
+    "confidence",
+    "boundary",
+    "suggested_patch",
+    "mutation_policy",
+    "raw_unchanged",
+    "warnings",
+}
 
 
 def load_jsonl(path: pathlib.Path) -> list[dict[str, Any]]:
@@ -491,11 +520,44 @@ def validate_schema_subset(instance: Any, schema: dict[str, Any], path: str = "$
     return failures
 
 
-def schema_contract_gate(schema_dir: pathlib.Path = DEFAULT_SCHEMA_DIR) -> dict[str, Any]:
+def extract_rust_pub_struct_fields(source: str, struct_name: str) -> set[str]:
+    start = source.find(f"pub struct {struct_name}")
+    if start < 0:
+        return set()
+    brace_start = source.find("{", start)
+    if brace_start < 0:
+        return set()
+    depth = 0
+    end = brace_start
+    for idx in range(brace_start, len(source)):
+        ch = source[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx
+                break
+    body = source[brace_start + 1 : end]
+    fields: set[str] = set()
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("pub ") or ":" not in line:
+            continue
+        left = line.split(":", 1)[0]
+        name = left.removeprefix("pub").strip()
+        if name.startswith("r#"):
+            name = name[2:]
+        if name and all(part.isidentifier() for part in name.split("_")):
+            fields.add(name)
+    return fields
+
+
+def schema_contract_gate(schema_dir: pathlib.Path = DEFAULT_SCHEMA_DIR, repo: pathlib.Path = REPO) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
     loaded: dict[str, dict[str, Any]] = {}
-    for name in ["search_result", "proposal", "digest_run"]:
+    for name in ["search_result", "proposal", "digest_run", "reasoning_result"]:
         path = schema_dir / f"orderk.v2.{name}.schema.json"
         try:
             loaded[name] = load_json(path)
@@ -560,6 +622,58 @@ def schema_contract_gate(schema_dir: pathlib.Path = DEFAULT_SCHEMA_DIR) -> dict[
         if schema_failures:
             failures.append(f"digest_sample_schema_invalid: {schema_failures[:5]}")
 
+    if "reasoning_result" in loaded:
+        required = schema_required(loaded["reasoning_result"])
+        runtime_fields = extract_rust_pub_struct_fields(
+            read_repo_text("crates/orderk-core/src/reasoning.rs", repo),
+            "ReasoningReport",
+        )
+        if required != REASONING_REQUIRED:
+            failures.append(f"reasoning_required_mismatch expected={sorted(REASONING_REQUIRED)} actual={sorted(required)}")
+        if runtime_fields != required:
+            failures.append(
+                "reasoning_runtime_schema_field_mismatch "
+                f"runtime={sorted(runtime_fields)} schema_required={sorted(required)}"
+            )
+        sample = {
+            "ok": True,
+            "schema_version": "orderk.reasoning.result.v1",
+            "mode": "evidence_only",
+            "query": "judge cashflow tradeoff",
+            "reasoning_triggered": True,
+            "trigger_reasons": ["explicit_high_level_intent"],
+            "llm_allowed": True,
+            "llm_calls": 0,
+            "llm_invocation": "not_called_evidence_only",
+            "evidence_used": [],
+            "relations_activated": [],
+            "conclusion": "evidence only",
+            "confidence": 0.5,
+            "boundary": {
+                "evidence_only": True,
+                "direct_write_allowed": False,
+                "raw_write_allowed": False,
+                "wiki_write_allowed": False,
+                "graph_write_allowed": False,
+                "suggested_patch_route": "proposals",
+            },
+            "suggested_patch": {
+                "status": "proposal_required",
+                "route": "proposal_flow_only",
+                "apply_allowed": False,
+                "target_path": None,
+                "relation": None,
+                "summary": "route through proposals",
+                "patch_text": None,
+            },
+            "mutation_policy": "no_direct_writes",
+            "raw_unchanged": True,
+            "warnings": [],
+        }
+        schema_failures = validate_schema_subset(sample, loaded["reasoning_result"])
+        if schema_failures:
+            failures.append(f"reasoning_sample_schema_invalid: {schema_failures[:5]}")
+
     metrics = {
         "schemas_checked": sorted(loaded),
         "schema_hashes": {
@@ -567,11 +681,15 @@ def schema_contract_gate(schema_dir: pathlib.Path = DEFAULT_SCHEMA_DIR) -> dict[
             for name in loaded
             if (schema_dir / f"orderk.v2.{name}.schema.json").is_file()
         },
+        "reasoning_runtime_fields": sorted(
+            extract_rust_pub_struct_fields(read_repo_text("crates/orderk-core/src/reasoning.rs", repo), "ReasoningReport")
+        ),
     }
     thresholds = {
         "search_required": sorted(SEARCH_REQUIRED),
         "proposal_required": sorted(PROPOSAL_REQUIRED),
         "digest_required": sorted(DIGEST_REQUIRED),
+        "reasoning_required": sorted(REASONING_REQUIRED),
         "allowed_relations": sorted(ALLOWED_RELATIONS),
         "allowed_statuses": sorted(ALLOWED_STATUSES),
         "allowed_fallback_invocations": sorted(ALLOWED_FALLBACK_INVOCATIONS),
@@ -1014,6 +1132,140 @@ def base_non_regression_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
     return gate_result("base_non_regression", not failures, metrics, thresholds, failures, warnings)
 
 
+def reasoning_fixture_rows(repo: pathlib.Path = REPO) -> list[dict[str, Any]]:
+    root = repo / "fixtures" / "golden_queries" / "reasoning"
+    rows: list[dict[str, Any]] = []
+    if not root.is_dir():
+        return rows
+    for path in sorted(root.glob("*.jsonl")):
+        rows.extend(load_jsonl(path))
+    return rows
+
+
+def reasoning_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    reasoning_rs = read_repo_text("crates/orderk-core/src/reasoning.rs", repo)
+    lib_rs = read_repo_text("crates/orderk-core/src/lib.rs", repo)
+    cli_rs = read_repo_text("crates/orderk-cli/src/main.rs", repo)
+    core_test = read_repo_text("crates/orderk-core/tests/batch6_reasoning_contract.rs", repo)
+    fixture_rows = reasoning_fixture_rows(repo)
+    required_markers = [
+        "reason_about_vault",
+        "ReasoningReport",
+        "evidence_used",
+        "relations_activated",
+        "suggested_patch",
+        "direct_write_allowed: false",
+        "raw_unchanged: true",
+        "llm_calls: 0",
+        "not_called_no_trigger",
+        "not_called_evidence_only",
+        "no_direct_writes",
+        "proposal_flow_only",
+        "sanitize_excerpt",
+    ]
+    failures.extend(require_markers(reasoning_rs, required_markers, "reasoning.rs"))
+    failures.extend(require_markers(lib_rs, ["pub mod reasoning", "reason_about_vault"], "lib.rs"))
+    failures.extend(require_markers(cli_rs, ["reason_command", '"reason"', "unknown reason flag", "--confidence must be between 0 and 1", "take_optional_f32"], "main.rs"))
+    failures.extend(
+        require_markers(
+            core_test,
+            [
+                "reasoning_no_trigger_keeps_llm_zero_and_does_not_write",
+                "reasoning_trigger_outputs_evidence_only_proposal_patch_without_mutating_vault",
+                "reasoning_rejects_unsafe_context_paths",
+                "reasoning_evidence_excerpts_redact_common_secret_shapes",
+            ],
+            "batch6_reasoning_contract.rs",
+        )
+    )
+    runtime_text = rust_runtime_text(reasoning_rs)
+    forbidden_write_markers = ["fs::write", "OpenOptions", "create_dir_all", "File::create"]
+    for marker in forbidden_write_markers:
+        if marker in runtime_text:
+            failures.append(f"reasoning_runtime_has_direct_write_marker:{marker}")
+    if not fixture_rows:
+        failures.append("reasoning_fixtures_missing")
+    invalid_fixture_rows: list[str] = []
+    llm_nonzero_rows: list[str] = []
+    llm_allowed_without_reason: list[str] = []
+    missing_fields: list[str] = []
+    for row in fixture_rows:
+        row_id = str(row.get("id", "<missing>"))
+        if row.get("schema_version") != "orderk.reasoning_fixture.v1":
+            invalid_fixture_rows.append(f"{row_id}:bad_schema")
+        if row.get("llm_allowed") is True and row.get("reasoning_expected") is not True:
+            llm_allowed_without_reason.append(row_id)
+        if row.get("expected_llm_calls") != 0:
+            llm_nonzero_rows.append(row_id)
+        expected_fields = row.get("expected_fields") or []
+        for field in ["evidence_used", "relations_activated", "conclusion", "confidence", "boundary", "suggested_patch"]:
+            if field not in expected_fields:
+                missing_fields.append(f"{row_id}:{field}")
+        forbidden_writes = row.get("forbidden_writes") or []
+        if not forbidden_writes:
+            invalid_fixture_rows.append(f"{row_id}:missing_forbidden_writes")
+        for path in row.get("context_paths") or []:
+            _normalized, error = validate_vault_rel_path(path, repo / "fixtures" / "eval" / "vault")
+            if error:
+                invalid_fixture_rows.append(f"{row_id}:context_path:{error}")
+    if invalid_fixture_rows:
+        failures.append(f"invalid_reasoning_fixtures: {invalid_fixture_rows[:20]}")
+    if llm_nonzero_rows:
+        failures.append(f"reasoning_fixture_expected_llm_calls_nonzero: {llm_nonzero_rows[:20]}")
+    if llm_allowed_without_reason:
+        failures.append(f"reasoning_llm_allowed_without_trigger: {llm_allowed_without_reason[:20]}")
+    if missing_fields:
+        failures.append(f"reasoning_fixture_missing_expected_fields: {missing_fields[:20]}")
+    metrics = {
+        "reasoning_fixture_rows": len(fixture_rows),
+        "runtime_direct_write_markers": [marker for marker in forbidden_write_markers if marker in runtime_text],
+        "triggered_fixture_rows": sum(1 for row in fixture_rows if row.get("reasoning_expected") is True),
+        "no_trigger_fixture_rows": sum(1 for row in fixture_rows if row.get("reasoning_expected") is False),
+    }
+    thresholds = {"min_reasoning_fixture_rows": 2, "max_runtime_direct_write_markers": 0, "expected_llm_calls": 0}
+    if len(fixture_rows) < 2:
+        failures.append(f"reasoning_fixture_rows {len(fixture_rows)} < 2")
+    return gate_result("reasoning", not failures, metrics, thresholds, failures, warnings)
+
+
+def golden_retrieval_gate(golden: pathlib.Path = DEFAULT_GOLDEN, digest: pathlib.Path = DEFAULT_DIGEST, vault: pathlib.Path = DEFAULT_VAULT) -> dict[str, Any]:
+    base = fixture_integrity_gate(golden, digest, vault)
+    failures = list(base.get("failures", []))
+    metrics = dict(base.get("metrics", {}))
+    thresholds = dict(base.get("thresholds", {}))
+    metrics["source_gate"] = "fixture_integrity"
+    return gate_result("golden_retrieval", not failures, metrics, thresholds, failures, base.get("warnings", []))
+
+
+def resource_fallback_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    reasoning_rs = read_repo_text("crates/orderk-core/src/reasoning.rs", repo)
+    bench_py = read_repo_text("scripts/sword_hs_bench.py", repo)
+    test_py = read_repo_text("scripts/test_sword_hs_bench.py", repo)
+    required = [
+        "not_called_no_trigger",
+        "not_called_evidence_only",
+        "llm_calls: 0",
+        "missing_active_llm_key",
+        "live_active_sword_llm_probe",
+        "claims_denied",
+        "test_active_exit_zero_without_key_or_llm_call_is_blocked_not_live_pass",
+    ]
+    failures.extend(require_markers(reasoning_rs + bench_py + test_py, required, "resource fallback"))
+    if "state': 'pass'" in bench_py and "live_llm_called" not in bench_py:
+        failures.append("active_probe_pass_without_live_llm_guard")
+    metrics = {
+        "reasoning_has_zero_llm_path": "llm_calls: 0" in reasoning_rs,
+        "active_probe_missing_key_blocked": "missing_active_llm_key" in bench_py,
+        "active_probe_live_guard": "live_llm_called" in bench_py,
+    }
+    thresholds = {"expected_no_trigger_llm_calls": 0, "active_missing_key_state": "blocked"}
+    return gate_result("resource_fallback", not failures, metrics, thresholds, failures, warnings)
+
+
 def normalize_gate_name(name: str) -> str:
     normalized = name.strip().replace("_", "-")
     return GATE_ALIASES.get(normalized, normalized)
@@ -1073,6 +1325,9 @@ def run_requested_gates(
         "profile",
         "proposals",
         "graph",
+        "reasoning",
+        "golden-retrieval",
+        "resource-fallback",
         "base-non-regression",
         "raw-secret-safety",
         "doctor",
@@ -1083,13 +1338,19 @@ def run_requested_gates(
         if gate_id == "fixture-integrity":
             gates.append(fixture_integrity_gate(golden, digest, vault))
         elif gate_id == "schema-contract":
-            gates.append(schema_contract_gate(schema_dir))
+            gates.append(schema_contract_gate(schema_dir, REPO))
         elif gate_id == "profile":
             gates.append(profile_gate(REPO))
         elif gate_id == "proposals":
             gates.append(proposals_gate(REPO))
         elif gate_id == "graph":
             gates.append(graph_gate(REPO))
+        elif gate_id == "reasoning":
+            gates.append(reasoning_gate(REPO))
+        elif gate_id == "golden-retrieval":
+            gates.append(golden_retrieval_gate(golden, digest, vault))
+        elif gate_id == "resource-fallback":
+            gates.append(resource_fallback_gate(REPO))
         elif gate_id == "base-non-regression":
             gates.append(base_non_regression_gate(REPO))
         elif gate_id == "raw-secret-safety":
