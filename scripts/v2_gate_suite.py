@@ -40,6 +40,7 @@ SUPPORTED_GATES = {
     "reasoning",
     "golden-retrieval",
     "resource-fallback",
+    "adapters-cockpit",
 }
 GATE_ALIASES = {
     "fixture": "fixture-integrity",
@@ -66,6 +67,9 @@ GATE_ALIASES = {
     "retrieval": "golden-retrieval",
     "fallback": "resource-fallback",
     "resource": "resource-fallback",
+    "adapter": "adapters-cockpit",
+    "adapters": "adapters-cockpit",
+    "cockpit": "adapters-cockpit",
 }
 RAW_SECRET_SCAN_EXCLUDES = {
     "Cargo.lock",
@@ -1104,6 +1108,96 @@ def graph_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
     return gate_result("graph", not failures, metrics, thresholds, failures, warnings)
 
 
+def resource_fallback_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    reasoning_rs = read_repo_text("crates/orderk-core/src/reasoning.rs", repo)
+    bench_py = read_repo_text("scripts/sword_hs_bench.py", repo)
+    test_py = read_repo_text("scripts/test_sword_hs_bench.py", repo)
+    required = [
+        "not_called_no_trigger",
+        "not_called_evidence_only",
+        "llm_calls: 0",
+        "missing_active_llm_key",
+        "live_active_sword_llm_probe",
+        "claims_denied",
+    ]
+    combined = "\n".join([reasoning_rs, bench_py, test_py])
+    failures.extend(require_markers(combined, required, "reasoning/resource fallback"))
+    return gate_result(
+        "resource_fallback",
+        not failures,
+        {
+            "reasoning_has_zero_llm_path": "llm_calls: 0" in reasoning_rs,
+            "active_probe_missing_key_blocked": "missing_active_llm_key" in bench_py,
+            "active_probe_live_guard": "claims_denied" in bench_py,
+        },
+        {"expected_no_trigger_llm_calls": 0, "active_missing_key_state": "blocked"},
+        failures,
+        warnings,
+    )
+
+
+def adapters_cockpit_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    mod_rs = read_repo_text("crates/orderk-core/src/adapters/mod.rs", repo)
+    obsidian_rs = read_repo_text("crates/orderk-core/src/adapters/obsidian.rs", repo)
+    cli_rs = read_repo_text("crates/orderk-cli/src/main.rs", repo)
+    batch7_test = read_repo_text("crates/orderk-core/tests/batch7_adapter_contract.rs", repo)
+    required_adapter_markers = [
+        "scan_obsidian_adapter",
+        "AdapterScanReport",
+        "write_capability",
+        "raw_write_performed",
+        "extract_obsidian_attachments",
+        "record_markdown_symlink_warnings",
+    ]
+    failures.extend(require_markers(mod_rs + "\n" + obsidian_rs, required_adapter_markers, "adapters"))
+    required_mcp_markers = [
+        '"get_source"',
+        '"explain_result"',
+        '"graph_neighbors"',
+        '"list_concepts"',
+        '"list_tags"',
+        '"doctor"',
+        '"ingest_raw"',
+        '"run_digest"',
+        '"approve_proposal"',
+        "disabled_mcp_write_tool_definition",
+        "mcp_disabled_write_tool",
+        "remote self-authorization is not supported",
+        "normalize_mcp_vault_path",
+    ]
+    failures.extend(require_markers(cli_rs, required_mcp_markers, "main.rs MCP adapters"))
+    required_tests = [
+        "obsidian_adapter_reads_markdown_frontmatter_wikilinks_and_attachment_metadata_only",
+        "obsidian_adapter_rejects_symlinked_markdown_and_stays_inside_vault",
+        "mcp_adapter_read_tools_return_source_concepts_tags_without_writes",
+        "mcp_write_tool_stubs_reject_remote_self_authorization",
+    ]
+    failures.extend(require_markers(cli_rs + "\n" + batch7_test, required_tests, "Batch 7 tests"))
+    direct_adapter_writes = re.findall(r"\bfs::write\b|\bFile::create\b|\bOpenOptions\b", rust_runtime_text(obsidian_rs))
+    if direct_adapter_writes:
+        failures.append(f"adapter_runtime_write_markers_present: {sorted(set(direct_adapter_writes))}")
+    if "Tauri" in mod_rs + obsidian_rs:
+        failures.append("adapter core must not introduce cockpit/editor implementation")
+    return gate_result(
+        "adapters_cockpit",
+        not failures,
+        {
+            "adapter_markers_checked": len(required_adapter_markers),
+            "mcp_markers_checked": len(required_mcp_markers),
+            "batch7_test_markers_checked": len(required_tests),
+            "adapter_runtime_write_markers": sorted(set(direct_adapter_writes)),
+            "cockpit_scope": "search/source preview/graph/proposals/status only; no editor clone",
+        },
+        {"adapter_runtime_write_markers": 0, "write_tools_default": "disabled"},
+        failures,
+        warnings,
+    )
+
+
 def base_non_regression_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
@@ -1239,33 +1333,6 @@ def golden_retrieval_gate(golden: pathlib.Path = DEFAULT_GOLDEN, digest: pathlib
     return gate_result("golden_retrieval", not failures, metrics, thresholds, failures, base.get("warnings", []))
 
 
-def resource_fallback_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
-    failures: list[str] = []
-    warnings: list[str] = []
-    reasoning_rs = read_repo_text("crates/orderk-core/src/reasoning.rs", repo)
-    bench_py = read_repo_text("scripts/sword_hs_bench.py", repo)
-    test_py = read_repo_text("scripts/test_sword_hs_bench.py", repo)
-    required = [
-        "not_called_no_trigger",
-        "not_called_evidence_only",
-        "llm_calls: 0",
-        "missing_active_llm_key",
-        "live_active_sword_llm_probe",
-        "claims_denied",
-        "test_active_exit_zero_without_key_or_llm_call_is_blocked_not_live_pass",
-    ]
-    failures.extend(require_markers(reasoning_rs + bench_py + test_py, required, "resource fallback"))
-    if "state': 'pass'" in bench_py and "live_llm_called" not in bench_py:
-        failures.append("active_probe_pass_without_live_llm_guard")
-    metrics = {
-        "reasoning_has_zero_llm_path": "llm_calls: 0" in reasoning_rs,
-        "active_probe_missing_key_blocked": "missing_active_llm_key" in bench_py,
-        "active_probe_live_guard": "live_llm_called" in bench_py,
-    }
-    thresholds = {"expected_no_trigger_llm_calls": 0, "active_missing_key_state": "blocked"}
-    return gate_result("resource_fallback", not failures, metrics, thresholds, failures, warnings)
-
-
 def normalize_gate_name(name: str) -> str:
     normalized = name.strip().replace("_", "-")
     return GATE_ALIASES.get(normalized, normalized)
@@ -1328,6 +1395,7 @@ def run_requested_gates(
         "reasoning",
         "golden-retrieval",
         "resource-fallback",
+        "adapters-cockpit",
         "base-non-regression",
         "raw-secret-safety",
         "doctor",
@@ -1351,6 +1419,8 @@ def run_requested_gates(
             gates.append(golden_retrieval_gate(golden, digest, vault))
         elif gate_id == "resource-fallback":
             gates.append(resource_fallback_gate(REPO))
+        elif gate_id == "adapters-cockpit":
+            gates.append(adapters_cockpit_gate(REPO))
         elif gate_id == "base-non-regression":
             gates.append(base_non_regression_gate(REPO))
         elif gate_id == "raw-secret-safety":

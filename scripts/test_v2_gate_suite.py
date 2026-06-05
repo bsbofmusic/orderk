@@ -349,6 +349,14 @@ class V2GateSuiteTests(unittest.TestCase):
             ["reasoning", "golden_retrieval", "resource_fallback"],
         )
 
+    def test_batch7_plan_gate_names_are_supported_without_unknown_gate(self) -> None:
+        suite = v2_gate_suite.run_requested_gates({"adapters-cockpit", "raw-secret"}, DEFAULT_FOR_TEST=True)
+        self.assertNotIn("unknown_gate", suite["claims_denied"], suite)
+        self.assertEqual(
+            [gate["gate_id"] for gate in suite["gates"]],
+            ["adapters_cockpit", "raw_secret_safety"],
+        )
+
     def test_gate_aliases_normalize_plan_and_cli_spellings(self) -> None:
         self.assertEqual(v2_gate_suite.normalize_gate_name("raw_secret"), "raw-secret-safety")
         self.assertEqual(v2_gate_suite.normalize_gate_name("model-profile"), "profile")
@@ -359,6 +367,8 @@ class V2GateSuiteTests(unittest.TestCase):
         self.assertEqual(v2_gate_suite.normalize_gate_name("active-reasoning"), "reasoning")
         self.assertEqual(v2_gate_suite.normalize_gate_name("golden"), "golden-retrieval")
         self.assertEqual(v2_gate_suite.normalize_gate_name("fallback"), "resource-fallback")
+        self.assertEqual(v2_gate_suite.normalize_gate_name("adapters"), "adapters-cockpit")
+        self.assertEqual(v2_gate_suite.normalize_gate_name("cockpit"), "adapters-cockpit")
 
     def test_extract_rust_pub_struct_fields_detects_reasoning_schema_drift(self) -> None:
         source = """

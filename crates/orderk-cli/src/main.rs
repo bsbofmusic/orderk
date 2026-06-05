@@ -4,12 +4,12 @@ use orderk_core::{
     feedback, get_chunks, health_report, index_vault_with_options, init, inspect_capsule_manifest,
     list_proposals, optimize_apply, optimize_dry_run, optimize_reset, optimize_set,
     optimize_status, provider_from_name, query_with_options, reason_about_vault, rebuild_graph,
-    reject_proposal, resolve_sword_model_profile_from_env, run_sword_spirit, show_proposal, status,
-    sword_spirit_status, write_capsule_manifest, ChunkGetDetail, ChunkGetOptions, DigestOptions,
-    EmbeddingProvider, FeedbackEvent, FreshnessMode, GraphBuildOptions, IndexOptions, QueryOptions,
-    QueryResponse, ReasoningOptions, SearchIndexResponse, SwordSpiritBudgetProfile,
-    SwordSpiritOptions, SwordSpiritProposal, SwordSpiritThinkingMode, SwordSpiritTraceLevel,
-    VectorBackend,
+    reject_proposal, resolve_sword_model_profile_from_env, run_sword_spirit, scan_obsidian_adapter,
+    show_proposal, status, sword_spirit_status, write_capsule_manifest, AdapterScanOptions,
+    ChunkGetDetail, ChunkGetOptions, DigestOptions, EmbeddingProvider, FeedbackEvent,
+    FreshnessMode, GraphBuildOptions, IndexOptions, QueryOptions, QueryResponse, ReasoningOptions,
+    SearchIndexResponse, SwordSpiritBudgetProfile, SwordSpiritOptions, SwordSpiritProposal,
+    SwordSpiritThinkingMode, SwordSpiritTraceLevel, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1488,6 +1488,7 @@ fn run_eval_report(
 #[derive(Debug, Clone)]
 struct McpConfig {
     db: PathBuf,
+    vault: Option<PathBuf>,
     embedding_provider: String,
     embedding_dim: usize,
     embedding_model: String,
@@ -1496,9 +1497,14 @@ struct McpConfig {
 
 fn run_mcp_server(args: &mut Vec<String>) -> Result<()> {
     let db = take_path(args, "--db")?;
+    let vault = take_optional_path(args, "--vault")?;
     let profile = resolve_embedding_profile(args, Some(&db))?;
+    if !args.is_empty() {
+        return Err(anyhow!("unknown mcp flag(s): {}", args.join(" ")));
+    }
     let config = McpConfig {
         db,
+        vault,
         embedding_provider: profile.embedding_provider,
         embedding_dim: profile.embedding_dim,
         embedding_model: profile.embedding_model,
@@ -1651,8 +1657,16 @@ fn handle_mcp_tool_call(
     let value = match name {
         "search" => mcp_search(config, &arguments)?,
         "get" => mcp_get(config, &arguments)?,
+        "get_source" => mcp_get_source(config, &arguments)?,
+        "explain_result" => mcp_explain_result(config, &arguments)?,
+        "graph_neighbors" => mcp_graph_neighbors(config, &arguments)?,
+        "list_concepts" => mcp_list_concepts(config, &arguments)?,
+        "list_tags" => mcp_list_tags(config, &arguments)?,
         "status" => serde_json::to_value(status(&config.db)?)?,
-        "health" => mcp_health(config, &arguments)?,
+        "doctor" | "health" => mcp_health(config, &arguments)?,
+        "ingest_raw" | "run_digest" | "approve_proposal" => {
+            mcp_disabled_write_tool(name, &arguments)?
+        }
         other => return Err(anyhow!("unknown orderk MCP tool: {other}")),
     };
     Ok(json!({
@@ -1830,15 +1844,157 @@ fn mcp_health(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
     ))?)
 }
 
+fn mcp_vault(config: &McpConfig) -> Result<&Path> {
+    config.vault.as_deref().ok_or_else(|| {
+        anyhow!("MCP tool requires --vault; remote self-authorization is not supported")
+    })
+}
+
+fn mcp_get_source(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde_json::Value> {
+    let vault = mcp_vault(config)?;
+    let path = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("get_source.path is required"))?;
+    let max_chars = arguments
+        .get("max_chars")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2_000)
+        .clamp(1, 20_000) as usize;
+    let rel = normalize_mcp_vault_path(path)?;
+    let abs = vault.join(&rel);
+    let vault_canon = vault.canonicalize()?;
+    let meta = fs::symlink_metadata(&abs).with_context(|| format!("metadata for {rel}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(anyhow!("get_source refuses symlinked vault paths"));
+    }
+    let abs_canon = abs.canonicalize()?;
+    if !abs_canon.starts_with(&vault_canon) {
+        return Err(anyhow!("get_source path escapes vault root"));
+    }
+    let raw = fs::read_to_string(&abs_canon).with_context(|| format!("read source {rel}"))?;
+    let parsed = orderk_core::markdown::parse_markdown(&rel, &raw)?;
+    let preview = raw.chars().take(max_chars).collect::<String>();
+    Ok(json!({
+        "ok": true,
+        "schema_version": "orderk.mcp.get_source.v1",
+        "path": rel,
+        "title": parsed.title,
+        "tags": parsed.tags,
+        "wikilinks": parsed.wikilinks,
+        "preview": preview,
+        "truncated": raw.chars().count() > max_chars,
+        "write_capability": "disabled"
+    }))
+}
+
+fn mcp_explain_result(
+    config: &McpConfig,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut args = arguments.clone();
+    args["explain"] = json!(true);
+    args["view"] = json!("full");
+    let response = mcp_search(config, &args)?;
+    Ok(json!({
+        "ok": true,
+        "schema_version": "orderk.mcp.explain_result.v1",
+        "response": response,
+        "write_capability": "disabled"
+    }))
+}
+
+fn mcp_graph_neighbors(
+    config: &McpConfig,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let vault = mcp_vault(config)?;
+    let query = arguments
+        .get("path")
+        .or_else(|| arguments.get("query"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("graph_neighbors.path or query is required"))?;
+    Ok(serde_json::to_value(explain_graph(vault, query)?)?)
+}
+
+fn mcp_list_concepts(
+    config: &McpConfig,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let vault = mcp_vault(config)?;
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200)
+        .clamp(1, 1_000) as usize;
+    let mut report = scan_obsidian_adapter(vault, &AdapterScanOptions::default())?;
+    report.concepts.truncate(limit);
+    Ok(json!({
+        "ok": true,
+        "schema_version": "orderk.mcp.list_concepts.v1",
+        "concepts": report.concepts,
+        "write_capability": "disabled"
+    }))
+}
+
+fn mcp_list_tags(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde_json::Value> {
+    let vault = mcp_vault(config)?;
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200)
+        .clamp(1, 1_000) as usize;
+    let mut report = scan_obsidian_adapter(vault, &AdapterScanOptions::default())?;
+    report.tags.truncate(limit);
+    Ok(json!({
+        "ok": true,
+        "schema_version": "orderk.mcp.list_tags.v1",
+        "tags": report.tags,
+        "write_capability": "disabled"
+    }))
+}
+
+fn mcp_disabled_write_tool(name: &str, arguments: &serde_json::Value) -> Result<serde_json::Value> {
+    let requested_remote_allow = arguments
+        .get("allow_write")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Err(anyhow!(
+        "MCP write tool {name} is disabled by default (allow_write={requested_remote_allow}); local allowlist is required and remote self-authorization is not supported"
+    ))
+}
+
+fn normalize_mcp_vault_path(raw: &str) -> Result<String> {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Err(anyhow!("vault path must be relative"));
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return Err(anyhow!("vault path escapes root")),
+        }
+    }
+    if parts.is_empty() {
+        return Err(anyhow!("vault path must not be empty"));
+    }
+    Ok(parts.join("/"))
+}
+
 fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
 fn mcp_tool_definitions() -> Vec<serde_json::Value> {
-    vec![
+    let mut tools = vec![
         json!({
             "name": "search",
             "description": "Read-only orderk search over the configured Obsidian vault index. Returns JSON evidence only; it never writes notes or reindexes.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1864,6 +2020,7 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
         json!({
             "name": "get",
             "description": "Read-only explicit chunk fetch by chunk_id after a compact search index pass. Preserves caller order, caps batches at 50, and never writes notes or reindexes.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1875,21 +2032,83 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
         json!({
+            "name": "get_source",
+            "description": "Read-only source preview for a vault-relative Markdown path; refuses absolute, traversal, and symlinked paths.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "max_chars": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 2000}}, "required": ["path"]}
+        }),
+        json!({
+            "name": "explain_result",
+            "description": "Read-only deterministic retrieval explanation wrapper. Calls search with explain=true and never invokes write paths.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}, "filter": {"type": "string"}}, "required": ["query"]}
+        }),
+        json!({
+            "name": "graph_neighbors",
+            "description": "Read-only graph neighbor/explain endpoint for a path or edge id from the local sidecar graph store.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "query": {"type": "string"}}}
+        }),
+        json!({
+            "name": "list_concepts",
+            "description": "Read-only adapter view over external Markdown base concept pages; metadata only, no editor/vault clone.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}}}
+        }),
+        json!({
+            "name": "list_tags",
+            "description": "Read-only adapter tag inventory from Markdown/frontmatter/inline tags.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}}}
+        }),
+        json!({
             "name": "status",
             "description": "Read-only machine-readable status for the configured orderk SQLite index.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
             "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "doctor",
+            "description": "Read-only doctor/health report for the configured orderk index and embedding profile.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            "inputSchema": {"type": "object", "properties": {"smoke_query": {"type": "string", "description": "Optional query that must return at least one result"}}}
         }),
         json!({
             "name": "health",
             "description": "Read-only health/doctor report for the configured orderk index and embedding profile.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "smoke_query": {"type": "string", "description": "Optional query that must return at least one result"}
-                }
-            }
+            "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            "inputSchema": {"type": "object", "properties": {"smoke_query": {"type": "string", "description": "Optional query that must return at least one result"}}}
         }),
-    ]
+    ];
+    tools.extend([
+        disabled_mcp_write_tool_definition(
+            "ingest_raw",
+            "Disabled write stub for ingesting raw Markdown; requires local allowlist outside MCP.",
+        ),
+        disabled_mcp_write_tool_definition(
+            "run_digest",
+            "Disabled write stub for running digest/apply; remote self-authorization is refused.",
+        ),
+        disabled_mcp_write_tool_definition(
+            "approve_proposal",
+            "Disabled write stub for proposal approval; use local CLI allowlist workflow.",
+        ),
+    ]);
+    tools
+}
+
+fn disabled_mcp_write_tool_definition(name: &str, description: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "description": description,
+        "annotations": {"readOnlyHint": false, "destructiveHint": true},
+        "x-orderk": {"write_default": "disabled", "remote_self_authorization": "forbidden"},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"allow_write": {"type": "boolean", "default": false}},
+            "required": []
+        }
+    })
 }
 
 fn write_report(dir: &Path, stem: &str, value: &serde_json::Value) -> Result<PathBuf> {
@@ -2093,6 +2312,10 @@ fn take_optional_f32(args: &mut Vec<String>, name: &str) -> Result<Option<f32>> 
         return Err(anyhow!("{} must be a finite number", name));
     }
     Ok(Some(value))
+}
+
+fn take_optional_path(args: &mut Vec<String>, name: &str) -> Result<Option<PathBuf>> {
+    Ok(take_optional_string(args, name)?.map(PathBuf::from))
 }
 
 fn take_path(args: &mut Vec<String>, name: &str) -> Result<PathBuf> {
@@ -3120,7 +3343,24 @@ mod tests {
                     .map(str::to_string)
             })
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["search", "get", "status", "health"]);
+        assert_eq!(
+            names,
+            vec![
+                "search",
+                "get",
+                "get_source",
+                "explain_result",
+                "graph_neighbors",
+                "list_concepts",
+                "list_tags",
+                "status",
+                "doctor",
+                "health",
+                "ingest_raw",
+                "run_digest",
+                "approve_proposal",
+            ]
+        );
         assert!(!names.iter().any(|name| {
             matches!(
                 name.as_str(),
@@ -3172,6 +3412,123 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .contains("YYYY-MM-DD"));
+
+        for write_tool_name in ["ingest_raw", "run_digest", "approve_proposal"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(write_tool_name))
+                .expect("write tool stub must be listed but disabled");
+            assert_eq!(
+                tool.pointer("/annotations/readOnlyHint")
+                    .and_then(|v| v.as_bool()),
+                Some(false)
+            );
+            assert_eq!(
+                tool.pointer("/annotations/destructiveHint")
+                    .and_then(|v| v.as_bool()),
+                Some(true)
+            );
+            assert_eq!(
+                tool.pointer("/x-orderk/write_default")
+                    .and_then(|v| v.as_str()),
+                Some("disabled")
+            );
+            assert_eq!(
+                tool.pointer("/inputSchema/properties/allow_write/default")
+                    .and_then(|v| v.as_bool()),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_adapter_read_tools_return_source_concepts_tags_without_writes() {
+        let root = temp_root("mcp-adapter-tools");
+        let vault = root.join("vault");
+        fs::create_dir_all(vault.join("wiki/concepts")).unwrap();
+        let note = vault.join("wiki/concepts/cashflow.md");
+        fs::write(
+            &note,
+            "---\ntags: [finance]\n---\n# Cashflow\nSee [[Budget]]. #strategy\n",
+        )
+        .unwrap();
+        let before = fs::read_to_string(&note).unwrap();
+        let config = McpConfig {
+            db: root.join("orderk.sqlite"),
+            vault: Some(vault.clone()),
+            embedding_provider: "mock".to_string(),
+            embedding_dim: 8,
+            embedding_model: "mock-8".to_string(),
+            vector_backend: VectorBackend::Exact,
+        };
+
+        let source = handle_mcp_message(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_source","arguments":{"path":"wiki/concepts/cashflow.md","max_chars":40}}}),
+            &config,
+        )
+        .unwrap();
+        assert!(source.get("error").is_none(), "{source}");
+        let source_structured = &source["result"]["structuredContent"];
+        assert_eq!(
+            source_structured["schema_version"],
+            "orderk.mcp.get_source.v1"
+        );
+        assert_eq!(source_structured["title"], "Cashflow");
+        assert_eq!(source_structured["write_capability"], "disabled");
+
+        let tags = handle_mcp_message(
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_tags","arguments":{}}}),
+            &config,
+        )
+        .unwrap();
+        assert!(tags["result"]["structuredContent"]["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag["name"] == "strategy"));
+
+        let concepts = handle_mcp_message(
+            &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_concepts","arguments":{}}}),
+            &config,
+        )
+        .unwrap();
+        assert!(concepts["result"]["structuredContent"]["concepts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|concept| concept["path"] == "wiki/concepts/cashflow.md"));
+        assert_eq!(fs::read_to_string(&note).unwrap(), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_write_tool_stubs_reject_remote_self_authorization() {
+        let root = temp_root("mcp-write-stubs");
+        let config = McpConfig {
+            db: root.join("orderk.sqlite"),
+            vault: Some(root.join("vault")),
+            embedding_provider: "mock".to_string(),
+            embedding_dim: 8,
+            embedding_model: "mock-8".to_string(),
+            vector_backend: VectorBackend::Exact,
+        };
+        for name in ["ingest_raw", "run_digest", "approve_proposal"] {
+            let response = handle_mcp_message(
+                &json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":name,"arguments":{"allow_write":true}}}),
+                &config,
+            )
+            .unwrap();
+            let error = response
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            assert!(error.contains("disabled by default"), "{name}: {response}");
+            assert!(
+                error.contains("remote self-authorization is not supported"),
+                "{name}: {response}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3240,6 +3597,7 @@ mod tests {
             .to_string();
         let config = McpConfig {
             db,
+            vault: Some(vault.clone()),
             embedding_provider: "mock".to_string(),
             embedding_dim: 8,
             embedding_model: "mock-8".to_string(),

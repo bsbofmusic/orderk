@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod api;
 pub mod capsule;
 pub mod chunker;
@@ -17,6 +18,10 @@ pub mod scanner;
 pub mod sword_spirit;
 pub mod v2_schema;
 
+pub use adapters::{
+    scan_obsidian_adapter, AdapterAttachment, AdapterConcept, AdapterFile, AdapterScanOptions,
+    AdapterScanReport, AdapterTag,
+};
 pub use api::{
     feedback, get_chunks, index_vault, index_vault_with_options, init, optimize_apply,
     optimize_dry_run, optimize_reset, optimize_set, optimize_status, provider_from_env,
