@@ -1,0 +1,85 @@
+{
+  "schema_version": "orderk.v3_qrels.v1",
+  "frozen": true,
+  "description": "Frozen V3 search fixture qrels. Labels are based on fixture file authorship and Unique eval anchor text, not on current ranking outputs.",
+  "queries": [
+    {
+      "id": "cashflow_concept_definition",
+      "query": "concept page exact cashflow ranking",
+      "expected_paths": ["wiki/concepts/现金流.md"],
+      "expected_phrases": ["concept page exact cashflow ranking"]
+    },
+    {
+      "id": "cashflow_noise_disambiguation",
+      "query": "现金流 定义页 不是会议重复词",
+      "expected_paths": ["wiki/concepts/现金流.md"],
+      "expected_phrases": ["资金流入与流出的时间序列"]
+    },
+    {
+      "id": "investment_noise_concept",
+      "query": "投资噪声概念 防止 concepts 目录盲目加权",
+      "expected_paths": ["wiki/concepts/投资噪声概念.md"],
+      "expected_phrases": ["防止 wiki/concepts 目录被盲目整体加权"]
+    },
+    {
+      "id": "chinese_oral_alias",
+      "query": "二脑检索 茶老板偏好 查知识库 oral alias",
+      "expected_paths": ["oral/chinese-alias.md"],
+      "expected_phrases": ["chinese oral query second brain retrieval"]
+    },
+    {
+      "id": "freshness_policy",
+      "query": "freshness balanced as of stale metadata boost",
+      "expected_paths": ["freshness/recency-policy.md"],
+      "expected_phrases": ["freshness balanced as of stale metadata boost"]
+    },
+    {
+      "id": "graph_link_depth",
+      "query": "graph retrieval depth one hop wikilink expansion",
+      "expected_paths": ["graph/link-depth.md"],
+      "expected_phrases": ["graph retrieval depth one hop wikilink expansion"]
+    },
+    {
+      "id": "alpha_sqlite_vec",
+      "query": "alpha retrieval blade sqlite vec semantic search",
+      "expected_paths": ["projects/alpha.md"],
+      "expected_phrases": ["alpha retrieval blade sqlite vec semantic search"]
+    },
+    {
+      "id": "query_py_smoke",
+      "query": "query py vector smoke live marker",
+      "expected_paths": ["health/query-py-smoke.md"],
+      "expected_phrases": ["query py vector smoke live marker"]
+    },
+    {
+      "id": "vector_fallback_warning",
+      "query": "vector layer unavailable explicit warning fallback",
+      "expected_paths": ["degradation/vector-fallback.md"],
+      "expected_phrases": ["vector layer unavailable explicit warning fallback"]
+    },
+    {
+      "id": "provider_surface_credentials",
+      "query": "orderk provider surface scoped credentials redaction",
+      "expected_paths": ["provider/surface.md"],
+      "expected_phrases": ["orderk provider surface scoped credentials redaction"]
+    },
+    {
+      "id": "release_gate_resources",
+      "query": "release gate resource baseline binary size daemon count",
+      "expected_paths": ["ops/release-gate.md"],
+      "expected_phrases": ["release gate resource baseline binary size daemon count"]
+    },
+    {
+      "id": "retrieval_quality_gates",
+      "query": "retrieval quality eval gates maintenance reports",
+      "expected_paths": ["quality/eval-gates.md"],
+      "expected_phrases": ["retrieval quality eval gates maintenance reports"]
+    },
+    {
+      "id": "bravo_plugin_packaging",
+      "query": "bravo obsidian plugin packaging npm workspace",
+      "expected_paths": ["projects/bravo.md"],
+      "expected_phrases": ["bravo obsidian plugin packaging npm workspace"]
+    }
+  ]
+}

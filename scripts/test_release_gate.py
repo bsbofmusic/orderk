@@ -24,6 +24,23 @@ class ReleaseGateStaticChecksTest(unittest.TestCase):
     def test_release_gate_runs_5topic_retrieval_non_regression_bench(self) -> None:
         self.assertIn(["python3", "scripts/sword_5topic_hs_vs_v2_bench.py"], release_gate.COMMANDS)
 
+    def test_release_gate_runs_v3_frozen_search_eval_and_tests(self) -> None:
+        unit_commands = [cmd for cmd in release_gate.COMMANDS if cmd[:3] == ["python3", "-m", "unittest"]]
+        self.assertEqual(len(unit_commands), 1)
+        self.assertIn("scripts/test_v3_search_eval.py", unit_commands[0])
+        self.assertIn(
+            [
+                "python3",
+                "scripts/v3_search_eval.py",
+                "--fixture",
+                "--qrels",
+                "fixtures/eval/v3_qrels.json",
+                "--baseline",
+                "baselines/orderk-v3-search-baseline.json",
+            ],
+            release_gate.COMMANDS,
+        )
+
     def test_quality_effect_gate_rejects_ok_bench_without_quantified_deltas(self) -> None:
         bench = {
             "ok": True,

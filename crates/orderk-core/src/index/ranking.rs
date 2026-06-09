@@ -359,6 +359,68 @@ pub(crate) fn sort_search_results(results: &mut [SearchResult]) {
     });
 }
 
+pub(crate) fn apply_same_file_mmr(
+    results: &mut Vec<SearchResult>,
+    top_limit: usize,
+    mmr_lambda: f32,
+    diversity_escape_margin: f32,
+    max_per_file: usize,
+) {
+    if results.len() <= 1 || top_limit <= 1 {
+        return;
+    }
+    sort_search_results(results);
+    let lambda = mmr_lambda.clamp(0.0, 1.0);
+    let margin = diversity_escape_margin.max(0.0);
+    let cap = max_per_file.max(1);
+    let mut remaining = std::mem::take(results);
+    let mut selected: Vec<SearchResult> = Vec::with_capacity(remaining.len());
+    let mut per_file: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    while !remaining.is_empty() && selected.len() < top_limit {
+        let best_relevance = remaining
+            .iter()
+            .map(|result| finite_score_for_sort(result.score))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let selected_paths = selected
+            .iter()
+            .map(|result| result.path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut best_idx = 0usize;
+        let mut best_mmr = f32::NEG_INFINITY;
+        for (idx, result) in remaining.iter().enumerate() {
+            let relevance = finite_score_for_sort(result.score);
+            let same_file_similarity = if selected_paths.contains(result.path.as_str()) {
+                1.0
+            } else {
+                0.0
+            };
+            let outside_escape_margin = !selected.is_empty() && best_relevance - relevance > margin;
+            let over_cap = per_file.get(&result.path).copied().unwrap_or(0) >= cap;
+            let mut mmr_score = lambda * relevance - (1.0 - lambda) * same_file_similarity;
+            if outside_escape_margin {
+                mmr_score -= 1.0;
+            }
+            if over_cap {
+                mmr_score -= 1.0;
+            }
+            if mmr_score > best_mmr
+                || (mmr_score == best_mmr
+                    && result.path < remaining[best_idx].path
+                    && result.line_start <= remaining[best_idx].line_start)
+            {
+                best_mmr = mmr_score;
+                best_idx = idx;
+            }
+        }
+        let chosen = remaining.remove(best_idx);
+        *per_file.entry(chosen.path.clone()).or_insert(0) += 1;
+        selected.push(chosen);
+    }
+    selected.extend(remaining);
+    *results = selected;
+}
+
 fn finite_score_for_sort(score: f32) -> f32 {
     if score.is_finite() {
         score
@@ -484,5 +546,28 @@ mod ranking_tests {
             results[0].path, "z-best-finite.md",
             "non-finite scores must never win top rank through fallback path ordering: {results:#?}"
         );
+    }
+
+    #[test]
+    fn same_file_mmr_prefers_a_diverse_file_when_scores_are_close() {
+        let mut results = vec![
+            test_result("same.md", 1.00),
+            SearchResult {
+                chunk_id: "same.md#2".to_string(),
+                line_start: 20,
+                ..test_result("same.md", 0.99)
+            },
+            test_result("other.md", 0.94),
+            test_result("far.md", 0.30),
+        ];
+
+        apply_same_file_mmr(&mut results, 3, 0.72, 0.12, 2);
+
+        let top_paths = results
+            .iter()
+            .take(3)
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(top_paths, vec!["same.md", "other.md", "same.md"]);
     }
 }

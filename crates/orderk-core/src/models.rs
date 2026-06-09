@@ -445,11 +445,15 @@ pub struct QueryOptions {
     pub include_stale: bool,
     #[serde(default)]
     pub query_expansion: bool,
-    #[serde(default)]
+    #[serde(default = "default_external_reranker")]
     pub external_reranker: bool,
 }
 
 fn default_rerank() -> bool {
+    true
+}
+
+fn default_external_reranker() -> bool {
     true
 }
 
@@ -469,7 +473,7 @@ impl QueryOptions {
             as_of: None,
             include_stale: false,
             query_expansion: false,
-            external_reranker: false,
+            external_reranker: default_external_reranker(),
         }
     }
 

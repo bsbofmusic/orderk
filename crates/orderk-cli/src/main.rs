@@ -1764,7 +1764,7 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
             as_of,
             include_stale,
             query_expansion: false,
-            external_reranker: false,
+            external_reranker: true,
         },
         provider.as_ref(),
         config.vector_backend.clone(),
@@ -2297,12 +2297,14 @@ fn parse_reranker_flag(args: &mut Vec<String>) -> Result<bool> {
         return Ok(true);
     }
     let Some(raw) = take_optional_string(args, "--reranker")? else {
-        return Ok(false);
+        return Ok(true);
     };
     match raw.as_str() {
-        "none" | "off" | "false" => Ok(false),
+        "none" => Ok(false),
         "lexical" => Ok(true),
-        other => Err(anyhow!("unknown reranker: {other} (expected lexical|none)")),
+        other => Err(anyhow!(
+            "unknown reranker: {other} (expected lexical|none; none is test/migration only)"
+        )),
     }
 }
 
@@ -2707,6 +2709,28 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn reranker_flag_defaults_to_lexical_and_allows_explicit_none() {
+        let mut default_args = Vec::new();
+        assert!(parse_reranker_flag(&mut default_args).unwrap());
+
+        let mut lexical_args = vec!["--lexical-reranker".to_string()];
+        assert!(parse_reranker_flag(&mut lexical_args).unwrap());
+        assert!(lexical_args.is_empty());
+
+        let mut none_args = vec!["--reranker".to_string(), "none".to_string()];
+        assert!(!parse_reranker_flag(&mut none_args).unwrap());
+        assert!(none_args.is_empty());
+
+        for alias in ["off", "false"] {
+            let mut alias_args = vec!["--reranker".to_string(), alias.to_string()];
+            assert!(
+                parse_reranker_flag(&mut alias_args).is_err(),
+                "only --reranker none should disable mandatory reranking"
+            );
+        }
     }
 
     fn test_sword_sidecar_proposal(id: &str, target: &str) -> SwordSpiritProposal {
@@ -3668,6 +3692,82 @@ mod tests {
             .unwrap_or("")
             .contains("compact recall evidence"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_search_defaults_to_mandatory_lexical_reranker() {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-mcp-reranker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("memory.md"),
+            "# Memory\nMCP search default reranker compact recall evidence.\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.join("other.md"),
+            "# Other\nA separate note keeps result diversity checks meaningful.\n",
+        )
+        .unwrap();
+        let db = root.join("orderk.sqlite");
+        run_with_args(vec![
+            "index".into(),
+            "--vault".into(),
+            vault.to_string_lossy().to_string(),
+            "--db".into(),
+            db.to_string_lossy().to_string(),
+            "--embedding-provider".into(),
+            "mock".into(),
+            "--embedding-dim".into(),
+            "8".into(),
+            "--embedding-model".into(),
+            "mock-8".into(),
+            "--vector-backend".into(),
+            "exact".into(),
+        ])
+        .unwrap();
+        let config = McpConfig {
+            db,
+            vault: Some(vault.clone()),
+            embedding_provider: "mock".to_string(),
+            embedding_dim: 8,
+            embedding_model: "mock-8".to_string(),
+            vector_backend: VectorBackend::Exact,
+        };
+
+        let response = mcp_search(
+            &config,
+            &json!({"query":"MCP search default reranker compact recall evidence", "limit": 2}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response
+                .pointer("/routing/external_reranker")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(
+            response["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|result| result
+                    .pointer("/evidence/sources")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|sources| sources
+                        .iter()
+                        .any(|source| source == "lexical_reranker"))),
+            "MCP search should expose lexical_reranker evidence: {response}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

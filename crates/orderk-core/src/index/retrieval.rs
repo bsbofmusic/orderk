@@ -23,6 +23,46 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+const V3_KEYWORD_CANDIDATES: usize = 80;
+const V3_VECTOR_CANDIDATES: usize = 80;
+const V3_ROUTE_CANDIDATES: usize = 50;
+const V3_CANDIDATE_POOL_CAP: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CandidateDepths {
+    pub(crate) keyword: usize,
+    pub(crate) vector: usize,
+    pub(crate) route: usize,
+    pub(crate) pool_cap: usize,
+}
+
+pub(crate) fn v3_candidate_depths(_limit: usize) -> CandidateDepths {
+    CandidateDepths {
+        keyword: V3_KEYWORD_CANDIDATES,
+        vector: V3_VECTOR_CANDIDATES,
+        route: V3_ROUTE_CANDIDATES,
+        pool_cap: V3_CANDIDATE_POOL_CAP,
+    }
+}
+
+fn reciprocal_rank_score(rank: Option<usize>) -> f32 {
+    rank.map(|value| 1.0 / (60.0 + value as f32)).unwrap_or(0.0)
+}
+
+pub(crate) fn candidate_fusion_score(
+    rowid: i64,
+    keyword_scores: &HashMap<i64, (usize, f32)>,
+    vector_scores: &HashMap<i64, (usize, f32)>,
+    route_scores: &HashMap<i64, RouteHit>,
+) -> f32 {
+    reciprocal_rank_score(keyword_scores.get(&rowid).map(|score| score.0))
+        + reciprocal_rank_score(vector_scores.get(&rowid).map(|score| score.0))
+        + route_scores
+            .get(&rowid)
+            .map(|hit| (hit.score.max(0.0) * reciprocal_rank_score(Some(1))).min(0.05))
+            .unwrap_or(0.0)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RouteHit {
     pub(crate) score: f32,
@@ -41,8 +81,12 @@ pub(crate) fn clean_route_term(term: &str) -> String {
 pub(crate) fn route_terms(plan: &QueryPlan) -> Vec<String> {
     let mut out = Vec::new();
     for pattern in &plan.patterns {
-        let cleaned = clean_route_term(pattern);
-        if !cleaned.is_empty() {
+        if let Some(cleaned) = clean_route_scan_term(pattern) {
+            out.push(cleaned);
+        }
+    }
+    for term in plan.all_terms() {
+        if let Some(cleaned) = clean_route_scan_term(&term) {
             out.push(cleaned);
         }
     }
@@ -51,9 +95,31 @@ pub(crate) fn route_terms(plan: &QueryPlan) -> Vec<String> {
     out
 }
 
+fn clean_route_scan_term(term: &str) -> Option<String> {
+    let cleaned = clean_route_term(term);
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.split_whitespace().count() > 1 {
+        return None;
+    }
+    let chars = cleaned.chars().count();
+    if chars < 2 {
+        return None;
+    }
+    const STOP_TERMS: &[&str] = &[
+        "什么", "怎么", "如何", "是否", "一个", "这个", "那个", "还有", "不是", "里面", "the",
+        "and", "for", "with", "from",
+    ];
+    if STOP_TERMS.iter().any(|stop| *stop == cleaned) {
+        return None;
+    }
+    Some(cleaned)
+}
+
 pub(crate) fn add_reason(hit: &mut RouteHit, label: &str, score: f32) {
+    hit.score += score;
     if !hit.reasons.iter().any(|reason| reason == label) {
-        hit.score += score;
         hit.reasons.push(label.to_string());
     }
 }
@@ -132,11 +198,11 @@ pub(crate) fn append_filter_args(args: &mut Vec<Value>, filter: Option<&FilterSq
 pub(crate) fn collect_route_hits(
     conn: &Connection,
     plan: &QueryPlan,
-    limit: usize,
+    candidate_limit: usize,
     filter: Option<&FilterSql>,
 ) -> Result<HashMap<i64, RouteHit>> {
     let mut hits: HashMap<i64, RouteHit> = HashMap::new();
-    let limit = (limit * 4).max(16) as i64;
+    let limit = candidate_limit.max(1) as i64;
     for pattern in route_terms(plan) {
         if pattern.is_empty() {
             continue;
@@ -192,21 +258,40 @@ pub(crate) fn collect_route_hits(
             }
         }
     }
+    if hits.len() > candidate_limit {
+        let mut ranked = hits
+            .iter()
+            .map(|(rowid, hit)| (*rowid, hit.score))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|(left_id, left_score), (right_id, right_score)| {
+            right_score
+                .partial_cmp(left_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let keep = ranked
+            .into_iter()
+            .take(candidate_limit)
+            .map(|(rowid, _)| rowid)
+            .collect::<HashSet<_>>();
+        hits.retain(|rowid, _| keep.contains(rowid));
+    }
     Ok(hits)
 }
 
 pub(crate) fn sqlite_vec_vector_scores(
     conn: &Connection,
     qvec: &[f32],
-    limit: usize,
+    candidate_limit: usize,
 ) -> Result<HashMap<i64, (usize, f32)>> {
     let mut scores = HashMap::new();
     let mut stmt = conn.prepare(
         "SELECT rowid, distance FROM vec_chunks WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance ASC",
     )?;
-    let rows = stmt.query_map(params![vector_to_blob(qvec), (limit * 4) as i64], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
-    })?;
+    let rows = stmt.query_map(
+        params![vector_to_blob(qvec), candidate_limit.max(1) as i64],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?)),
+    )?;
     for (rank, row) in rows.enumerate() {
         let (rowid, distance) = row?;
         scores.insert(rowid, (rank + 1, distance_to_score(distance)));
@@ -217,7 +302,7 @@ pub(crate) fn sqlite_vec_vector_scores(
 pub(crate) fn filtered_exact_vector_scores(
     conn: &Connection,
     qvec: &[f32],
-    limit: usize,
+    candidate_limit: usize,
     filter: &FilterSql,
 ) -> Result<HashMap<i64, (usize, f32)>> {
     let mut sql = String::from(
@@ -241,7 +326,7 @@ pub(crate) fn filtered_exact_vector_scores(
     }
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut scores = HashMap::new();
-    for (rank, (rowid, distance)) in scored.into_iter().take((limit * 4).max(16)).enumerate() {
+    for (rank, (rowid, distance)) in scored.into_iter().take(candidate_limit.max(1)).enumerate() {
         scores.insert(rowid, (rank + 1, distance_to_score(distance)));
     }
     Ok(scores)
@@ -257,6 +342,7 @@ pub(crate) fn query_hybrid<P: EmbeddingProvider + ?Sized>(
     rerank: bool,
 ) -> Result<(Vec<SearchResult>, QueryRoutingEvidence)> {
     let mut timings = QueryTimings::default();
+    let candidate_depths = v3_candidate_depths(limit);
     let scoring_query = plan.scoring_text();
     let keyword_started = Instant::now();
     let mut keyword_scores: HashMap<i64, (usize, f32)> = HashMap::new();
@@ -271,7 +357,7 @@ pub(crate) fn query_hybrid<P: EmbeddingProvider + ?Sized>(
         sql.push_str(" ORDER BY score ASC LIMIT ?");
         let mut args = vec![Value::Text(keyword_query)];
         append_filter_args(&mut args, filter);
-        args.push(Value::Integer((limit * 4) as i64));
+        args.push(Value::Integer(candidate_depths.keyword as i64));
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(args.iter()), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
@@ -286,20 +372,33 @@ pub(crate) fn query_hybrid<P: EmbeddingProvider + ?Sized>(
     let vector_started = Instant::now();
     let qvec = provider.embed_query(query)?;
     let vector_scores = if let Some(filter) = filter {
-        filtered_exact_vector_scores(conn, &qvec, limit, filter)?
+        filtered_exact_vector_scores(conn, &qvec, candidate_depths.vector, filter)?
     } else {
-        sqlite_vec_vector_scores(conn, &qvec, limit)?
+        sqlite_vec_vector_scores(conn, &qvec, candidate_depths.vector)?
     };
     timings.vector_ms = vector_started.elapsed().as_millis();
 
     let route_started = Instant::now();
-    let route_scores = collect_route_hits(conn, plan, limit, filter)?;
+    let route_scores = collect_route_hits(conn, plan, candidate_depths.route, filter)?;
     timings.route_ms = route_started.elapsed().as_millis();
 
     let merge_started = Instant::now();
     let mut candidate_ids: HashSet<i64> = keyword_scores.keys().copied().collect();
     candidate_ids.extend(vector_scores.keys().copied());
     candidate_ids.extend(route_scores.keys().copied());
+    let mut candidate_ids = candidate_ids.into_iter().collect::<Vec<_>>();
+    candidate_ids.sort_by(|a, b| {
+        candidate_fusion_score(*b, &keyword_scores, &vector_scores, &route_scores)
+            .partial_cmp(&candidate_fusion_score(
+                *a,
+                &keyword_scores,
+                &vector_scores,
+                &route_scores,
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+    candidate_ids.truncate(candidate_depths.pool_cap);
     let merged_candidates = candidate_ids.len();
 
     let mut results = Vec::new();
@@ -631,4 +730,115 @@ pub(crate) fn load_chunk_result(
         rerank,
     )
     .map(Some)
+}
+
+#[cfg(test)]
+mod retrieval_tests {
+    use super::*;
+
+    #[test]
+    fn v3_candidate_depths_are_independent_from_display_limit_and_capped() {
+        let depths = v3_candidate_depths(1);
+        assert_eq!(depths.keyword, 80);
+        assert_eq!(depths.vector, 80);
+        assert_eq!(depths.route, 50);
+        assert_eq!(depths.pool_cap, 200);
+
+        let larger = v3_candidate_depths(25);
+        assert_eq!(larger.keyword, 80);
+        assert_eq!(larger.vector, 80);
+        assert_eq!(larger.route, 50);
+        assert_eq!(larger.pool_cap, 200);
+    }
+
+    #[test]
+    fn candidate_fusion_prefers_cross_source_confirmation_over_single_source_rank() {
+        let mut keyword_scores = HashMap::new();
+        keyword_scores.insert(1, (1, 1.0));
+        keyword_scores.insert(2, (3, 0.7));
+        let mut vector_scores = HashMap::new();
+        vector_scores.insert(2, (3, 0.7));
+        let route_scores = HashMap::new();
+
+        assert!(
+            candidate_fusion_score(2, &keyword_scores, &vector_scores, &route_scores)
+                > candidate_fusion_score(1, &keyword_scores, &vector_scores, &route_scores)
+        );
+    }
+
+    #[test]
+    fn route_terms_include_semantic_query_terms_for_path_title_recall() {
+        let plan = QueryPlan::analyze("VPS 自动维护计划 定时任务 配置 是 什么");
+        let terms = route_terms(&plan);
+        assert!(terms.iter().any(|term| term == "vps"), "{terms:?}");
+        assert!(terms.iter().any(|term| term == "自动维护计划"), "{terms:?}");
+        assert!(terms.iter().any(|term| term == "定时任务"), "{terms:?}");
+        assert!(terms.iter().any(|term| term == "配置"), "{terms:?}");
+        assert!(
+            !terms.iter().any(|term| term == "是" || term == "什么"),
+            "route scan should not be widened by tiny stopword-like terms: {terms:?}"
+        );
+    }
+
+    #[test]
+    fn collect_route_hits_enforces_global_candidate_cap_across_terms() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                title TEXT,
+                heading TEXT,
+                tags_json TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        for (term, offset) in [("alpha", 0), ("beta", 100), ("gamma", 200)] {
+            for i in 0..30 {
+                conn.execute(
+                    "INSERT INTO chunks (file_path, title, heading, tags_json) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        format!("brain/environment/{term}-{i}.md"),
+                        format!("{term} topic {}", offset + i),
+                        format!("{term} heading {}", offset + i),
+                        "[]"
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let plan = QueryPlan::analyze("alpha beta gamma");
+        let hits = collect_route_hits(&conn, &plan, 50, None).unwrap();
+        assert!(
+            hits.len() <= 50,
+            "route candidate cap must be global, not per route term: {}",
+            hits.len()
+        );
+    }
+
+    #[test]
+    fn route_scoring_prefers_multi_term_path_title_matches_over_single_brand_matches() {
+        let plan = QueryPlan::analyze("orderk 定位 搜索刀 设计决策");
+        let single_brand = score_route_hit(
+            &plan,
+            "brain/projects/orderk-release-record.md",
+            Some("orderk release record"),
+            Some("orderk release record"),
+            "[]",
+        )
+        .expect("brand-only page should still be a route hit");
+        let multi_term = score_route_hit(
+            &plan,
+            "brain/systems/orderk-设计决策与定位.md",
+            Some("orderk — 设计决策与定位"),
+            Some("orderk — 设计决策与定位 > 历史产品定义"),
+            "[]",
+        )
+        .expect("multi-term title/path page should be a route hit");
+
+        assert!(
+            multi_term.score > single_brand.score,
+            "multi-term route match should outrank single brand hits: {multi_term:?} <= {single_brand:?}"
+        );
+    }
 }

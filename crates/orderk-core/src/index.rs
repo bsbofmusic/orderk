@@ -494,6 +494,7 @@ impl IndexStore {
         if optimizer::apply_runtime_adjustments(&mut results, &optimizer_config) > 0 {
             sort_search_results(&mut results);
         }
+        apply_same_file_mmr(&mut results, limit, 0.72, 0.12, 2);
         let filtered_candidates = results.len();
         if let Some(min_score) = options.min_score {
             let before_threshold = results.len();
@@ -740,6 +741,58 @@ mod tests {
         .unwrap();
         assert!(!res.results.is_empty());
         assert_eq!(res.results[0].path, "alpha.md");
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn default_search_applies_mandatory_lexical_reranker_evidence() {
+        let vault = sample_vault();
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-default-reranker-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        let res = IndexStore::query(
+            &conn,
+            "sqlite vec semantic search",
+            5,
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+
+        assert!(
+            res.routing.external_reranker,
+            "routing must prove reranker ran"
+        );
+        assert!(
+            res.results.iter().any(|result| result
+                .evidence
+                .sources
+                .iter()
+                .any(|source| source == "lexical_reranker")),
+            "at least one result should carry lexical_reranker evidence: {:#?}",
+            res.results
+        );
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);
     }
