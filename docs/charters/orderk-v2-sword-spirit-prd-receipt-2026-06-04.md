@@ -1,5 +1,7 @@
 # orderk V2 Sword Spirit PRD Receipt
 
+> **⚠️ HISTORICAL — 旧 V2/Sword Spirit 方向的执行收据。保留仅供归档参考。当前 orderk 是 Obsidian 只读搜索刀。**
+
 - Timestamp: 2026-06-04T01:39:20+08:00
 - Primary artifact: `docs/charters/orderk-v2-sword-spirit-prd.md`
 - Index artifact: `docs/charters/README.md`

@@ -1,6 +1,7 @@
 # Noteriv × orderk Headless Second-Brain Completion PRD
 
-> Created: 2026-06-05  
+> **⚠️ HISTORICAL — 此文档是旧 Noteriv × orderk 第二大脑方向的历史记录，不代表当前产品路线。保留仅供归档参考。当前 orderk 是 Obsidian 只读搜索刀，不做 Noteriv/第二大脑。**
+
 > Status: Hermes + SF DeepSeek V4 Pro + MiMo audit round 2 PASS  
 > Scope: headless only. No cockpit/UI in this PRD.  
 > Rule: no middle state. Every requirement is either ✅ done or ❌ not done. Partial work is marked ❌ until the full acceptance gate passes.

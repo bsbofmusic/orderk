@@ -1,6 +1,7 @@
 # orderk V2 构想 / PRD：有剑灵的 Markdown-first 智能检索宝具
 
-> Draft created: 2026-06-04T01:20:13+08:00  
+> **⚠️ HISTORICAL — 此文档是旧 V2/Sword Spirit 方向的历史记录，不代表当前 orderk 产品路线。保留仅供归档参考。当前 orderk 是 Obsidian 只读搜索刀，不做剑灵/Noteriv/第二大脑。**
+
 > Status: revised PRD after GPT / SF DeepSeek V4 Pro / MiMo / MiniMax 四路审计  
 > Owner intent: 茶老板希望 orderk V2 从被动检索刀，升级为快准狠稳、能主动唤醒推理、带单一后台剑灵机制的智能级检索工具。
 

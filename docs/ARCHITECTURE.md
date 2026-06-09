@@ -2,7 +2,7 @@
 
 ## Boundary
 
-orderk only does retrieval. It does not do chat, agent orchestration, note writing, automatic summaries, or LLM / cross-encoder reranking. It does expose an opt-in deterministic lexical reranker for bounded second-pass ranking.
+orderk only does retrieval. It does not do chat, agent orchestration, note writing, automatic summaries, or LLM / cross-encoder reranking. It applies a bounded deterministic lexical reranker by default for second-pass ranking.
 
 It now also exposes explicit health and evaluation contracts:
 
@@ -55,7 +55,7 @@ The index stores the active provider/model/dimension/backend in SQLite settings 
 
 ## Ranking
 
-v1 uses lightweight score fusion and query-aware routing:
+orderk uses lightweight score fusion and query-aware routing:
 
 - keyword score from FTS5/BM25
 - vector similarity from sqlite-vec
@@ -68,7 +68,7 @@ v1 uses lightweight score fusion and query-aware routing:
 - deterministic lexical query expansion: `--query-expansion`
 - JSON Lines output for pipeline consumers: `--json-lines`
 - eval A/B for chunk overlap: `eval --ab-chunk-overlap`
-- optional lexical reranker: `--reranker lexical|none`
+- lexical reranker: `--reranker lexical` (default); `--reranker none` explicitly disables for testing/migration
 
 Each search result also carries structured `score_breakdown`, `evidence` with `evidence_count` and per-result `retrieval_depth`, and tag metadata so agents can inspect why it surfaced. The response-level `routing.timings` reports keyword/vector/route/merge/link-expansion/enrichment stages, while `routing.retrieval_depth` states whether authored graph-depth recall was active.
 

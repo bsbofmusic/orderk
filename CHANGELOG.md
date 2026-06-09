@@ -10,11 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [0.1.16] - 2026-06-09
 
 ### Added
-- Add the frozen V3 search evaluation gate with qrels/fixture hashes, mandatory reranker evidence checks, and per-case regression protection.
+- Add the frozen orderk search evaluation gate with qrels/fixture hashes, mandatory reranker evidence checks, and per-case regression protection.
 
 ### Changed
 - Make lexical reranking mandatory by default for CLI and MCP search while keeping explicit `--reranker none` as a test/migration escape hatch.
-- Decouple V3 candidate depths from display limit, fuse keyword/vector/route candidates with bounded RRF, and add same-file MMR diversity before truncation.
+- Decouple candidate depths from display limit, fuse keyword/vector/route candidates with bounded RRF, and add same-file MMR diversity before truncation.
 
 ### Fixed
 - Improve route recall for Chinese/mixed queries by scanning semantic query terms against path/title/heading evidence, enforcing a global route candidate cap, and scoring multi-term route matches above single-brand matches.

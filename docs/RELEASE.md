@@ -35,10 +35,10 @@ This release adds agent-facing retrieval controls without changing orderk's boun
 - `orderk search --min-score` / `--threshold` to suppress low-score tails.
 - `orderk search --context-chunks N` to include same-file neighbor chunks.
 - `orderk search --include-links` to expose Obsidian wikilink/backlink evidence.
-- `orderk search --expand-links 1` to optionally recall one-hop linked/backlinked chunks with bounded deterministic link evidence.
+- `orderk search --expand-links 1` to recall one-hop linked/backlinked chunks with bounded deterministic link evidence.
 - `orderk search --query-expansion` to enable deterministic lexical query expansion.
 - `orderk search --json-lines` to emit one result per line for pipe-friendly tooling.
-- `orderk search --reranker lexical|none` to optionally apply a bounded deterministic lexical reranker after temporal-quality adjustment.
+- `orderk search --reranker lexical` to apply a bounded deterministic lexical reranker after temporal-quality adjustment (default). `--reranker none` explicitly disables it for testing/migration only.
 - `orderk index --chunk-overlap N` to preserve boundary context when chunk sizes cap out.
 - `orderk eval --ab-chunk-overlap N` to compare overlap settings against the baseline eval run.
 - `orderk mcp` as a thin read-only stdio MCP surface exposing only `search`, `status`, and `health` with standard `Content-Length` frames plus JSONL smoke compatibility.

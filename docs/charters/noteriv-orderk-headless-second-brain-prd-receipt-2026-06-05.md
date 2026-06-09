@@ -1,5 +1,7 @@
 # Noteriv × orderk Headless Second-Brain PRD Receipt — 2026-06-05
 
+> **⚠️ HISTORICAL — 旧 Noteriv × orderk 第二大脑方向的执行收据。保留仅供归档参考。当前 orderk 是 Obsidian 只读搜索刀。**
+
 ## Change summary
 
 Updated the orderk charter set with a new headless Noteriv × orderk second-brain completion PRD:
