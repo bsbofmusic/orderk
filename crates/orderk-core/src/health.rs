@@ -62,6 +62,7 @@ pub fn health_report(
     embedding_model: &str,
     vector_backend: &VectorBackend,
     smoke_query: Option<&str>,
+    external_reranker: bool,
 ) -> HealthReport {
     let mut checks = Vec::new();
 
@@ -222,7 +223,13 @@ pub fn health_report(
                 )
             });
         if can_search {
-            match IndexStore::query(&conn, query, 1, provider, vector_backend) {
+            let options = QueryOptions {
+                limit: 1,
+                rerank: external_reranker,
+                external_reranker,
+                ..QueryOptions::new(1)
+            };
+            match IndexStore::query_with_options(&conn, query, &options, provider, vector_backend) {
                 Ok(resp) if !resp.results.is_empty() => checks.push(HealthCheck::ok(
                     "smoke_query",
                     "smoke query returned at least one result",
@@ -331,6 +338,7 @@ mod tests {
             "mock-8",
             &VectorBackend::SqliteVec,
             None,
+            false,
         );
         assert_eq!(report.state, HealthState::Unhealthy);
         assert!(report.error_codes.contains(&ErrorCode::EDbOpenFailed));
@@ -351,6 +359,7 @@ mod tests {
             "mock-8",
             &VectorBackend::SqliteVec,
             None,
+            false,
         );
         assert_eq!(report.state, HealthState::NeedsIndex);
         assert!(report.error_codes.contains(&ErrorCode::ENoEmbeddings));

@@ -1,9 +1,10 @@
 //! Query analysis and routing plan.
 //!
 //! `QueryPlan::analyze` classifies a raw query into a `QueryRoute` (semantic,
-//! short, path, tag), normalizes/expands its terms, and exposes the derived
-//! keyword query, scoring text, and attempted routes used by the retrieval
-//! pipeline. Pure logic with no SQLite coupling. Extracted from `index.rs`.
+//! short, path, tag), derives a generic `QueryIntent`, normalizes/expands its
+//! terms, and exposes the derived keyword query, scoring text, and attempted
+//! routes used by the retrieval pipeline. Pure logic with no SQLite coupling.
+//! Extracted from `index.rs`.
 
 use super::scoring::normalize_query;
 use crate::models::*;
@@ -28,9 +29,29 @@ impl QueryRoute {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryIntent {
+    General,
+    Historical,
+    Concept,
+    Config,
+}
+
+impl QueryIntent {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Historical => "historical",
+            Self::Concept => "concept",
+            Self::Config => "config",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QueryPlan {
     pub(crate) route: QueryRoute,
+    pub(crate) intent: QueryIntent,
     pub(crate) normalized: String,
     pub(crate) terms: Vec<String>,
     pub(crate) expanded_terms: Vec<String>,
@@ -59,8 +80,10 @@ impl QueryPlan {
         } else {
             QueryRoute::Semantic
         };
+        let intent = infer_intent(&raw, &normalized, &terms);
         Self {
             route,
+            intent,
             normalized,
             terms,
             expanded_terms: Vec::new(),
@@ -162,6 +185,74 @@ impl QueryPlan {
     }
 }
 
+fn infer_intent(raw: &str, normalized: &str, terms: &[String]) -> QueryIntent {
+    let haystack = format!("{raw} {normalized}");
+    if contains_any(
+        &haystack,
+        &[
+            "什么时候",
+            "哪天",
+            "何时",
+            "开始",
+            "关停",
+            "启用",
+            "停用",
+            "暂停",
+            "删除",
+            "创建",
+            "发生",
+            "当时",
+            "原话",
+            "对话",
+            "时间线",
+            "历史",
+            "timeline",
+            "when",
+            "history",
+            "transcript",
+            "started",
+            "stopped",
+            "disabled",
+            "enabled",
+            "shutdown",
+        ],
+    ) {
+        return QueryIntent::Historical;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "配置", "cron", "env", "端口", "service", "systemd", "日志", "报错", "失败", "error",
+            "config", "port",
+        ],
+    ) {
+        return QueryIntent::Config;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "是什么",
+            "什么是",
+            "定义",
+            "原则",
+            "方式",
+            "怎么理解",
+            "概念",
+            "concept",
+            "definition",
+            "principle",
+        ],
+    ) || (terms.len() <= 2 && raw.chars().count() <= 16)
+    {
+        return QueryIntent::Concept;
+    }
+    QueryIntent::General
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 pub(crate) fn query_expansions_for_term(term: &str) -> &'static [&'static str] {
     match term {
         "rag" => &["retrieval", "augmented", "generation"],
@@ -177,5 +268,37 @@ pub(crate) fn query_expansions_for_term(term: &str) -> &'static [&'static str] {
         "检索" => &["search", "retrieval"],
         "记忆" => &["memory", "recall"],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_intent_detects_historical_questions_without_entity_hardcoding() {
+        assert_eq!(
+            QueryPlan::analyze("我什么时候开始用某个系统").intent,
+            QueryIntent::Historical
+        );
+        assert_eq!(
+            QueryPlan::analyze("什么时候关停 beta tool").intent,
+            QueryIntent::Historical
+        );
+        assert_eq!(
+            QueryPlan::analyze("alpha service started timeline").intent,
+            QueryIntent::Historical
+        );
+    }
+
+    #[test]
+    fn query_intent_detects_concept_and_config_without_changing_route() {
+        let concept = QueryPlan::analyze("现金流是什么");
+        assert_eq!(concept.intent, QueryIntent::Concept);
+        assert_eq!(concept.route, QueryRoute::Short);
+
+        let config = QueryPlan::analyze("cron 配置为什么失败");
+        assert_eq!(config.intent, QueryIntent::Config);
+        assert_eq!(config.route, QueryRoute::Short);
     }
 }

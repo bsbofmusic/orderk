@@ -309,6 +309,12 @@ pub struct ScoreBreakdown {
     pub evidence_count_boost: f32,
     #[serde(default)]
     pub reranker_boost: f32,
+    #[serde(default)]
+    pub source_tier_boost: f32,
+    #[serde(default)]
+    pub intent_boost: f32,
+    #[serde(default)]
+    pub event_time_boost: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -364,6 +370,12 @@ pub struct EvidenceSummary {
     pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
     pub evidence_count: usize,
     pub sources: Vec<String>,
     #[serde(default)]
@@ -504,6 +516,8 @@ pub struct QueryTimings {
     pub keyword_ms: u128,
     pub vector_ms: u128,
     pub route_ms: u128,
+    #[serde(default)]
+    pub intent_tier_ms: u128,
     pub merge_ms: u128,
     pub link_expansion_ms: u128,
     pub enrich_ms: u128,
@@ -533,6 +547,12 @@ pub struct QueryRoutingEvidence {
     pub query_expansion_terms: Vec<String>,
     #[serde(default)]
     pub external_reranker: bool,
+    #[serde(default)]
+    pub intent: String,
+    #[serde(default)]
+    pub tier_candidates: usize,
+    #[serde(default)]
+    pub reranker_mode: String,
     pub keyword_candidates: usize,
     pub vector_candidates: usize,
     pub route_candidates: usize,
@@ -564,6 +584,10 @@ pub struct QueryExplainResult {
 pub struct QueryExplainTrace {
     pub schema_version: String,
     pub route: String,
+    #[serde(default)]
+    pub intent: String,
+    #[serde(default)]
+    pub reranker_mode: String,
     pub strategy: String,
     pub vector_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -605,6 +629,12 @@ pub struct SearchResult {
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub source_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
     #[serde(default)]
     pub validity: ValidityEvidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -722,6 +752,12 @@ pub struct SearchIndexEntry {
     pub quality: QualitySummary,
     #[serde(default)]
     pub evidence_summary: EvidenceSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -763,6 +799,9 @@ impl From<QueryResponse> for SearchIndexResponse {
                 validity: result.validity,
                 quality: result.quality,
                 evidence_summary: result.evidence_summary,
+                source_tier: result.source_tier,
+                evidence_type: result.evidence_type,
+                event_time: result.event_time,
             })
             .collect();
         let explain = response.explain;
@@ -830,6 +869,12 @@ pub struct ChunkGetResult {
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub source_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

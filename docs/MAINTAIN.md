@@ -54,7 +54,7 @@ orderk maintain \
 
 Output schema: `orderk.maintain.v1`.
 
-The maintainer-facing query path now also supports the retrieval workflow controls surfaced in the CLI: `--chunk-overlap`, `--query-expansion`, `--json-lines`, and `eval --ab-chunk-overlap` (opt-in controls for recall quality and pipeline ergonomics). `--reranker lexical` is default-on for ranking quality; `--reranker none` explicitly disables it for testing/migration.
+The maintainer-facing query path also supports the retrieval workflow controls surfaced in the CLI: `--chunk-overlap`, `--query-expansion`, `--json-lines`, and `eval --ab-chunk-overlap` (opt-in controls for recall quality and pipeline ergonomics). `--reranker qwen` is default-on for model ranking quality; `--reranker none` explicitly disables it for testing/migration, and missing reranker credentials fail closed.
 
 ### Continuous retrieval quality monitoring
 

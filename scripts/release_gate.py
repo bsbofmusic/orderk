@@ -275,6 +275,59 @@ def load_resource_baseline(repo: pathlib.Path = REPO) -> dict[str, Any]:
     return read_json(repo / RESOURCE_BASELINE.relative_to(REPO))
 
 
+def read_proc_cmdline(entry: pathlib.Path) -> str:
+    try:
+        raw = (entry / "cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", errors="ignore").strip()
+
+
+def read_proc_ppid(entry: pathlib.Path) -> int | None:
+    try:
+        status = (entry / "status").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("PPid:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def parent_cmdline(entry: pathlib.Path) -> str:
+    ppid = read_proc_ppid(entry)
+    if not ppid:
+        return ""
+    return read_proc_cmdline(pathlib.Path("/proc") / str(ppid))
+
+
+def is_hermes_gateway_cmdline(cmdline: str) -> bool:
+    return "hermes" in cmdline and " gateway " in f" {cmdline} " and " run" in cmdline
+
+
+def is_orderk_mcp_cmdline(cmdline: str) -> bool:
+    return "orderk" in cmdline and " mcp" in cmdline
+
+
+def is_countable_orderk_process(comm: str, cmdline: str, parent_cmd: str) -> bool:
+    """Return whether an orderk process counts as a release-gate daemon leak.
+
+    Hermes runs orderk as a stdio MCP tool server while this agent is using the
+    orderk MCP tools. That process is part of the test harness, not an orderk
+    runtime daemon left behind by the CLI/release artifact. Other orderk mcp
+    processes and any non-MCP orderk daemons still count.
+    """
+
+    if comm != "orderk":
+        return False
+    if is_orderk_mcp_cmdline(cmdline) and is_hermes_gateway_cmdline(parent_cmd):
+        return False
+    return True
+
+
 def count_orderk_processes() -> int:
     proc_root = pathlib.Path("/proc")
     if not proc_root.exists():
@@ -288,7 +341,8 @@ def count_orderk_processes() -> int:
             comm = (entry / "comm").read_text(encoding="utf-8", errors="ignore").strip()
         except OSError:
             continue
-        if comm == "orderk":
+        cmdline = read_proc_cmdline(entry)
+        if is_countable_orderk_process(comm, cmdline, parent_cmdline(entry)):
             count += 1
     return count
 

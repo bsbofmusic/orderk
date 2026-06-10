@@ -6,7 +6,7 @@
 //! and uses `index::RouteHit` via `super::`. Extracted from `index.rs`.
 
 use super::links::{link_points_to, normalize_wikilink_target};
-use super::query_plan::QueryPlan;
+use super::query_plan::{QueryIntent, QueryPlan};
 use super::ranking::{refresh_evidence_count, sort_search_results};
 use super::retrieval::{load_chunk_result, RouteHit};
 use super::scoring::{
@@ -15,6 +15,7 @@ use super::scoring::{
 use super::uri::{evidence_uri, open_uri};
 use crate::filter::FilterSql;
 use crate::models::*;
+use crate::source_intel::{infer_event_time, infer_evidence_type, infer_source_tier};
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -272,6 +273,14 @@ pub(crate) fn load_chunk_by_chunk_id(
     };
     let evidence_uri = evidence_uri(&chunk_id);
     let open_uri = open_uri(&path, line_start);
+    let source_tier = infer_source_tier(&path, source_type.as_deref());
+    let evidence_type = infer_evidence_type(&path, source_type.as_deref());
+    let event_time = infer_event_time(
+        &path,
+        valid_from.as_deref(),
+        updated.as_deref(),
+        file_mtime.or(Some(mtime)),
+    );
     Ok(Some(ChunkGetResult {
         chunk_id,
         path,
@@ -286,6 +295,9 @@ pub(crate) fn load_chunk_by_chunk_id(
         confidence,
         status,
         source_type,
+        source_tier: Some(source_tier),
+        evidence_type: Some(evidence_type),
+        event_time,
         valid_from,
         valid_until,
         supersedes,
@@ -527,6 +539,24 @@ pub(crate) fn build_result(
     } else {
         0.0
     };
+    let source_tier = infer_source_tier(path, source_type.as_deref());
+    let evidence_type = infer_evidence_type(path, source_type.as_deref());
+    let event_time = infer_event_time(path, valid_from.as_deref(), updated.as_deref(), mtime);
+    let source_tier_boost = if rerank {
+        source_tier_intent_boost(plan.intent, &source_tier)
+    } else {
+        0.0
+    };
+    let intent_boost = if rerank {
+        evidence_type_intent_boost(plan.intent, &evidence_type)
+    } else {
+        0.0
+    };
+    let event_time_boost = if rerank && event_time.is_some() {
+        event_time_intent_boost(plan.intent)
+    } else {
+        0.0
+    };
     let breakdown = ScoreBreakdown {
         keyword: keyword_score,
         vector: vector_score,
@@ -543,6 +573,9 @@ pub(crate) fn build_result(
         status_boost: 0.0,
         evidence_count_boost: 0.0,
         reranker_boost: 0.0,
+        source_tier_boost,
+        intent_boost,
+        event_time_boost,
     };
     let score = (keyword_score * 0.35)
         + (vector_score * 0.35)
@@ -552,6 +585,9 @@ pub(crate) fn build_result(
         + breakdown.route_boost
         + breakdown.recency_boost
         + metadata_boost
+        + source_tier_boost
+        + intent_boost
+        + event_time_boost
         + breakdown.link_boost;
     let snippet = snippet(text, query);
     let mut sources = Vec::new();
@@ -598,6 +634,9 @@ pub(crate) fn build_result(
         confidence,
         status,
         source_type,
+        source_tier: Some(source_tier),
+        evidence_type: Some(evidence_type),
+        event_time,
         validity: ValidityEvidence::default(),
         valid_from,
         valid_until,
@@ -606,4 +645,108 @@ pub(crate) fn build_result(
         updated,
         mtime: mtime.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
     })
+}
+
+fn source_tier_intent_boost(intent: QueryIntent, tier: &str) -> f32 {
+    match intent {
+        QueryIntent::Historical => match tier {
+            "transcript" | "report" | "system_snapshot" => 0.05,
+            "raw" | "brain" => 0.03,
+            _ => 0.0,
+        },
+        QueryIntent::Concept => match tier {
+            "wiki" | "brain" => 0.04,
+            _ => 0.0,
+        },
+        QueryIntent::Config => match tier {
+            "report" | "system_snapshot" | "raw" | "brain" => 0.04,
+            _ => 0.0,
+        },
+        QueryIntent::General => 0.0,
+    }
+}
+
+fn evidence_type_intent_boost(intent: QueryIntent, evidence_type: &str) -> f32 {
+    match intent {
+        QueryIntent::Historical => match evidence_type {
+            "dialogue" | "event_record" | "system_record" => 0.03,
+            "source" | "memory" => 0.015,
+            _ => 0.0,
+        },
+        QueryIntent::Concept => match evidence_type {
+            "concept" | "memory" => 0.03,
+            _ => 0.0,
+        },
+        QueryIntent::Config => match evidence_type {
+            "event_record" | "system_record" | "source" | "memory" => 0.03,
+            _ => 0.0,
+        },
+        QueryIntent::General => 0.0,
+    }
+}
+
+fn event_time_intent_boost(intent: QueryIntent) -> f32 {
+    match intent {
+        QueryIntent::Historical => 0.04,
+        QueryIntent::Config => 0.02,
+        QueryIntent::Concept | QueryIntent::General => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    fn historical_result(rerank: bool) -> SearchResult {
+        let plan = QueryPlan::analyze("alpha 什么时候开始");
+        build_result(
+            1,
+            "chk_hist",
+            "raw/transcripts/hermes-sessions/2026/06/08/alpha.md",
+            Some("Alpha log".to_string()),
+            None,
+            1,
+            5,
+            "alpha started on this date",
+            "[]",
+            None,
+            Some(1),
+            Some(1),
+            0.2,
+            0.2,
+            None,
+            &plan,
+            "alpha 什么时候开始",
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            rerank,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn build_result_applies_intent_metadata_boosts_for_historical_event_evidence() {
+        let result = historical_result(true);
+        assert_eq!(result.source_tier.as_deref(), Some("transcript"));
+        assert_eq!(result.evidence_type.as_deref(), Some("dialogue"));
+        assert_eq!(result.event_time.as_deref(), Some("2026-06-08"));
+        assert!(result.score_breakdown.source_tier_boost > 0.0);
+        assert!(result.score_breakdown.intent_boost > 0.0);
+        assert!(result.score_breakdown.event_time_boost > 0.0);
+
+        let no_rerank = historical_result(false);
+        assert_eq!(no_rerank.score_breakdown.source_tier_boost, 0.0);
+        assert_eq!(no_rerank.score_breakdown.intent_boost, 0.0);
+        assert_eq!(no_rerank.score_breakdown.event_time_boost, 0.0);
+    }
 }

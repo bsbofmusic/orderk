@@ -110,6 +110,36 @@
       "expected_phrases": [
         "现金流 是资金流入"
       ]
+    },
+    {
+      "id": "history-alpha-transcript",
+      "query": "Alpha launch migration call started on 2026-06-08 transcript dialogue record",
+      "expected_paths": [
+        "raw/transcripts/hermes-sessions/2026/06/08/alpha-start.md"
+      ],
+      "expected_phrases": [
+        "Alpha launch chronicle started on 2026-06-08"
+      ]
+    },
+    {
+      "id": "config-delta-system-snapshot",
+      "query": "Delta runtime snapshot socket 9876 firewall rule alpha-snap system snapshot",
+      "expected_paths": [
+        "raw/system-snapshots/2026-06-10/delta-service.md"
+      ],
+      "expected_phrases": [
+        "Delta runtime snapshot recorded socket 9876 blocked by firewall rule alpha-snap"
+      ]
+    },
+    {
+      "id": "report-delta-config-outage",
+      "query": "Delta config outage report cron disabled port 9876 service restart evidence",
+      "expected_paths": [
+        "wiki/reports/2026-06-10-delta-config-outage.md"
+      ],
+      "expected_phrases": [
+        "Delta config outage report confirms cron disabled port 9876"
+      ]
     }
   ]
 }

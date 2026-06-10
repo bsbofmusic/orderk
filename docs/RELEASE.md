@@ -38,12 +38,12 @@ This release adds agent-facing retrieval controls without changing orderk's boun
 - `orderk search --expand-links 1` to recall one-hop linked/backlinked chunks with bounded deterministic link evidence.
 - `orderk search --query-expansion` to enable deterministic lexical query expansion.
 - `orderk search --json-lines` to emit one result per line for pipe-friendly tooling.
-- `orderk search --reranker lexical` to apply a bounded deterministic lexical reranker after temporal-quality adjustment (default). `--reranker none` explicitly disables it for testing/migration only.
+- `orderk search --reranker qwen` to apply the default SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker after temporal-quality adjustment. `--reranker none` explicitly disables it for testing/migration only; missing model credentials fail closed.
 - `orderk index --chunk-overlap N` to preserve boundary context when chunk sizes cap out.
 - `orderk eval --ab-chunk-overlap N` to compare overlap settings against the baseline eval run.
 - `orderk mcp` as a thin read-only stdio MCP surface exposing only `search`, `status`, and `health` with standard `Content-Length` frames plus JSONL smoke compatibility.
 
-These features return vault evidence only; they do not write notes, generate summaries, run chat, auto-save memories, or expose index mutation through MCP. The lexical reranker is deterministic and bounded; it is not an LLM or cross-encoder reranker.
+These features return vault evidence only; they do not write notes, generate summaries, run chat, auto-save memories, or expose index mutation through MCP. The default reranker is the SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker and fails closed when credentials are missing; `--reranker none` is test/migration only.
 
 ## npm packages
 

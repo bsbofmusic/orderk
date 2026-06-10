@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import pathlib
@@ -15,6 +16,24 @@ spec.loader.exec_module(release_gate)
 
 
 class ReleaseGateStaticChecksTest(unittest.TestCase):
+    def test_mock_stress_searches_explicitly_disable_model_reranker(self) -> None:
+        """Mock stress is a local resource baseline; it must not call live model rerankers."""
+        stress_path = pathlib.Path(__file__).resolve().parent / "stress.py"
+        tree = ast.parse(stress_path.read_text(encoding="utf-8"))
+        offenders: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Name) or node.func.id != "orderk":
+                continue
+            literal_args = [arg.value for arg in node.args if isinstance(arg, ast.Constant) and isinstance(arg.value, str)]
+            if "search" not in literal_args:
+                continue
+            if "--embedding-provider" in literal_args and "mock" in literal_args:
+                if "--reranker" not in literal_args or "none" not in literal_args:
+                    offenders.append(f"line {node.lineno}: mock search lacks --reranker none")
+        self.assertEqual(offenders, [], offenders)
+
     def test_clippy_gate_covers_all_targets(self) -> None:
         clippy_commands = [cmd for cmd in release_gate.COMMANDS if len(cmd) > 1 and cmd[0] == "cargo" and cmd[1] == "clippy"]
         self.assertEqual(len(clippy_commands), 1)
@@ -176,6 +195,22 @@ class ReleaseGateStaticChecksTest(unittest.TestCase):
         result = release_gate.check_resource_baseline(repo, baseline=baseline, binary=binary, run_runtime_checks=False)
         self.assertFalse(result["ok"], result)
         self.assertIn("binary_size_bytes", result["stdout_tail"])
+
+    def test_resource_baseline_ignores_hermes_managed_orderk_mcp_but_counts_other_daemons(self) -> None:
+        hermes_parent = "/opt/hermes/.venv/bin/python3 /opt/hermes/.venv/bin/hermes gateway run --replace --accept-hooks"
+        orderk_mcp = "/home/agent/.local/bin/orderk mcp --db /vault/.obsidian/orderk/orderk-clean.sqlite"
+        self.assertFalse(
+            release_gate.is_countable_orderk_process("orderk", orderk_mcp, hermes_parent),
+            "Hermes-managed MCP tool server is test harness state, not an orderk runtime daemon leak",
+        )
+        self.assertTrue(
+            release_gate.is_countable_orderk_process("orderk", orderk_mcp, "python3 unrelated-supervisor.py"),
+            "Non-Hermes orderk mcp process must still fail the daemon-count gate",
+        )
+        self.assertTrue(
+            release_gate.is_countable_orderk_process("orderk", "/usr/local/bin/orderk serve --port 9999", hermes_parent),
+            "Only Hermes-managed MCP stdio servers are ignored; other orderk daemons still count",
+        )
 
     def test_stress_resource_baseline_rejects_latency_regression(self) -> None:
         stress_report = {

@@ -2,6 +2,7 @@ use crate::embedding::EmbeddingProvider;
 use crate::filter::compile_filter;
 use crate::models::*;
 use crate::optimizer;
+use crate::reranker::{self, RerankerProvider};
 use crate::scanner::scan_vault;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -43,6 +44,8 @@ fn build_query_explain_trace(
     QueryExplainTrace {
         schema_version: "orderk.explain_trace.v1".to_string(),
         route: routing.route.clone(),
+        intent: routing.intent.clone(),
+        reranker_mode: routing.reranker_mode.clone(),
         strategy: routing.strategy.clone(),
         vector_backend: vector_backend.to_string(),
         embedding_profile_fingerprint: routing.embedding_profile_fingerprint.clone(),
@@ -67,6 +70,11 @@ fn build_query_explain_trace(
                 name: "route".to_string(),
                 candidates: routing.route_candidates,
                 took_ms: routing.timings.route_ms,
+            },
+            QueryExplainStage {
+                name: "intent_tier".to_string(),
+                candidates: routing.tier_candidates,
+                took_ms: routing.timings.intent_tier_ms,
             },
             QueryExplainStage {
                 name: "link_expansion".to_string(),
@@ -115,6 +123,49 @@ fn compute_embedding_profile_fingerprint(
     hasher.update(b"\0");
     hasher.update(vector_backend.as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn search_reranker_for_embedding_provider<P: EmbeddingProvider + ?Sized>(
+    _provider: &P,
+) -> Result<Box<dyn RerankerProvider>> {
+    reranker::provider_from_env()
+}
+
+fn model_reranker_mode(reranker: &dyn RerankerProvider) -> String {
+    let model = reranker.model_id().to_ascii_lowercase();
+    if model.contains("qwen3-reranker-4b") {
+        "metadata_intent+qwen3-reranker-4b".to_string()
+    } else {
+        format!(
+            "metadata_intent+{}:{}",
+            reranker.provider_id(),
+            reranker.model_id()
+        )
+    }
+}
+
+fn reranker_documents_for_results(
+    conn: &Connection,
+    results: &[SearchResult],
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT text FROM chunks WHERE chunk_id = ?1 LIMIT 1")?;
+    results
+        .iter()
+        .map(|result| {
+            let text = stmt
+                .query_row(params![&result.chunk_id], |row| row.get::<_, String>(0))
+                .optional()?
+                .unwrap_or_else(|| result.snippet.clone());
+            Ok(format!(
+                "path: {}\ntitle: {}\nheading: {}\ntags: {}\ntext: {}",
+                result.path,
+                result.title.as_deref().unwrap_or(""),
+                result.heading.as_deref().unwrap_or(""),
+                result.tags.join(" "),
+                text
+            ))
+        })
+        .collect()
 }
 
 pub struct IndexStore {
@@ -473,6 +524,11 @@ impl IndexStore {
         routing.query_expansion = options.query_expansion;
         routing.query_expansion_terms = plan.expanded_terms.clone();
         routing.external_reranker = options.external_reranker;
+        routing.reranker_mode = match (options.rerank, options.external_reranker) {
+            (false, _) => "none".to_string(),
+            (true, true) => "metadata_intent+qwen3-reranker-4b".to_string(),
+            (true, false) => "metadata_intent".to_string(),
+        };
         if retrieval_depth > 0 {
             let expansion_started = Instant::now();
             routing.link_candidates = expand_link_candidates(
@@ -488,8 +544,11 @@ impl IndexStore {
             routing.merged_candidates = results.len();
         }
         apply_temporal_quality(&mut results, options, query)?;
-        if options.external_reranker {
-            apply_lexical_reranker(&mut results, &plan, query);
+        if options.rerank && options.external_reranker {
+            let reranker = search_reranker_for_embedding_provider(provider)?;
+            let reranker_documents = reranker_documents_for_results(conn, &results)?;
+            apply_model_reranker(&mut results, query, &reranker_documents, reranker.as_ref())?;
+            routing.reranker_mode = model_reranker_mode(reranker.as_ref());
         }
         if optimizer::apply_runtime_adjustments(&mut results, &optimizer_config) > 0 {
             sort_search_results(&mut results);
@@ -648,6 +707,53 @@ mod tests {
         dir
     }
 
+    fn no_external_reranker(limit: usize) -> QueryOptions {
+        QueryOptions {
+            limit,
+            external_reranker: false,
+            ..QueryOptions::new(limit)
+        }
+    }
+
+    fn query_without_external_reranker<P: EmbeddingProvider + ?Sized>(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+        provider: &P,
+        vector_backend: &VectorBackend,
+    ) -> Result<QueryResponse> {
+        IndexStore::query_with_options(
+            conn,
+            query,
+            &no_external_reranker(limit),
+            provider,
+            vector_backend,
+        )
+    }
+
+    fn query_with_filter_without_external_reranker<P: EmbeddingProvider + ?Sized>(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+        provider: &P,
+        vector_backend: &VectorBackend,
+        filter: Option<&str>,
+    ) -> Result<QueryResponse> {
+        let mut options = no_external_reranker(limit);
+        options.filter = filter
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        IndexStore::query_with_options(conn, query, &options, provider, vector_backend)
+    }
+
+    fn reranker_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
     #[test]
     fn open_uri_percent_encodes_path_query_component() {
         assert_eq!(
@@ -731,7 +837,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary.files, 2);
-        let res = IndexStore::query(
+        let res = query_without_external_reranker(
             &conn,
             "sqlite vec semantic search",
             5,
@@ -746,7 +852,91 @@ mod tests {
     }
 
     #[test]
-    fn default_search_applies_mandatory_lexical_reranker_evidence() {
+    fn default_search_applies_mandatory_qwen_reranker_evidence() {
+        let _guard = reranker_env_lock();
+        let saved = [
+            "ORDERK_SEARCH_RERANKER_PROVIDER",
+            "ORDERK_SEARCH_RERANKER_SILICONFLOW_API_KEY",
+            "ORDERK_SEARCH_RERANKER_API_KEY",
+            "ORDERK_RERANKER_SILICONFLOW_API_KEY",
+            "ORDERK_RERANKER_API_KEY",
+            "ORDERK_SWORD_RERANKER_SILICONFLOW_API_KEY",
+            "ORDERK_SWORD_RERANKER_API_KEY",
+            "ORDERK_SILICONFLOW_API_KEY",
+            "ORDERK_SEARCH_RERANKER_SILICONFLOW_BASE_URL",
+            "ORDERK_SEARCH_RERANKER_BASE_URL",
+            "ORDERK_RERANKER_BASE_URL",
+            "ORDERK_SWORD_RERANKER_SILICONFLOW_BASE_URL",
+            "ORDERK_SWORD_RERANKER_BASE_URL",
+            "ORDERK_SILICONFLOW_BASE_URL",
+            "ORDERK_SEARCH_RERANKER_SILICONFLOW_MODEL",
+            "ORDERK_SEARCH_RERANKER_MODEL",
+            "ORDERK_RERANKER_MODEL",
+            "ORDERK_SWORD_RERANKER_SILICONFLOW_MODEL",
+            "ORDERK_SWORD_RERANKER_MODEL",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var(name).ok()))
+        .collect::<Vec<_>>();
+        for (name, _) in &saved {
+            std::env::remove_var(name);
+        }
+
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0_u8; 8192];
+            loop {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        let request = String::from_utf8_lossy(&buf);
+                        if request.contains("Qwen/Qwen3-Reranker-4B") {
+                            break;
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read reranker request: {err}"),
+                }
+            }
+            let request = String::from_utf8_lossy(&buf);
+            assert!(request.contains("POST /v1/rerank HTTP/1.1"), "{request}");
+            assert!(request.contains("Qwen/Qwen3-Reranker-4B"), "{request}");
+            let response = r#"{"results":[{"index":0,"relevance_score":0.91},{"index":1,"relevance_score":0.12}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        });
+        std::env::set_var("ORDERK_SEARCH_RERANKER_SILICONFLOW_API_KEY", "test-key");
+        std::env::set_var(
+            "ORDERK_SEARCH_RERANKER_SILICONFLOW_BASE_URL",
+            format!("http://{addr}/v1"),
+        );
+
         let vault = sample_vault();
         let db_path = std::env::temp_dir().join(format!(
             "orderk-default-reranker-{}-{}.sqlite",
@@ -784,17 +974,44 @@ mod tests {
             res.routing.external_reranker,
             "routing must prove reranker ran"
         );
+        assert_eq!(
+            res.routing.reranker_mode, "metadata_intent+qwen3-reranker-4b",
+            "default search must report the actual Qwen model reranker mode"
+        );
         assert!(
             res.results.iter().any(|result| result
                 .evidence
                 .sources
                 .iter()
-                .any(|source| source == "lexical_reranker")),
-            "at least one result should carry lexical_reranker evidence: {:#?}",
+                .any(|source| source == "qwen_reranker")),
+            "at least one result should carry qwen_reranker evidence: {:#?}",
             res.results
         );
+        let none = IndexStore::query_with_options(
+            &conn,
+            "sqlite vec semantic search",
+            &QueryOptions {
+                limit: 5,
+                rerank: false,
+                external_reranker: false,
+                ..QueryOptions::new(5)
+            },
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
+        assert_eq!(none.routing.reranker_mode, "none");
+        assert!(!none.routing.external_reranker);
         let _ = fs::remove_dir_all(&vault);
         let _ = fs::remove_file(&db_path);
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        server.join().unwrap();
     }
 
     #[test]
@@ -930,7 +1147,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut options = QueryOptions::new(5);
+        let mut options = no_external_reranker(5);
         let without_explain = IndexStore::query_with_options(
             &conn,
             "sqlite vec semantic search",
@@ -1227,7 +1444,7 @@ mod tests {
         let err = crate::api::query_with_options(
             &db_path,
             "orderk migration",
-            &QueryOptions::new(5),
+            &no_external_reranker(5),
             &provider,
             VectorBackend::Exact,
         )
@@ -1285,7 +1502,7 @@ mod tests {
         )
         .unwrap();
 
-        let res = IndexStore::query_with_filter(
+        let res = query_with_filter_without_external_reranker(
             &conn,
             "shared retrieval needle",
             10,
@@ -1326,7 +1543,7 @@ mod tests {
             Some("sql_pushdown+filtered_exact_vector")
         );
 
-        let none = IndexStore::query_with_filter(
+        let none = query_with_filter_without_external_reranker(
             &conn,
             "shared retrieval needle",
             10,
@@ -1337,7 +1554,7 @@ mod tests {
         .unwrap();
         assert!(none.results.is_empty(), "{:#?}", none.results);
 
-        let err = IndexStore::query_with_filter(
+        let err = query_with_filter_without_external_reranker(
             &conn,
             "shared retrieval needle",
             10,
@@ -1394,7 +1611,7 @@ mod tests {
         )
         .unwrap();
 
-        let res = IndexStore::query_with_filter(
+        let res = query_with_filter_without_external_reranker(
             &conn,
             "shared tag needle",
             10,
@@ -1457,7 +1674,7 @@ mod tests {
         )
         .unwrap();
 
-        let no_filter = IndexStore::query(
+        let no_filter = query_without_external_reranker(
             &conn,
             "exact backend needle",
             10,
@@ -1465,7 +1682,7 @@ mod tests {
             &VectorBackend::Exact,
         )
         .unwrap();
-        let none_filter = IndexStore::query_with_filter(
+        let none_filter = query_with_filter_without_external_reranker(
             &conn,
             "exact backend needle",
             10,
@@ -1480,7 +1697,7 @@ mod tests {
             none_filter.results.first().map(|r| &r.path)
         );
 
-        let filtered = IndexStore::query_with_filter(
+        let filtered = query_with_filter_without_external_reranker(
             &conn,
             "exact backend needle",
             10,
@@ -1567,7 +1784,7 @@ shared temporal filter needle old evidence
         )
         .unwrap();
 
-        let current = IndexStore::query_with_filter(
+        let current = query_with_filter_without_external_reranker(
             &conn,
             "shared temporal filter needle old current",
             1,
@@ -1585,7 +1802,7 @@ shared temporal filter needle old evidence
             vec!["current.md"]
         );
 
-        let mut old_options = QueryOptions::new(1);
+        let mut old_options = no_external_reranker(1);
         old_options.filter = Some("superseded_by == 'current.md'".to_string());
         old_options.include_stale = true;
         let old = IndexStore::query_with_options(
@@ -1634,7 +1851,7 @@ shared temporal filter needle old evidence
         )
         .unwrap();
 
-        let path_res = IndexStore::query(
+        let path_res = query_without_external_reranker(
             &conn,
             "path:alpha.md",
             5,
@@ -1657,8 +1874,14 @@ shared temporal filter needle old evidence
             .iter()
             .any(|source| source == "path"));
 
-        let tag_res =
-            IndexStore::query(&conn, "#alpha", 5, &provider, &VectorBackend::SqliteVec).unwrap();
+        let tag_res = query_without_external_reranker(
+            &conn,
+            "#alpha",
+            5,
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
         assert_eq!(tag_res.route, "tag");
         assert!(tag_res
             .routing
@@ -1673,8 +1896,14 @@ shared temporal filter needle old evidence
             .any(|source| source == "tag"));
         assert!(tag_res.results[0].score_breakdown.route_boost > 0.0);
 
-        let short_res =
-            IndexStore::query(&conn, "alpha", 5, &provider, &VectorBackend::SqliteVec).unwrap();
+        let short_res = query_without_external_reranker(
+            &conn,
+            "alpha",
+            5,
+            &provider,
+            &VectorBackend::SqliteVec,
+        )
+        .unwrap();
         assert_eq!(short_res.route, "short");
         assert!(short_res
             .routing
@@ -1751,7 +1980,7 @@ shared temporal filter needle old evidence
         assert_eq!(provider.calls(), 2);
         assert_eq!(provider.total_inputs(), 3);
 
-        let res = IndexStore::query(
+        let res = query_without_external_reranker(
             &conn,
             "new beta body",
             5,
@@ -1885,7 +2114,7 @@ shared temporal filter needle old evidence
         assert_eq!(after.notes, before.notes);
         assert_eq!(after.chunks, before.chunks);
         assert_eq!(after.embeddings, before.embeddings);
-        let res = IndexStore::query(
+        let res = query_without_external_reranker(
             &conn,
             "durable sqlite vec semantic search",
             5,
@@ -2018,7 +2247,7 @@ shared temporal filter needle old evidence
         )
         .unwrap();
 
-        let res = IndexStore::query_with_filter(
+        let res = query_with_filter_without_external_reranker(
             &conn,
             "needle-nearest-neighbor",
             2,
@@ -2091,7 +2320,7 @@ shared temporal filter needle old evidence
             &VectorBackend::SqliteVec,
         )
         .unwrap();
-        let res = IndexStore::query(
+        let res = query_without_external_reranker(
             &conn,
             "needle-nearest-neighbor",
             2,
@@ -2154,7 +2383,7 @@ shared temporal filter needle old evidence
         let default = IndexStore::query_with_options(
             &conn,
             "temporal-quality needle current",
-            &QueryOptions::new(10),
+            &no_external_reranker(10),
             &provider,
             &VectorBackend::SqliteVec,
         )
@@ -2193,7 +2422,7 @@ shared temporal filter needle old evidence
             "temporal-quality needle old superseded",
             &QueryOptions {
                 limit: 1,
-                ..QueryOptions::new(1)
+                ..no_external_reranker(1)
             },
             &provider,
             &VectorBackend::Exact,
@@ -2222,7 +2451,7 @@ shared temporal filter needle old evidence
             &QueryOptions {
                 limit: 10,
                 include_stale: true,
-                ..QueryOptions::new(10)
+                ..no_external_reranker(10)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2245,7 +2474,7 @@ shared temporal filter needle old evidence
                 limit: 10,
                 as_of: Some("2026-04-15".to_string()),
                 freshness: FreshnessMode::Off,
-                ..QueryOptions::new(10)
+                ..no_external_reranker(10)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2269,7 +2498,7 @@ shared temporal filter needle old evidence
                 limit: 10,
                 freshness: FreshnessMode::Recent,
                 include_stale: true,
-                ..QueryOptions::new(10)
+                ..no_external_reranker(10)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2320,7 +2549,7 @@ shared temporal filter needle old evidence
         let baseline = IndexStore::query_with_options(
             &conn,
             "sqlite vec semantic search",
-            &QueryOptions::new(10),
+            &no_external_reranker(10),
             &provider,
             &VectorBackend::SqliteVec,
         )
@@ -2334,7 +2563,7 @@ shared temporal filter needle old evidence
             &QueryOptions {
                 limit: 10,
                 min_score: Some(impossible_threshold),
-                ..QueryOptions::new(10)
+                ..no_external_reranker(10)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2404,7 +2633,7 @@ shared temporal filter needle old evidence
                 limit: 3,
                 context_chunks: 1,
                 include_links: true,
-                ..QueryOptions::new(3)
+                ..no_external_reranker(3)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2517,7 +2746,7 @@ shared temporal filter needle old evidence
                 limit: 6,
                 expand_links: 1,
                 include_links: true,
-                ..QueryOptions::new(6)
+                ..no_external_reranker(6)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2615,7 +2844,7 @@ shared temporal filter needle old evidence
             &QueryOptions {
                 limit: 6,
                 retrieval_depth: 0,
-                ..QueryOptions::new(6)
+                ..no_external_reranker(6)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2640,7 +2869,7 @@ shared temporal filter needle old evidence
                 limit: 6,
                 retrieval_depth: 1,
                 include_links: true,
-                ..QueryOptions::new(6)
+                ..no_external_reranker(6)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2719,7 +2948,7 @@ shared temporal filter needle old evidence
             &QueryOptions {
                 limit: 3,
                 retrieval_depth: 2,
-                ..QueryOptions::new(3)
+                ..no_external_reranker(3)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2739,7 +2968,7 @@ shared temporal filter needle old evidence
             limit: 4,
             expand_links: 1,
             retrieval_depth: 0,
-            ..QueryOptions::new(4)
+            ..no_external_reranker(4)
         };
         assert_eq!(options.effective_retrieval_depth().unwrap(), 1);
     }
@@ -2797,7 +3026,8 @@ shared temporal filter needle old evidence
             "code task",
             &QueryOptions {
                 limit: 5,
-                ..QueryOptions::new(5)
+                external_reranker: false,
+                ..no_external_reranker(5)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2846,7 +3076,7 @@ shared temporal filter needle old evidence
             &QueryOptions {
                 limit: 5,
                 rerank: false,
-                ..QueryOptions::new(5)
+                ..no_external_reranker(5)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2878,7 +3108,7 @@ shared temporal filter needle old evidence
                 limit: 5,
                 min_score: Some(threshold_between_scores),
                 rerank: false,
-                ..QueryOptions::new(5)
+                ..no_external_reranker(5)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2897,7 +3127,8 @@ shared temporal filter needle old evidence
             &QueryOptions {
                 limit: 5,
                 min_score: Some(threshold_between_scores),
-                ..QueryOptions::new(5)
+                external_reranker: false,
+                ..no_external_reranker(5)
             },
             &provider,
             &VectorBackend::SqliteVec,
@@ -2938,7 +3169,7 @@ shared temporal filter needle old evidence
             &QueryOptions {
                 limit: 5,
                 rerank: false,
-                ..QueryOptions::new(5)
+                ..no_external_reranker(5)
             },
             &provider,
             &VectorBackend::Exact,

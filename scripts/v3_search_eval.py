@@ -140,7 +140,7 @@ def score_case(case: dict[str, Any], response: dict[str, Any], limit: int) -> di
     reranker_evidence_at_10 = 0
     for result in top_results:
         sources = set(result_sources(result))
-        if "lexical_reranker" in sources or "reranker" in sources:
+        if "qwen_reranker" in sources or "reranker" in sources:
             reranker_evidence_at_10 += 1
     for result in top_results[:3]:
         sources = set(result_sources(result))
@@ -367,7 +367,12 @@ def validate_quality_gate(report: dict[str, Any]) -> dict[str, Any]:
         positive_keys = ("hit_at_1", "hit_at_3", "hit_at_10", "mrr_at_10", "ndcg_at_10", "recall_at_10")
         has_positive = any(float(deltas.get(key, 0) or 0) > 0 for key in positive_keys)
         has_diversity_gain = float(deltas.get("duplicate_file_rate_at_10", 0) or 0) < 0
-        if not (has_positive or has_diversity_gain):
+        has_reranker_evidence_gain = (
+            thresholds.get("require_reranker_evidence") is True
+            and float(deltas.get("reranker_evidence_rate_at_10", 0) or 0) > 0
+            and float(candidate.get("reranker_evidence_rate_at_10", 0) or 0) > 0
+        )
+        if not (has_positive or has_diversity_gain or has_reranker_evidence_gain):
             failures.append("positive effect required but candidate did not improve any gated metric")
     if thresholds.get("require_reranker_evidence") is True:
         reranker_rate = float(candidate.get("reranker_evidence_rate_at_10", 0) or 0)
@@ -511,7 +516,7 @@ def main() -> None:
     if not args.fixture:
         raise SystemExit("only --fixture mode is implemented for the V3 mechanical gate")
     if args.write_baseline:
-        report = run_fixture_baseline(args.qrels, args.limit, [])
+        report = run_fixture_baseline(args.qrels, args.limit, ["--reranker", "none"])
         args.write_baseline.parent.mkdir(parents=True, exist_ok=True)
         args.write_baseline.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report, ensure_ascii=False, indent=2))

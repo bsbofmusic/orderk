@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-06-10
+
+### Added
+- Add full-vault-smart retrieval signals: source-tier inference for transcripts/reports/system snapshots/wiki/brain/raw evidence, event-time inference from existing fields/paths, and intent-aware candidate lanes for historical/config/concept queries.
+- Extend the frozen eval gate from 11 to 14 cases with historical transcript, system snapshot, and report fixtures; strict baseline remains top1/hit@k/recall/NDCG/MRR all 1.0.
+
+### Changed
+- Make default search reranking a real SiliconFlow `Qwen/Qwen3-Reranker-4B` model call. Routing now reports `metadata_intent+qwen3-reranker-4b`; results carry `qwen_reranker` evidence; CLI/MCP keep `--reranker none` / `reranker: "none"` as the only explicit test/migration escape hatch and reject legacy `--no-rerank` / `rerank: false` disable paths.
+
+### Verification
+- `cargo fmt --check` + `git diff --check` exit 0; `cargo test --workspace --all-targets` exit 0 (33 CLI tests + 114 core tests + 6/4/2 integration tests); `cargo clippy --workspace --all-targets -- -D warnings` exit 0; `python3 scripts/eval.py` exit 0 with 14/14 top1, recall@k=1.0, NDCG=1.0, MRR=1.0, mean_took_ms≈109.8; real Qwen reranker smoke exit 0 with `routing.reranker_mode=metadata_intent+qwen3-reranker-4b` and `qwen_reranker` evidence.
+
 ## [0.1.16] - 2026-06-09
 
 ### Added
@@ -170,7 +182,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/bsbofmusic/orderk/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/bsbofmusic/orderk/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/bsbofmusic/orderk/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/bsbofmusic/orderk/compare/v0.1.13...v0.1.14

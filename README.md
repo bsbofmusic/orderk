@@ -34,7 +34,7 @@ It is built for people who want better recall without giving another app permiss
 | Disposable SQLite index | Files, chunks, embeddings, FTS, vector rows, settings, and feedback live in one rebuildable DB. Delete the index and your Markdown vault is still intact. |
 | Hybrid retrieval | Keyword search, vector search, query-aware routing, path/tag/recency signals, and RRF-style fusion work together instead of pretending one score explains everything. |
 | Metadata-aware reranking | Paths, headings, tags, frontmatter, confidence, status, source type, and link evidence can influence rank without an LLM rewrite step. |
-| Retrieval workflow controls | Opt-in chunk overlap, deterministic query expansion, JSON Lines output, and eval A/B give agents and maintainers more control. A bounded lexical reranker runs by default for second-pass ranking quality. |
+| Retrieval workflow controls | Opt-in chunk overlap, deterministic query expansion, JSON Lines output, and eval A/B give agents and maintainers more control. A real SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker runs by default for second-pass ranking quality. |
 | Obsidian-native evidence | Results can include snippets, headings, tags, wikilinks, backlinks, neighbor chunks, score breakdowns, and routing timings, so agents can explain what they found. |
 | Cheap embeddings by default | Production defaults use SiliconFlow + `BAAI/bge-m3` (`1024` dimensions), which is strong enough for everyday personal-vault recall without paying for a large memory platform. |
 | Read-only agent surface | CLI search and MCP expose retrieval, status, and health. They do not expose note writing, save, forget, chat, or index mutation tools. |
@@ -88,7 +88,7 @@ orderk search \
   --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
   --query "retrieval workflow notes" \
   --query-expansion \
-  --reranker lexical \
+  --reranker qwen \
   --json-lines
 
 orderk eval \
@@ -101,8 +101,9 @@ orderk eval \
 - `--chunk-overlap` preserves boundary context when chunks are size-capped.
 - `--query-expansion` uses a deterministic lexical map, not an LLM rewrite.
 - `--json-lines` emits one JSON object per line for piping and tooling.
-- `--reranker lexical` runs a bounded deterministic lexical second pass after candidate ranking (default); `--reranker none` explicitly disables it for testing/migration only. There is no normal no-reranker product path.
-- `--no-rerank` only disables the metadata-aware rerank path (not the lexical reranker).
+- `--reranker qwen` runs the default SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker after candidate ranking; missing reranker credentials fail closed instead of silently falling back.
+- `--reranker none` explicitly disables model reranking for testing/migration only. There is no normal no-reranker product path.
+- `--no-rerank` is rejected; `--reranker none` is the only explicit escape hatch.
 - `--ab-chunk-overlap` compares overlap settings against the baseline eval run.
 
 In representative live-vault queries, compact recall cut output size by **41–46%** while preserving the same top file. See [`benchmarks/TOKEN_SAVINGS.md`](benchmarks/TOKEN_SAVINGS.md).
@@ -288,9 +289,9 @@ orderk search \
 - `--retrieval-depth 1`: include one-hop authored Obsidian wikilink/backlink candidates for deeper recall. Default `0` returns direct keyword/vector/route candidates only.
 - `--expand-links 1`: compatibility alias for `--retrieval-depth 1`; off by default and capped at one hop.
 - `--filter "tag == 'rust' && has_code == true && confidence == 'high'"`: optional metadata filter DSL. Supported fields are `path`, `title`, `heading`, `tag`, `has_code`, `has_link`, `has_task_list`, `has_incomplete_tasks`, `confidence`, `status`, and `source_type`.
-- `--no-rerank`: disable the deterministic metadata-aware rerank path. By default orderk adds a bounded `score_breakdown.metadata_boost` from indexed structure/frontmatter.
-- `--reranker lexical`: run the bounded deterministic lexical reranker (default).
-- `--reranker none`: explicitly disable lexical reranking for testing/migration only. The normal product path requires lexical reranking.
+- `--reranker qwen`: run the default SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker. Missing credentials fail closed with an explicit error.
+- `--reranker none`: explicitly disable model reranking for testing/migration only. The normal product path requires model reranking.
+- `--no-rerank`: rejected; use `--reranker none` only for explicit tests/migrations.
 - `--query-expansion`: enable deterministic lexical query expansion for short or synonym-heavy searches.
 - `--json-lines`: emit one JSON object per line for scripts and pipes.
 
@@ -389,7 +390,7 @@ This is the shortest path for an agent or automation:
 5. Use `sqlite_vec` as the vector backend.
 6. Consume the JSON output directly. Search responses include `route`, `routing` with per-stage timings, `retrieval_depth`, and link expansion counts, per-result `score_breakdown`, `evidence` with `evidence_count` and per-result `retrieval_depth`, `tags`, `confidence`, `status`, `source_type`, optional neighbor `context_chunks`, and optional Obsidian link evidence.
 7. Use `--view index` plus `orderk get --ids ...` for two-stage compact recall when an agent should inspect candidate IDs before fetching full text.
-8. Use `--chunk-max-chars`, `--chunk-overlap`, `--query-expansion`, `--json-lines`, `--reranker lexical`, `--min-score`/`--threshold`, `--context-chunks`, `--include-links`, `--retrieval-depth 1`, `--expand-links 1`, `--filter`, and `--no-rerank` when an agent needs thicker evidence, deterministic lexical expansion, machine-friendly line output, or wants metadata rerank disabled.
+8. Use `--chunk-max-chars`, `--chunk-overlap`, `--query-expansion`, `--json-lines`, `--reranker qwen`, `--reranker none`, `--min-score`/`--threshold`, `--context-chunks`, `--include-links`, `--retrieval-depth 1`, `--expand-links 1`, and `--filter` when an agent needs thicker evidence, deterministic lexical expansion, machine-friendly line output, model reranking, or an explicit test/migration reranker escape hatch.
 9. If the client supports MCP, use `orderk mcp` for read-only `search`/`get`/`status`/`health` tools instead of asking the agent to guess shell flags.
 10. Use `orderk capsule export` / `orderk capsule inspect` when an agent needs to verify that a portable SQLite index artifact still matches its recorded profile, counts, size, and checksum.
 11. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
@@ -461,7 +462,7 @@ For the full maintenance contract, see [`docs/MAINTAIN.md`](docs/MAINTAIN.md). F
 - agent orchestration
 - note writing
 - automatic summaries
-- LLM / cross-encoder reranking; the only rerank path is the bounded deterministic lexical reranker (default on; `--reranker none` for testing/migration only)
+- chat-style generation or memory lifecycle management; reranking is retrieval-only and uses the default Qwen model reranker (`--reranker none` only for tests/migrations)
 - second-brain style lifecycle management
 
 ## License

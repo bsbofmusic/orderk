@@ -64,5 +64,5 @@ Do not publish from a partially green run.
 - No agent orchestrator.
 - No note writing.
 - No automatic summaries.
-- No LLM or cross-encoder reranker in v1; the only rerank path is the bounded deterministic lexical reranker.
+- No chat/generative answer layer; search reranking is retrieval-only and defaults to SiliconFlow `Qwen/Qwen3-Reranker-4B` (`--reranker none` only for tests/migrations).
 - No background daemon or automatic polling by default.

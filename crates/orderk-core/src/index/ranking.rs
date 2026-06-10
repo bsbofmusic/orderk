@@ -3,11 +3,10 @@
 //! Pure functions over `SearchResult` / `ScoreBreakdown` with no SQLite
 //! coupling: confidence/status/freshness/evidence boosts, validity windows,
 //! temporal-quality application, quality/evidence summaries, result sorting,
-//! and the lexical reranker. Extracted from `index.rs`.
+//! and the model reranker. Extracted from `index.rs`.
 
-use super::query_plan::QueryPlan;
-use super::scoring::normalize_query;
 use crate::models::*;
+use crate::reranker::RerankerProvider;
 use anyhow::{anyhow, Result};
 use chrono::{NaiveDate, Utc};
 
@@ -336,6 +335,9 @@ pub(crate) fn evidence_summary(result: &SearchResult) -> EvidenceSummary {
         confidence: result.confidence.clone(),
         status: result.status.clone(),
         source_type: result.source_type.clone(),
+        source_tier: result.source_tier.clone(),
+        evidence_type: result.evidence_type.clone(),
+        event_time: result.event_time.clone(),
         evidence_count: result.evidence.evidence_count,
         sources: result.evidence.sources.clone(),
         evidence_uri: result.evidence_uri.clone(),
@@ -429,61 +431,48 @@ fn finite_score_for_sort(score: f32) -> f32 {
     }
 }
 
-pub(crate) fn apply_lexical_reranker(results: &mut [SearchResult], plan: &QueryPlan, query: &str) {
-    let mut terms = plan.all_terms();
-    terms.extend(
-        normalize_query(query)
-            .split_whitespace()
-            .map(ToString::to_string),
-    );
-    terms.retain(|term| term.chars().count() >= 2);
-    terms.sort();
-    terms.dedup();
-    if terms.is_empty() {
-        return;
+pub(crate) fn apply_model_reranker(
+    results: &mut [SearchResult],
+    query: &str,
+    documents: &[String],
+    reranker: &dyn RerankerProvider,
+) -> Result<()> {
+    if results.is_empty() {
+        return Ok(());
     }
-    let normalized_query = normalize_query(query).to_lowercase();
-    for result in results.iter_mut() {
-        let haystack = format!(
-            "{} {} {} {} {}",
-            result.path,
-            result.title.as_deref().unwrap_or(""),
-            result.heading.as_deref().unwrap_or(""),
-            result.snippet,
-            result.tags.join(" ")
-        )
-        .to_lowercase();
-        let matched = terms
-            .iter()
-            .filter(|term| haystack.contains(term.as_str()))
-            .count();
-        if matched == 0 {
-            continue;
-        }
-        let coverage = matched as f32 / terms.len() as f32;
-        let phrase_boost = if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
-            0.02
-        } else {
-            0.0
-        };
-        let boost = (coverage * 0.06 + phrase_boost).min(0.08);
-        if boost <= 0.0 {
-            continue;
-        }
-        result.score += boost;
-        result.score_breakdown.reranker_boost = boost;
+    if documents.len() != results.len() {
+        return Err(anyhow!(
+            "reranker document count mismatch: got {}, expected {}",
+            documents.len(),
+            results.len()
+        ));
+    }
+    let scores = reranker.rerank(query, documents)?;
+    if scores.len() != results.len() {
+        return Err(anyhow!(
+            "{} reranker returned {} scores for {} candidates",
+            reranker.model_id(),
+            scores.len(),
+            results.len()
+        ));
+    }
+    for (result, score) in results.iter_mut().zip(scores) {
+        let normalized = score.clamp(0.0, 1.0);
+        result.score_breakdown.reranker_boost = normalized;
+        result.score = normalized + (result.score * 0.01);
         if !result
             .evidence
             .sources
             .iter()
-            .any(|source| source == "lexical_reranker")
+            .any(|source| source == "qwen_reranker")
         {
-            result.evidence.sources.push("lexical_reranker".to_string());
+            result.evidence.sources.push("qwen_reranker".to_string());
         }
         refresh_evidence_count(result);
         refresh_result_summaries(result);
     }
     sort_search_results(results);
+    Ok(())
 }
 
 pub(crate) fn refresh_evidence_count(result: &mut SearchResult) {
@@ -522,6 +511,9 @@ mod ranking_tests {
             confidence: None,
             status: None,
             source_type: None,
+            source_tier: None,
+            evidence_type: None,
+            event_time: None,
             validity: Default::default(),
             valid_from: None,
             valid_until: None,

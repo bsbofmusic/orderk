@@ -138,6 +138,7 @@ def main() -> None:
             "--embedding-dim", str(DIM),
             "--embedding-model", f"mock-{DIM}",
             "--vector-backend", "sqlite_vec",
+            "--reranker", "none",
             "--json",
         )
         assert sample["vector_backend"] == "sqlite_vec", sample
@@ -157,6 +158,7 @@ def main() -> None:
                 "--embedding-dim", str(DIM),
                 "--embedding-model", f"mock-{DIM}",
                 "--vector-backend", "sqlite_vec",
+                "--reranker", "none",
                 "--json",
             )
             elapsed_ms = (time.perf_counter() - start) * 1000
@@ -208,6 +210,7 @@ def main() -> None:
             "--embedding-dim", str(DIM),
             "--embedding-model", f"mock-{DIM}",
             "--vector-backend", "sqlite_vec",
+            "--reranker", "none",
             "--json",
         )
         assert all(not r["path"].endswith(f"note-{delete_ids[0]:05d}.md") for r in deleted_probe["results"]), deleted_probe

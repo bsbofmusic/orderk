@@ -2,7 +2,7 @@
 
 ## Boundary
 
-orderk only does retrieval. It does not do chat, agent orchestration, note writing, automatic summaries, or LLM / cross-encoder reranking. It applies a bounded deterministic lexical reranker by default for second-pass ranking.
+orderk only does retrieval. It does not do chat, agent orchestration, note writing, or automatic summaries. It applies a default SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker for second-pass ranking; `--reranker none` is reserved for tests/migrations.
 
 It now also exposes explicit health and evaluation contracts:
 
@@ -68,13 +68,13 @@ orderk uses lightweight score fusion and query-aware routing:
 - deterministic lexical query expansion: `--query-expansion`
 - JSON Lines output for pipeline consumers: `--json-lines`
 - eval A/B for chunk overlap: `eval --ab-chunk-overlap`
-- lexical reranker: `--reranker lexical` (default); `--reranker none` explicitly disables for testing/migration
+- model reranker: `--reranker qwen` (default, SiliconFlow `Qwen/Qwen3-Reranker-4B`); `--reranker none` explicitly disables for testing/migration
 
 Each search result also carries structured `score_breakdown`, `evidence` with `evidence_count` and per-result `retrieval_depth`, and tag metadata so agents can inspect why it surfaced. The response-level `routing.timings` reports keyword/vector/route/merge/link-expansion/enrichment stages, while `routing.retrieval_depth` states whether authored graph-depth recall was active.
 
 ### Pipeline stages → score_breakdown mapping
 
-All scoring stages are additive and deterministic (no LLM, no cross-encoder, no runtime config except the bounded self-tuning optimizer which is opt-out).
+Pre-reranker scoring stages are additive and deterministic. The default final reranker is a real model call to SiliconFlow `Qwen/Qwen3-Reranker-4B`; missing reranker credentials fail closed unless `--reranker none` is explicitly selected for tests/migrations.
 
 ```
 Stage                          score_breakdown field            Configurable?
@@ -84,7 +84,7 @@ Stage                          score_breakdown field            Configurable?
 2. Link expansion               link_score                       --retrieval-depth 1
    (one-hop wikilink/backlink) 
 3. Temporal quality decay       temporal_quality_score           --freshness
-4. Lexical reranker             rerank_bonus                     --reranker lexical (default on)
+4. Qwen model reranker          reranker_score / rerank_bonus    --reranker qwen (default on)
 5. Bounded self-tuning          optimizer_adjustment             ORDERK_OPTIMIZER=off to disable;
    (text-only penalty)                                          orderk optimize set/reset for manual
 6. Filter & truncate            min_score gate, top-N            --min-score, --limit
@@ -97,7 +97,7 @@ Key invariants:
 - The optimizer's `text_only_penalty` is clamped [0.65, 1.0], max 3 dynamic stopwords, auto-rollback after 3 consecutive adjustments if vector hit ratio drops 5%+.
 - Every stage writes to `score_breakdown` — no hidden score manipulation.
 
-No LLM or cross-encoder reranker is used; the only reranker path is the bounded deterministic lexical reranker.
+The default reranker path is the Qwen model reranker. Missing credentials fail closed; `--reranker none` is the explicit test/migration escape hatch.
 
 ## Feedback
 

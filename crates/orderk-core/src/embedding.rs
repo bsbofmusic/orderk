@@ -372,9 +372,33 @@ mod tests {
 
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0_u8; 8192];
-            let n = stream.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]);
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0_u8; 8192];
+            loop {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        let request = String::from_utf8_lossy(&buf);
+                        if request.contains("fixture-embedding-model") {
+                            break;
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read embedding request: {err}"),
+                }
+            }
+            let request = String::from_utf8_lossy(&buf);
             assert!(request.contains("POST /v1/embeddings HTTP/1.1"));
             assert!(request
                 .to_lowercase()

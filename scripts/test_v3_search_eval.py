@@ -118,6 +118,46 @@ class V3SearchEvalMetricsTest(unittest.TestCase):
         self.assertFalse(gate["ok"])
         self.assertIn("positive", "\n".join(gate["failures"]))
 
+    def test_quality_gate_accepts_full_score_candidate_when_mandatory_reranker_evidence_is_added(self) -> None:
+        report = {
+            "schema_version": "orderk.v3_search_eval.v1",
+            "qrels_frozen": True,
+            "baseline": {
+                "hit_at_10": 13,
+                "mrr_at_10": 1.0,
+                "ndcg_at_10": 1.0,
+                "recall_at_10": 1.0,
+                "duplicate_file_rate_at_10": 0.0,
+                "reranker_evidence_rate_at_10": 0.0,
+            },
+            "candidate": {
+                "hit_at_10": 13,
+                "mrr_at_10": 1.0,
+                "ndcg_at_10": 1.0,
+                "recall_at_10": 1.0,
+                "duplicate_file_rate_at_10": 0.0,
+                "reranker_evidence_rate_at_10": 1.0,
+            },
+            "deltas": {
+                "hit_at_10": 0,
+                "mrr_at_10": 0.0,
+                "ndcg_at_10": 0.0,
+                "recall_at_10": 0.0,
+                "duplicate_file_rate_at_10": 0.0,
+                "reranker_evidence_rate_at_10": 1.0,
+            },
+            "regressions": {"mrr_at_10": [], "ndcg_at_10": [], "hit_at_10": []},
+            "thresholds": {
+                "max_duplicate_file_rate_at_10": 0.5,
+                "require_positive_effect": True,
+                "require_reranker_evidence": True,
+            },
+        }
+
+        gate = v3_eval.validate_quality_gate(report)
+
+        self.assertTrue(gate["ok"], gate)
+
     def test_quality_gate_rejects_missing_mandatory_reranker_evidence(self) -> None:
         report = {
             "schema_version": "orderk.v3_search_eval.v1",

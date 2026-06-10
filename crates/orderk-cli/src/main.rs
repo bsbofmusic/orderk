@@ -156,10 +156,11 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let include_links = take_flag(&mut args, "--include-links");
             let retrieval_depth = take_usize(&mut args, "--retrieval-depth", 0)?;
             let explain = take_flag(&mut args, "--explain");
-            let rerank = !take_flag(&mut args, "--no-rerank");
+            reject_no_rerank_flag(&mut args)?;
             let query_expansion =
                 take_flag(&mut args, "--query-expansion") || take_flag(&mut args, "--expand-query");
             let external_reranker = parse_reranker_flag(&mut args)?;
+            let rerank = external_reranker;
             let freshness = parse_freshness(&take_string(
                 &mut args,
                 "--freshness",
@@ -580,9 +581,10 @@ fn sword_search_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let filter = take_optional_string(args, "--filter")?;
     let retrieval_depth = take_usize(args, "--retrieval-depth", 0)?;
     let explain = take_flag(args, "--explain");
-    let rerank = !take_flag(args, "--no-rerank");
+    reject_no_rerank_flag(args)?;
     let query_expansion = take_flag(args, "--query-expansion") || take_flag(args, "--expand-query");
     let external_reranker = parse_reranker_flag(args)?;
+    let rerank = external_reranker;
     let freshness = parse_freshness(&take_string(args, "--freshness", "balanced".to_string())?)?;
     let include_stale = take_flag(args, "--include-stale");
     if !args.is_empty() {
@@ -955,6 +957,8 @@ fn health_like_command(args: &mut Vec<String>, doctor: bool) -> Result<serde_jso
     let vault = take_optional_string(args, "--vault")?.map(PathBuf::from);
     let profile = resolve_embedding_profile(args, Some(&db))?;
     let smoke_query = take_optional_string(args, "--smoke-query")?;
+    reject_no_rerank_flag(args)?;
+    let external_reranker = parse_reranker_flag(args)?;
     let (provider, provider_error) = resolve_provider(
         &profile.embedding_provider,
         profile.embedding_dim,
@@ -970,6 +974,7 @@ fn health_like_command(args: &mut Vec<String>, doctor: bool) -> Result<serde_jso
         &profile.embedding_model,
         &profile.vector_backend,
         smoke_query.as_deref(),
+        external_reranker,
     );
     let mut value = serde_json::to_value(report)?;
     if doctor {
@@ -1036,6 +1041,8 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let limit = take_usize(args, "--limit", 10)?;
     let ab_chunk_overlap = take_optional_usize(args, "--ab-chunk-overlap")?;
     let ab_vault = take_optional_string(args, "--vault")?.map(PathBuf::from);
+    reject_no_rerank_flag(args)?;
+    let external_reranker = parse_reranker_flag(args)?;
     let profile = resolve_embedding_profile(args, Some(&db))?;
     let provider = provider_from_name(
         &profile.embedding_provider,
@@ -1080,6 +1087,8 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
 
         let mut options = QueryOptions::new(limit);
         options.filter = eval_scope_filter(case);
+        options.rerank = external_reranker;
+        options.external_reranker = external_reranker;
         let resp = query_with_options(
             &db,
             &case.query,
@@ -1226,6 +1235,8 @@ fn eval_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
             profile.embedding_model.clone(),
             "--vector-backend".to_string(),
             profile.vector_backend.as_str().to_string(),
+            "--reranker".to_string(),
+            if external_reranker { "qwen" } else { "none" }.to_string(),
         ];
         let candidate = eval_command(&mut candidate_args)?;
         let candidate_mrr = candidate.get("mrr").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1318,6 +1329,8 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     let report_dir = take_optional_string(args, "--report-dir")?.map(PathBuf::from);
     let smoke_query = take_optional_string(args, "--smoke-query")?;
     let limit = take_usize(args, "--limit", 10)?;
+    reject_no_rerank_flag(args)?;
+    let external_reranker = parse_reranker_flag(args)?;
     let profile = resolve_embedding_profile(args, Some(&db))?;
     let (provider, provider_error) = resolve_provider(
         &profile.embedding_provider,
@@ -1335,6 +1348,7 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
         &profile.embedding_model,
         &profile.vector_backend,
         smoke_query.as_deref(),
+        external_reranker,
     );
 
     let mut checks: Vec<orderk_core::HealthCheck> = Vec::new();
@@ -1348,6 +1362,7 @@ fn maintain_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                 profile.embedding_dim,
                 &profile.embedding_model,
                 profile.vector_backend.clone(),
+                external_reranker,
             ) {
                 Ok(value) => {
                     let zero_hit = value.get("zero_hit").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1465,6 +1480,7 @@ fn run_eval_report(
     embedding_dim: usize,
     embedding_model: &str,
     vector_backend: VectorBackend,
+    external_reranker: bool,
 ) -> Result<serde_json::Value> {
     let mut args = vec![
         "--db".to_string(),
@@ -1481,6 +1497,8 @@ fn run_eval_report(
         embedding_model.to_string(),
         "--vector-backend".to_string(),
         vector_backend.as_str().to_string(),
+        "--reranker".to_string(),
+        if external_reranker { "qwen" } else { "none" }.to_string(),
     ];
     eval_command(&mut args)
 }
@@ -1716,10 +1734,17 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
         .min(1) as usize;
-    let rerank = arguments
-        .get("rerank")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    if arguments.get("rerank").and_then(|v| v.as_bool()) == Some(false) {
+        return Err(anyhow!(
+            "MCP search rerank=false is not supported; use reranker:'none' for the explicit test/migration escape hatch"
+        ));
+    }
+    let reranker = arguments
+        .get("reranker")
+        .and_then(|v| v.as_str())
+        .unwrap_or("qwen");
+    let external_reranker = parse_reranker_value(reranker)?;
+    let rerank = external_reranker;
     let explain = arguments
         .get("explain")
         .and_then(|v| v.as_bool())
@@ -1764,7 +1789,7 @@ fn mcp_search(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
             as_of,
             include_stale,
             query_expansion: false,
-            external_reranker: true,
+            external_reranker,
         },
         provider.as_ref(),
         config.vector_backend.clone(),
@@ -1826,6 +1851,16 @@ fn mcp_get(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde_js
 
 fn mcp_health(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde_json::Value> {
     let smoke_query = arguments.get("smoke_query").and_then(|v| v.as_str());
+    if arguments.get("rerank").and_then(|v| v.as_bool()) == Some(false) {
+        return Err(anyhow!(
+            "MCP health rerank=false is not supported; use reranker:'none' for the explicit test/migration escape hatch"
+        ));
+    }
+    let reranker = arguments
+        .get("reranker")
+        .and_then(|v| v.as_str())
+        .unwrap_or("qwen");
+    let external_reranker = parse_reranker_value(reranker)?;
     let (provider, provider_error) = resolve_provider(
         &config.embedding_provider,
         config.embedding_dim,
@@ -1841,6 +1876,7 @@ fn mcp_health(config: &McpConfig, arguments: &serde_json::Value) -> Result<serde
         &config.embedding_model,
         &config.vector_backend,
         smoke_query,
+        external_reranker,
     ))?)
 }
 
@@ -2008,7 +2044,8 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
                     "include_links": {"type": "boolean", "default": false},
                     "retrieval_depth": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "Retrieval depth over authored Obsidian wikilinks/backlinks: 0 direct only, 1 one-hop expansion; deterministic and off by default"},
                     "expand_links": {"type": "integer", "minimum": 0, "maximum": 1, "default": 0, "description": "DEPRECATED: compatibility alias for retrieval_depth; use retrieval_depth instead"},
-                    "rerank": {"type": "boolean", "default": true, "description": "Enable metadata-aware rerank (has_code, has_task_list, temporal validity/quality metadata, etc.)"},
+                    "rerank": {"type": "boolean", "default": true, "description": "Legacy compatibility flag; false is rejected. Use reranker='none' for the explicit test/migration escape hatch."},
+                    "reranker": {"type": "string", "enum": ["qwen", "none"], "default": "qwen", "description": "Model reranker mode. Default uses SiliconFlow Qwen/Qwen3-Reranker-4B; 'none' is the only explicit test/migration escape hatch."},
                     "freshness": {"type": "string", "enum": ["off", "balanced", "recent", "oldest"], "default": "balanced", "description": "Temporal rerank mode: off disables freshness boost, recent favors newly updated valid evidence, oldest favors earliest valid evidence"},
                     "as_of": {"type": "string", "description": "Optional YYYY-MM-DD historical validity date; returns evidence valid at that date instead of only current evidence"},
                     "include_stale": {"type": "boolean", "default": false, "description": "Include stale/superseded/archived evidence instead of hiding it by default"},
@@ -2294,18 +2331,33 @@ fn resolve_embedding_profile(
 
 fn parse_reranker_flag(args: &mut Vec<String>) -> Result<bool> {
     if take_flag(args, "--lexical-reranker") {
-        return Ok(true);
+        return Err(anyhow!(
+            "--lexical-reranker is no longer supported; default search uses Qwen/Qwen3-Reranker-4B, or use --reranker none for the explicit test/migration escape hatch"
+        ));
     }
     let Some(raw) = take_optional_string(args, "--reranker")? else {
         return Ok(true);
     };
-    match raw.as_str() {
+    parse_reranker_value(&raw)
+}
+
+fn parse_reranker_value(raw: &str) -> Result<bool> {
+    match raw {
         "none" => Ok(false),
-        "lexical" => Ok(true),
+        "qwen" | "qwen3" | "qwen3-reranker-4b" | "siliconflow" => Ok(true),
         other => Err(anyhow!(
-            "unknown reranker: {other} (expected lexical|none; none is test/migration only)"
+            "unknown reranker: {other} (expected qwen|none; none is the only test/migration escape hatch)"
         )),
     }
+}
+
+fn reject_no_rerank_flag(args: &mut Vec<String>) -> Result<()> {
+    if take_flag(args, "--no-rerank") {
+        return Err(anyhow!(
+            "--no-rerank is no longer supported; use --reranker none for the explicit test/migration escape hatch"
+        ));
+    }
+    Ok(())
 }
 
 fn take_optional_f32(args: &mut Vec<String>, name: &str) -> Result<Option<f32>> {
@@ -2488,7 +2540,10 @@ fn run_with_args(mut args: Vec<String>) -> Result<serde_json::Value> {
                     min_score: take_optional_f32(&mut args, "--min-score")?,
                     context_chunks: take_usize(&mut args, "--context-chunks", 0)?,
                     include_links: take_flag(&mut args, "--include-links"),
-                    rerank: !take_flag(&mut args, "--no-rerank"),
+                    rerank: {
+                        reject_no_rerank_flag(&mut args)?;
+                        external_reranker
+                    },
                     retrieval_depth: retrieval_depth_mcp,
                     expand_links: retrieval_depth_mcp,
                     explain,
@@ -2555,7 +2610,7 @@ fn print_usage() {
         "orderk <init|index|search|get|status|health|doctor|eval|maintain|optimize|capsule|sword|sword-spirit|graph|digest|mcp|feedback> [--flags]"
     );
     eprintln!(
-        "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--query-expansion] [--reranker lexical|none] [--json-lines] [--explain] [--no-rerank]"
+        "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--query-expansion] [--reranker qwen|none] [--json-lines] [--explain]"
     );
     eprintln!("index flags: --vault <path> --db <orderk.sqlite> [--chunk-max-chars <n>] [--chunk-overlap <n>]");
     eprintln!("eval flags: --db <orderk.sqlite> --queries <queries.json> [--ab-chunk-overlap <n>] [--vault <path>]");
@@ -2712,17 +2767,29 @@ mod tests {
     }
 
     #[test]
-    fn reranker_flag_defaults_to_lexical_and_allows_explicit_none() {
+    fn reranker_flag_defaults_to_qwen_and_allows_explicit_none() {
         let mut default_args = Vec::new();
         assert!(parse_reranker_flag(&mut default_args).unwrap());
 
+        let mut qwen_args = vec!["--reranker".to_string(), "qwen".to_string()];
+        assert!(parse_reranker_flag(&mut qwen_args).unwrap());
+        assert!(qwen_args.is_empty());
+
         let mut lexical_args = vec!["--lexical-reranker".to_string()];
-        assert!(parse_reranker_flag(&mut lexical_args).unwrap());
-        assert!(lexical_args.is_empty());
+        assert!(
+            parse_reranker_flag(&mut lexical_args).is_err(),
+            "legacy lexical reranker flag must not masquerade as the Qwen model reranker"
+        );
 
         let mut none_args = vec!["--reranker".to_string(), "none".to_string()];
         assert!(!parse_reranker_flag(&mut none_args).unwrap());
         assert!(none_args.is_empty());
+
+        let mut no_rerank_args = vec!["--no-rerank".to_string()];
+        assert!(
+            reject_no_rerank_flag(&mut no_rerank_args).is_err(),
+            "legacy --no-rerank must not become a second disable path"
+        );
 
         for alias in ["off", "false"] {
             let mut alias_args = vec!["--reranker".to_string(), alias.to_string()];
@@ -3363,6 +3430,8 @@ mod tests {
                 "3".into(),
                 "--view".into(),
                 "index".into(),
+                "--reranker".into(),
+                "none".into(),
             ])
             .expect("bare search should reuse provider/model/dim/backend stored in the DB profile despite ambient env defaults");
 
@@ -3429,6 +3498,21 @@ mod tests {
             .pointer("/inputSchema/properties/view")
             .expect("search tool schema must expose compact view selector");
         assert_eq!(view.get("default").and_then(|v| v.as_str()), Some("full"));
+        let reranker = search_tool
+            .pointer("/inputSchema/properties/reranker")
+            .expect("search tool schema must expose explicit reranker selector");
+        assert_eq!(
+            reranker.get("default").and_then(|v| v.as_str()),
+            Some("qwen")
+        );
+        assert!(reranker
+            .get("enum")
+            .and_then(|value| value.as_array())
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("qwen"))));
+        assert!(reranker
+            .get("enum")
+            .and_then(|value| value.as_array())
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("none"))));
         let filter_description = search_tool
             .pointer("/inputSchema/properties/filter/description")
             .and_then(|value| value.as_str())
@@ -3696,7 +3780,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_search_defaults_to_mandatory_lexical_reranker() {
+    fn mcp_search_defaults_to_mandatory_qwen_reranker() {
         let root = std::env::temp_dir().join(format!(
             "orderk-mcp-reranker-{}-{}",
             std::process::id(),
@@ -3755,6 +3839,12 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(true)
         );
+        assert_eq!(
+            response
+                .pointer("/routing/reranker_mode")
+                .and_then(|value| value.as_str()),
+            Some("metadata_intent+qwen3-reranker-4b")
+        );
         assert!(
             response["results"]
                 .as_array()
@@ -3763,11 +3853,32 @@ mod tests {
                 .any(|result| result
                     .pointer("/evidence/sources")
                     .and_then(|value| value.as_array())
-                    .is_some_and(|sources| sources
-                        .iter()
-                        .any(|source| source == "lexical_reranker"))),
-            "MCP search should expose lexical_reranker evidence: {response}"
+                    .is_some_and(|sources| sources.iter().any(|source| source == "qwen_reranker"))),
+            "MCP search should expose qwen_reranker evidence: {response}"
         );
+
+        let none_response = mcp_search(
+            &config,
+            &json!({"query":"MCP search default reranker compact recall evidence", "limit": 2, "reranker":"none"}),
+        )
+        .unwrap();
+        assert_eq!(
+            none_response
+                .pointer("/routing/external_reranker")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            none_response
+                .pointer("/routing/reranker_mode")
+                .and_then(|value| value.as_str()),
+            Some("none")
+        );
+        assert!(mcp_search(
+            &config,
+            &json!({"query":"MCP search default reranker compact recall evidence", "limit": 2, "rerank": false}),
+        )
+        .is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4284,6 +4395,9 @@ Temporal quality summary needle keeps evidence readable.
             confidence: None,
             status: None,
             source_type: None,
+            source_tier: None,
+            evidence_type: None,
+            event_time: None,
             validity: Default::default(),
             valid_from: None,
             valid_until: None,
@@ -4545,6 +4659,9 @@ Temporal quality summary needle keeps evidence readable.
                 confidence: None,
                 status: None,
                 source_type: None,
+                source_tier: None,
+                evidence_type: None,
+                event_time: None,
                 validity: Default::default(),
                 valid_from: None,
                 valid_until: None,

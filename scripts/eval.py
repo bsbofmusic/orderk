@@ -219,6 +219,8 @@ def main() -> None:
                     "16",
                     "--embedding-model",
                     "mock-16",
+                    "--reranker",
+                    "none",
                     "--json",
                 ]
             )

@@ -14,7 +14,9 @@ pub mod optimizer;
 pub mod profiles;
 pub mod proposals;
 pub mod reasoning;
+pub mod reranker;
 pub mod scanner;
+pub mod source_intel;
 pub mod sword_spirit;
 pub mod v2_schema;
 
@@ -47,6 +49,10 @@ pub use proposals::{approve_proposal, list_proposals, reject_proposal, show_prop
 pub use reasoning::{
     reason_about_vault, ReasoningBoundary, ReasoningEvidence, ReasoningOptions, ReasoningRelation,
     ReasoningReport, SuggestedPatch,
+};
+pub use reranker::{
+    RerankerProvider, SiliconFlowRerankerProvider, DEFAULT_SEARCH_RERANKER_MODEL,
+    DEFAULT_SEARCH_RERANKER_PROVIDER,
 };
 pub use sword_spirit::{
     default_sword_embedding_dim, default_sword_embedding_model, default_sword_embedding_provider,

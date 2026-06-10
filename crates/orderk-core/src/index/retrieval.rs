@@ -3,12 +3,12 @@
 //!
 //! The DB-touching retrieval core: route-hit scoring, FTS/filter SQL
 //! assembly, sqlite-vec and exact vector score collection, the
-//! `query_hybrid` / `query_exact` execution paths, and `load_chunk_result`
+//! `query_hybrid` / `query_exact` execution paths, and candidate row assembly.
 //! row assembly. Calls into `evidence::build_result` and back-references
 //! nothing in `index.rs`. Extracted from `index.rs`.
 
 use super::evidence::build_result;
-use super::query_plan::{QueryPlan, QueryRoute};
+use super::query_plan::{QueryIntent, QueryPlan, QueryRoute};
 use super::ranking::sort_search_results;
 use super::scoring::{
     blob_to_vec, bm25_to_score, distance_to_score, keyword_overlap_score, l2_distance,
@@ -17,15 +17,17 @@ use super::scoring::{
 use crate::embedding::EmbeddingProvider;
 use crate::filter::FilterSql;
 use crate::models::*;
+use crate::source_intel::{infer_event_time, infer_source_tier};
 use anyhow::Result;
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 const V3_KEYWORD_CANDIDATES: usize = 80;
 const V3_VECTOR_CANDIDATES: usize = 80;
 const V3_ROUTE_CANDIDATES: usize = 50;
+const V3_INTENT_TIER_CANDIDATES: usize = 60;
 const V3_CANDIDATE_POOL_CAP: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,7 @@ pub(crate) struct CandidateDepths {
     pub(crate) keyword: usize,
     pub(crate) vector: usize,
     pub(crate) route: usize,
+    pub(crate) intent_tier: usize,
     pub(crate) pool_cap: usize,
 }
 
@@ -41,6 +44,7 @@ pub(crate) fn v3_candidate_depths(_limit: usize) -> CandidateDepths {
         keyword: V3_KEYWORD_CANDIDATES,
         vector: V3_VECTOR_CANDIDATES,
         route: V3_ROUTE_CANDIDATES,
+        intent_tier: V3_INTENT_TIER_CANDIDATES,
         pool_cap: V3_CANDIDATE_POOL_CAP,
     }
 }
@@ -49,17 +53,38 @@ fn reciprocal_rank_score(rank: Option<usize>) -> f32 {
     rank.map(|value| 1.0 / (60.0 + value as f32)).unwrap_or(0.0)
 }
 
+#[cfg(test)]
 pub(crate) fn candidate_fusion_score(
     rowid: i64,
     keyword_scores: &HashMap<i64, (usize, f32)>,
     vector_scores: &HashMap<i64, (usize, f32)>,
     route_scores: &HashMap<i64, RouteHit>,
 ) -> f32 {
+    candidate_fusion_score_with_tier(
+        rowid,
+        keyword_scores,
+        vector_scores,
+        route_scores,
+        &HashMap::new(),
+    )
+}
+
+fn candidate_fusion_score_with_tier(
+    rowid: i64,
+    keyword_scores: &HashMap<i64, (usize, f32)>,
+    vector_scores: &HashMap<i64, (usize, f32)>,
+    route_scores: &HashMap<i64, RouteHit>,
+    tier_scores: &HashMap<i64, RouteHit>,
+) -> f32 {
     reciprocal_rank_score(keyword_scores.get(&rowid).map(|score| score.0))
         + reciprocal_rank_score(vector_scores.get(&rowid).map(|score| score.0))
         + route_scores
             .get(&rowid)
             .map(|hit| (hit.score.max(0.0) * reciprocal_rank_score(Some(1))).min(0.05))
+            .unwrap_or(0.0)
+        + tier_scores
+            .get(&rowid)
+            .map(|hit| (hit.score.max(0.0) * reciprocal_rank_score(Some(1))).min(0.06))
             .unwrap_or(0.0)
 }
 
@@ -279,6 +304,157 @@ pub(crate) fn collect_route_hits(
     Ok(hits)
 }
 
+pub(crate) fn collect_intent_tier_hits(
+    conn: &Connection,
+    plan: &QueryPlan,
+    candidate_limit: usize,
+    filter: Option<&FilterSql>,
+) -> Result<HashMap<i64, RouteHit>> {
+    let tiers = intent_tier_names(plan.intent);
+    if tiers.is_empty() || candidate_limit == 0 {
+        return Ok(HashMap::new());
+    }
+    let mut terms = route_terms(plan);
+    terms.retain(|term| term.chars().count() >= 2);
+    terms.sort();
+    terms.dedup();
+    if terms.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut sql = String::from(
+        "SELECT c.id, c.file_path, c.title, c.heading, c.tags_json, c.text, c.source_type, c.valid_from, c.updated, c.mtime
+         FROM chunks c
+         WHERE (",
+    );
+    sql.push_str(&source_tier_sql_clause(&tiers));
+    sql.push_str(") AND (");
+    let mut args = Vec::new();
+    let mut clauses = Vec::new();
+    for term in &terms {
+        clauses.push("lower(c.file_path) LIKE ? OR lower(coalesce(c.title, '')) LIKE ? OR lower(coalesce(c.heading, '')) LIKE ? OR lower(c.tags_json) LIKE ? OR lower(c.text) LIKE ? OR lower(coalesce(c.source_type, '')) LIKE ?".to_string());
+        let like = format!("%{}%", term.to_lowercase());
+        for _ in 0..6 {
+            args.push(Value::Text(like.clone()));
+        }
+    }
+    sql.push_str(&clauses.join(" OR "));
+    sql.push(')');
+    append_filter_clause(&mut sql, filter);
+    sql.push_str(" LIMIT ?");
+    append_filter_args(&mut args, filter);
+    args.push(Value::Integer(candidate_limit.max(1) as i64));
+
+    let mut hits = HashMap::new();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, i64>(9)?,
+        ))
+    })?;
+    for row in rows {
+        let (rowid, path, title, heading, tags_json, text, source_type, valid_from, updated, mtime) =
+            row?;
+        let haystack = format!(
+            "{} {} {} {} {} {}",
+            path,
+            title.as_deref().unwrap_or(""),
+            heading.as_deref().unwrap_or(""),
+            tags_json,
+            text,
+            source_type.as_deref().unwrap_or("")
+        )
+        .to_lowercase();
+        let matched_terms = terms
+            .iter()
+            .filter(|term| haystack.contains(term.as_str()))
+            .count();
+        if matched_terms == 0 {
+            continue;
+        }
+        let tier = infer_source_tier(&path, source_type.as_deref());
+        let event_time = infer_event_time(
+            &path,
+            valid_from.as_deref(),
+            updated.as_deref(),
+            Some(mtime),
+        );
+        let mut reasons = vec!["intent_tier".to_string(), format!("source_tier:{tier}")];
+        if event_time.is_some() {
+            reasons.push("event_time".to_string());
+        }
+        hits.insert(
+            rowid,
+            RouteHit {
+                score: intent_tier_score(plan.intent, &tier, event_time.is_some(), matched_terms),
+                reasons,
+            },
+        );
+    }
+    Ok(hits)
+}
+
+fn intent_tier_names(intent: QueryIntent) -> Vec<&'static str> {
+    match intent {
+        QueryIntent::Historical => vec!["transcript", "report", "system_snapshot", "raw", "brain"],
+        QueryIntent::Concept => vec!["wiki", "brain"],
+        QueryIntent::Config => vec!["report", "system_snapshot", "raw", "brain"],
+        QueryIntent::General => Vec::new(),
+    }
+}
+
+fn source_tier_sql_clause(tiers: &[&str]) -> String {
+    tiers
+        .iter()
+        .map(|tier| match *tier {
+            "transcript" => "(lower(c.file_path) LIKE 'raw/transcripts/%' OR lower(c.file_path) LIKE '%/raw/transcripts/%' OR lower(coalesce(c.source_type, '')) LIKE '%transcript%' OR lower(coalesce(c.source_type, '')) LIKE '%dialogue%')",
+            "report" => "(lower(c.file_path) LIKE 'wiki/reports/%' OR lower(c.file_path) LIKE 'reports/%' OR lower(c.file_path) LIKE '%/reports/%' OR lower(coalesce(c.source_type, '')) LIKE '%report%' OR lower(coalesce(c.source_type, '')) LIKE '%audit%')",
+            "system_snapshot" => "(lower(c.file_path) LIKE 'raw/system-snapshots/%' OR lower(c.file_path) LIKE '%/system-snapshots/%' OR lower(coalesce(c.source_type, '')) LIKE '%snapshot%' OR lower(coalesce(c.source_type, '')) LIKE '%system%')",
+            "wiki" => "(lower(c.file_path) LIKE 'wiki/%')",
+            "brain" => "(lower(c.file_path) LIKE 'brain/%')",
+            "raw" => "(lower(c.file_path) LIKE 'raw/%')",
+            _ => "0",
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn intent_tier_score(
+    intent: QueryIntent,
+    tier: &str,
+    has_event_time: bool,
+    matched_terms: usize,
+) -> f32 {
+    let tier_boost = match intent {
+        QueryIntent::Historical => match tier {
+            "transcript" | "report" | "system_snapshot" => 0.34,
+            "raw" | "brain" => 0.22,
+            _ => 0.0,
+        },
+        QueryIntent::Concept => match tier {
+            "wiki" | "brain" => 0.20,
+            _ => 0.0,
+        },
+        QueryIntent::Config => match tier {
+            "report" | "system_snapshot" | "raw" | "brain" => 0.24,
+            _ => 0.0,
+        },
+        QueryIntent::General => 0.0,
+    };
+    let event_boost = if has_event_time { 0.08 } else { 0.0 };
+    let term_boost = (matched_terms.min(4) as f32) * 0.025;
+    tier_boost + event_boost + term_boost
+}
+
 pub(crate) fn sqlite_vec_vector_scores(
     conn: &Connection,
     qvec: &[f32],
@@ -382,41 +558,62 @@ pub(crate) fn query_hybrid<P: EmbeddingProvider + ?Sized>(
     let route_scores = collect_route_hits(conn, plan, candidate_depths.route, filter)?;
     timings.route_ms = route_started.elapsed().as_millis();
 
+    let tier_started = Instant::now();
+    let tier_scores = collect_intent_tier_hits(conn, plan, candidate_depths.intent_tier, filter)?;
+    timings.intent_tier_ms = tier_started.elapsed().as_millis();
+
+    let mut combined_route_scores = route_scores.clone();
+    for (rowid, tier_hit) in &tier_scores {
+        combined_route_scores
+            .entry(*rowid)
+            .and_modify(|existing| {
+                existing.score += tier_hit.score;
+                for reason in &tier_hit.reasons {
+                    if !existing.reasons.iter().any(|current| current == reason) {
+                        existing.reasons.push(reason.clone());
+                    }
+                }
+            })
+            .or_insert_with(|| tier_hit.clone());
+    }
+
     let merge_started = Instant::now();
     let mut candidate_ids: HashSet<i64> = keyword_scores.keys().copied().collect();
     candidate_ids.extend(vector_scores.keys().copied());
-    candidate_ids.extend(route_scores.keys().copied());
+    candidate_ids.extend(combined_route_scores.keys().copied());
     let mut candidate_ids = candidate_ids.into_iter().collect::<Vec<_>>();
     candidate_ids.sort_by(|a, b| {
-        candidate_fusion_score(*b, &keyword_scores, &vector_scores, &route_scores)
-            .partial_cmp(&candidate_fusion_score(
-                *a,
-                &keyword_scores,
-                &vector_scores,
-                &route_scores,
-            ))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.cmp(b))
+        candidate_fusion_score_with_tier(
+            *b,
+            &keyword_scores,
+            &vector_scores,
+            &route_scores,
+            &tier_scores,
+        )
+        .partial_cmp(&candidate_fusion_score_with_tier(
+            *a,
+            &keyword_scores,
+            &vector_scores,
+            &route_scores,
+            &tier_scores,
+        ))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.cmp(b))
     });
     candidate_ids.truncate(candidate_depths.pool_cap);
     let merged_candidates = candidate_ids.len();
 
-    let mut results = Vec::new();
-    for rowid in candidate_ids {
-        if let Some(result) = load_chunk_result(
-            conn,
-            rowid,
-            keyword_scores.get(&rowid),
-            vector_scores.get(&rowid),
-            route_scores.get(&rowid),
-            plan,
-            &scoring_query,
-            filter,
-            rerank,
-        )? {
-            results.push(result);
-        }
-    }
+    let mut results = load_candidate_results(
+        conn,
+        &candidate_ids,
+        &keyword_scores,
+        &vector_scores,
+        &combined_route_scores,
+        plan,
+        &scoring_query,
+        filter,
+        rerank,
+    )?;
     sort_search_results(&mut results);
     timings.merge_ms = merge_started.elapsed().as_millis();
 
@@ -437,6 +634,9 @@ pub(crate) fn query_hybrid<P: EmbeddingProvider + ?Sized>(
         query_expansion: false,
         query_expansion_terms: Vec::new(),
         external_reranker: false,
+        intent: plan.intent.as_str().to_string(),
+        tier_candidates: tier_scores.len(),
+        reranker_mode: if rerank { "metadata_intent" } else { "none" }.to_string(),
         keyword_candidates: keyword_scores.len(),
         vector_candidates: vector_scores.len(),
         route_candidates: route_scores.len(),
@@ -609,6 +809,9 @@ pub(crate) fn query_exact<P: EmbeddingProvider + ?Sized>(
         query_expansion: false,
         query_expansion_terms: Vec::new(),
         external_reranker: false,
+        intent: plan.intent.as_str().to_string(),
+        tier_candidates: 0,
+        reranker_mode: if rerank { "metadata_intent" } else { "none" }.to_string(),
         keyword_candidates: 0,
         vector_candidates: total_candidates,
         route_candidates: route_matches,
@@ -618,6 +821,128 @@ pub(crate) fn query_exact<P: EmbeddingProvider + ?Sized>(
         timings,
     };
     Ok((scored, routing))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_candidate_results(
+    conn: &Connection,
+    rowids: &[i64],
+    keyword_scores: &HashMap<i64, (usize, f32)>,
+    vector_scores: &HashMap<i64, (usize, f32)>,
+    route_scores: &HashMap<i64, RouteHit>,
+    plan: &QueryPlan,
+    query: &str,
+    filter: Option<&FilterSql>,
+    rerank: bool,
+) -> Result<Vec<SearchResult>> {
+    if rowids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; rowids.len()].join(",");
+    let mut sql = String::from(
+        "SELECT c.id, c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, f.mtime, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type, c.valid_from, c.valid_until, c.supersedes, c.superseded_by, c.updated
+         FROM chunks c
+         LEFT JOIN files f ON f.path = c.file_path
+         WHERE c.id IN (",
+    );
+    sql.push_str(&placeholders);
+    sql.push(')');
+    append_filter_clause(&mut sql, filter);
+    let mut args = rowids
+        .iter()
+        .copied()
+        .map(Value::Integer)
+        .collect::<Vec<_>>();
+    append_filter_args(&mut args, filter);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, i64>(5)? as usize,
+            row.get::<_, i64>(6)? as usize,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, i64>(11)? != 0,
+            row.get::<_, i64>(12)? != 0,
+            row.get::<_, i64>(13)? != 0,
+            row.get::<_, i64>(14)? != 0,
+            row.get::<_, Option<String>>(15)?,
+            row.get::<_, Option<String>>(16)?,
+            row.get::<_, Option<String>>(17)?,
+            row.get::<_, Option<String>>(18)?,
+            row.get::<_, Option<String>>(19)?,
+            row.get::<_, Option<String>>(20)?,
+            row.get::<_, Option<String>>(21)?,
+            row.get::<_, Option<String>>(22)?,
+        ))
+    })?;
+    let mut results = Vec::new();
+    for row in rows {
+        let (
+            rowid,
+            chunk_id,
+            path,
+            title,
+            heading,
+            line_start,
+            line_end,
+            text,
+            tags_json,
+            mtime,
+            file_mtime,
+            has_code,
+            has_link,
+            has_task_list,
+            has_incomplete_tasks,
+            confidence,
+            status,
+            source_type,
+            valid_from,
+            valid_until,
+            supersedes,
+            superseded_by,
+            updated,
+        ) = row?;
+        results.push(build_result(
+            rowid,
+            &chunk_id,
+            &path,
+            title,
+            heading,
+            line_start,
+            line_end,
+            &text,
+            &tags_json,
+            file_mtime.or(Some(mtime)),
+            keyword_scores.get(&rowid).map(|v| v.0),
+            vector_scores.get(&rowid).map(|v| v.0),
+            keyword_scores.get(&rowid).map(|v| v.1).unwrap_or(0.0),
+            vector_scores.get(&rowid).map(|v| v.1).unwrap_or(0.0),
+            route_scores.get(&rowid),
+            plan,
+            query,
+            has_code,
+            has_link,
+            has_task_list,
+            has_incomplete_tasks,
+            confidence,
+            status,
+            source_type,
+            valid_from,
+            valid_until,
+            supersedes,
+            superseded_by,
+            updated,
+            rerank,
+        )?);
+    }
+    Ok(results)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -632,104 +957,30 @@ pub(crate) fn load_chunk_result(
     filter: Option<&FilterSql>,
     rerank: bool,
 ) -> Result<Option<SearchResult>> {
-    let mut sql = String::from(
-        "SELECT c.chunk_id, c.file_path, c.title, c.heading, c.line_start, c.line_end, c.text, c.tags_json, c.mtime, f.mtime, c.has_code, c.has_link, c.has_task_list, c.has_incomplete_tasks, c.confidence, c.status, c.source_type, c.valid_from, c.valid_until, c.supersedes, c.superseded_by, c.updated
-         FROM chunks c
-         LEFT JOIN files f ON f.path = c.file_path
-         WHERE c.id = ?",
-    );
-    append_filter_clause(&mut sql, filter);
-    let mut args = vec![Value::Integer(rowid)];
-    append_filter_args(&mut args, filter);
-    let mut stmt = conn.prepare(&sql)?;
-    let row = stmt
-        .query_row(params_from_iter(args.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)? as usize,
-                row.get::<_, i64>(5)? as usize,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, Option<i64>>(9)?,
-                row.get::<_, i64>(10)? != 0,
-                row.get::<_, i64>(11)? != 0,
-                row.get::<_, i64>(12)? != 0,
-                row.get::<_, i64>(13)? != 0,
-                row.get::<_, Option<String>>(14)?,
-                row.get::<_, Option<String>>(15)?,
-                row.get::<_, Option<String>>(16)?,
-                row.get::<_, Option<String>>(17)?,
-                row.get::<_, Option<String>>(18)?,
-                row.get::<_, Option<String>>(19)?,
-                row.get::<_, Option<String>>(20)?,
-                row.get::<_, Option<String>>(21)?,
-            ))
-        })
-        .optional()?;
-    let Some((
-        chunk_id,
-        path,
-        title,
-        heading,
-        line_start,
-        line_end,
-        text,
-        tags_json,
-        mtime,
-        file_mtime,
-        has_code,
-        has_link,
-        has_task_list,
-        has_incomplete_tasks,
-        confidence,
-        status,
-        source_type,
-        valid_from,
-        valid_until,
-        supersedes,
-        superseded_by,
-        updated,
-    )) = row
-    else {
-        return Ok(None);
-    };
-    build_result(
-        rowid,
-        &chunk_id,
-        &path,
-        title,
-        heading,
-        line_start,
-        line_end,
-        &text,
-        &tags_json,
-        file_mtime.or(Some(mtime)),
-        keyword.map(|v| v.0),
-        vector.map(|v| v.0),
-        keyword.map(|v| v.1).unwrap_or(0.0),
-        vector.map(|v| v.1).unwrap_or(0.0),
-        route_hit,
+    let mut keyword_scores = HashMap::new();
+    if let Some(score) = keyword {
+        keyword_scores.insert(rowid, *score);
+    }
+    let mut vector_scores = HashMap::new();
+    if let Some(score) = vector {
+        vector_scores.insert(rowid, *score);
+    }
+    let mut route_scores = HashMap::new();
+    if let Some(hit) = route_hit {
+        route_scores.insert(rowid, hit.clone());
+    }
+    let mut results = load_candidate_results(
+        conn,
+        &[rowid],
+        &keyword_scores,
+        &vector_scores,
+        &route_scores,
         plan,
         query,
-        has_code,
-        has_link,
-        has_task_list,
-        has_incomplete_tasks,
-        confidence,
-        status,
-        source_type,
-        valid_from,
-        valid_until,
-        supersedes,
-        superseded_by,
-        updated,
+        filter,
         rerank,
-    )
-    .map(Some)
+    )?;
+    Ok(results.pop())
 }
 
 #[cfg(test)]
@@ -813,6 +1064,107 @@ mod retrieval_tests {
             hits.len() <= 50,
             "route candidate cap must be global, not per route term: {}",
             hits.len()
+        );
+    }
+
+    #[test]
+    fn collect_intent_tier_hits_keeps_historical_dialogue_reports_and_snapshots_in_pool() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                title TEXT,
+                heading TEXT,
+                tags_json TEXT NOT NULL,
+                text TEXT NOT NULL,
+                source_type TEXT,
+                valid_from TEXT,
+                updated TEXT,
+                mtime INTEGER
+            );",
+        )
+        .unwrap();
+        let rows = [
+            (
+                "raw/transcripts/hermes-sessions/2026/06/08/alpha-start.md",
+                "Alpha launch transcript",
+                "Transcript",
+                "[]",
+                "Alpha launch chronicle started on 2026-06-08 during the migration call.",
+                "transcript",
+                "2026-06-08",
+                "2026-06-08",
+                1_812_547_200_i64,
+            ),
+            (
+                "wiki/reports/2026-06-10-delta-config-outage.md",
+                "Delta config outage report",
+                "Report",
+                "[]",
+                "Delta config outage report confirms cron disabled port 9876.",
+                "report",
+                "2026-06-10",
+                "2026-06-10",
+                1_812_720_000_i64,
+            ),
+            (
+                "raw/system-snapshots/2026-06-10/delta-service.md",
+                "Delta service system snapshot",
+                "System snapshot",
+                "[]",
+                "Delta cron disabled port 9876 after config outage.",
+                "system_snapshot",
+                "2026-06-10",
+                "2026-06-10",
+                1_812_720_000_i64,
+            ),
+            (
+                "notes/noisy.md",
+                "Noise",
+                "Noise",
+                "[]",
+                "Alpha Delta generic note without evidence tier metadata.",
+                "note",
+                "",
+                "",
+                0_i64,
+            ),
+        ];
+        for row in rows {
+            conn.execute(
+                "INSERT INTO chunks (file_path, title, heading, tags_json, text, source_type, valid_from, updated, mtime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8],
+            )
+            .unwrap();
+        }
+
+        let history_plan =
+            QueryPlan::analyze("Alpha launch migration call 当时 2026-06-08 transcript");
+        let history_hits = collect_intent_tier_hits(&conn, &history_plan, 10, None).unwrap();
+        assert!(
+            history_hits.values().any(|hit| hit
+                .reasons
+                .iter()
+                .any(|reason| reason == "source_tier:transcript")),
+            "history intent should keep transcript evidence in candidate pool: {history_hits:?}"
+        );
+        assert!(
+            history_hits.values().any(|hit| hit
+                .reasons
+                .iter()
+                .any(|reason| reason == "source_tier:report")),
+            "history intent should keep report evidence in candidate pool: {history_hits:?}"
+        );
+
+        let config_plan = QueryPlan::analyze("Delta cron disabled port 9876 config outage");
+        let config_hits = collect_intent_tier_hits(&conn, &config_plan, 10, None).unwrap();
+        assert!(
+            config_hits.values().any(|hit| hit
+                .reasons
+                .iter()
+                .any(|reason| reason == "source_tier:system_snapshot")),
+            "config intent should keep system snapshot evidence in candidate pool: {config_hits:?}"
         );
     }
 

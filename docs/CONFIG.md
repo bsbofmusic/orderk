@@ -39,7 +39,8 @@ Optional search controls:
 - `--include-links`: include Obsidian wikilink/backlink evidence parsed from indexed Markdown.
 - `--expand-links 1`: optionally expand recall one hop along indexed Obsidian wikilinks/backlinks. This adds deterministic `link_expansion` evidence and a small `score_breakdown.link_boost`; it is off by default and does not write notes.
 - `--filter "tag == 'rust' && has_code == true && confidence == 'high'"`: apply the small whitelisted metadata filter DSL. Supported fields are `path`, `title`, `heading`, `tag`, `has_code`, `has_link`, `has_task_list`, `has_incomplete_tasks`, `confidence`, `status`, and `source_type`.
-- `--no-rerank`: disable deterministic metadata-aware rerank; default search adds bounded `score_breakdown.metadata_boost` from indexed structure/frontmatter without LLM or cross-encoder reranking.
+- `--reranker qwen`: run the default SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker. Missing reranker credentials fail closed with an explicit error.
+- `--reranker none`: explicitly disable model reranking for testing/migration only.
 
 ### MCP read-only server
 
