@@ -1166,22 +1166,31 @@ def adapters_cockpit_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
         '"list_concepts"',
         '"list_tags"',
         '"doctor"',
-        '"ingest_raw"',
-        '"run_digest"',
-        '"approve_proposal"',
-        "disabled_mcp_write_tool_definition",
-        "mcp_disabled_write_tool",
-        "remote self-authorization is not supported",
         "normalize_mcp_vault_path",
+        "unknown orderk MCP tool",
     ]
     failures.extend(require_markers(cli_rs, required_mcp_markers, "main.rs MCP adapters"))
     required_tests = [
         "obsidian_adapter_reads_markdown_frontmatter_wikilinks_and_attachment_metadata_only",
         "obsidian_adapter_rejects_symlinked_markdown_and_stays_inside_vault",
         "mcp_adapter_read_tools_return_source_concepts_tags_without_writes",
-        "mcp_write_tool_stubs_reject_remote_self_authorization",
+        "mcp_write_like_tool_names_are_not_available_over_mcp",
     ]
     failures.extend(require_markers(cli_rs + "\n" + batch7_test, required_tests, "Batch 7 tests"))
+    tools_start = cli_rs.find("fn mcp_tool_definitions()")
+    tools_end = cli_rs.find("\nfn write_report", tools_start)
+    tools_body = cli_rs[tools_start:tools_end] if tools_start >= 0 and tools_end > tools_start else ""
+    call_start = cli_rs.find("fn handle_mcp_tool_call")
+    call_end = cli_rs.find("\nfn mcp_search", call_start)
+    call_body = cli_rs[call_start:call_end] if call_start >= 0 and call_end > call_start else ""
+    for write_tool in ['"ingest_raw"', '"run_digest"', '"approve_proposal"']:
+        if write_tool in tools_body:
+            failures.append(f"MCP tools/list must not advertise write-like tool {write_tool}")
+        if write_tool in call_body:
+            failures.append(f"MCP tools/call must not route write-like tool {write_tool}")
+    for write_marker in ['readOnlyHint": false', 'destructiveHint": true', 'write_default']:
+        if write_marker in tools_body:
+            failures.append(f"MCP tools/list contains write marker {write_marker}")
     direct_adapter_writes = re.findall(r"\bfs::write\b|\bFile::create\b|\bOpenOptions\b", rust_runtime_text(obsidian_rs))
     if direct_adapter_writes:
         failures.append(f"adapter_runtime_write_markers_present: {sorted(set(direct_adapter_writes))}")
@@ -1194,10 +1203,16 @@ def adapters_cockpit_gate(repo: pathlib.Path = REPO) -> dict[str, Any]:
             "adapter_markers_checked": len(required_adapter_markers),
             "mcp_markers_checked": len(required_mcp_markers),
             "batch7_test_markers_checked": len(required_tests),
+            "mcp_write_tools_advertised": any(
+                marker in tools_body for marker in ['"ingest_raw"', '"run_digest"', '"approve_proposal"']
+            ),
+            "mcp_write_tools_routed": any(
+                marker in call_body for marker in ['"ingest_raw"', '"run_digest"', '"approve_proposal"']
+            ),
             "adapter_runtime_write_markers": sorted(set(direct_adapter_writes)),
             "cockpit_scope": "search/source preview/graph/proposals/status only; no editor clone",
         },
-        {"adapter_runtime_write_markers": 0, "write_tools_default": "disabled"},
+        {"adapter_runtime_write_markers": 0, "mcp_write_tools_advertised": False, "mcp_write_tools_routed": False},
         failures,
         warnings,
     )

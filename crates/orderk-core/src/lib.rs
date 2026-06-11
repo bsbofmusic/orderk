@@ -42,12 +42,12 @@ pub use graph::{
 };
 pub use health::{classify_error_message, health_report};
 pub use jianling::{
-    jianling_disable, jianling_doctor, jianling_enable, jianling_run, jianling_status,
-    jianling_validate_file, jianling_validate_run, jianling_validate_templates,
-    JianlingDisableReport, JianlingDoctorCheck, JianlingDoctorResponse, JianlingEnableOptions,
-    JianlingEnableReport, JianlingFileOp, JianlingRunMode, JianlingRunOptions, JianlingRunReport,
-    JianlingSourceAnchor, JianlingStatusResponse, JianlingSuccessPredicate,
-    JianlingValidateFileOptions, JianlingValidationResponse,
+    jianling_chat_smoke, jianling_disable, jianling_doctor, jianling_enable, jianling_run,
+    jianling_status, jianling_validate_file, jianling_validate_run, jianling_validate_templates,
+    JianlingChatSmokeResponse, JianlingDisableReport, JianlingDoctorCheck, JianlingDoctorResponse,
+    JianlingEnableOptions, JianlingEnableReport, JianlingFileOp, JianlingRunMode,
+    JianlingRunOptions, JianlingRunReport, JianlingSourceAnchor, JianlingStatusResponse,
+    JianlingSuccessPredicate, JianlingValidateFileOptions, JianlingValidationResponse,
 };
 pub use models::*;
 pub use profiles::{

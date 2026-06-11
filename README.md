@@ -1,6 +1,6 @@
 # orderk
 
-orderk is a tiny, local retrieval blade for Obsidian Markdown vaults, with an optional built-in Markdown memory compiler called Jianling.
+orderk is a tiny, local retrieval blade for Obsidian Markdown vaults, with an optional built-in Markdown memory compiler called Jianling. Current release target: `v0.1.20`.
 
 By default it turns your vault into fast, structured read-only evidence for humans, scripts, and AI agents. When explicitly enabled, `orderk jianling` can also write generated Markdown digests only under `brain/`, with receipts and source anchors under `.orderk/jianling/`. Raw notes and raw transcripts remain human-owned source of truth.
 
@@ -28,7 +28,7 @@ It is built for people who want better recall without giving another app permiss
 
 | Feature | Benefit |
 |---|---|
-| Single Rust binary | Small surface area and fast startup. The installed Linux x64 binary for v0.1.9 is 23,886,168 bytes, about 22.8 MiB, under a 30 MiB release-gate ceiling. |
+| Single Rust binary | Small surface area and fast startup. The current Linux x64 release build is 10,774,304 bytes, about 10.3 MiB, under a 30 MiB release-gate ceiling. |
 | On-demand search CLI | Search/index/get/status are one command, one result, then exit. Jianling scheduling is opt-in and uses managed systemd-user timer files rather than a resident orderk server. |
 | Low runtime memory | A live search probe on the maintainer machine used about 9.2 MiB VmRSS and 12.3 MiB VmPeak, under a 15 MiB baseline ceiling. |
 | Disposable SQLite index | Files, chunks, embeddings, FTS, vector rows, settings, and feedback live in one rebuildable DB. Delete the index and your Markdown vault is still intact. |
@@ -116,7 +116,7 @@ orderk is not a hosted memory OS. It is the small retrieval layer beside your ex
 |---|---|---|---|
 | Type | Local retrieval blade | Memory engine / API / agent runtime | App search |
 | Source of truth | Markdown vault | Memory DB / service-runtime layer | Markdown vault |
-| Writes notes | Search/MCP: no. Jianling: opt-in generated Markdown with source anchors and receipts. | memory writes / API state | manual only |
+| Writes notes | Search/MCP: no. Jianling: opt-in generated Markdown only after a writer/auditor/foreman Kanban hard gate, with source anchors and receipts. | memory writes / API state | manual only |
 | Daemon/server | Search: no resident daemon. Jianling: optional managed systemd-user timer. | common | app runtime only |
 | Search | BM25 + vector + metadata + links | vector / graph varies | keyword / app index |
 | Agent surface | CLI + read-only MCP | MCP / REST / hooks / runtime | none or manual |
@@ -143,7 +143,7 @@ orderk borrows useful ideas from memory tools without becoming one.
 - From agent memory systems: structured retrieval APIs and evidence-rich context.
 - From ranking systems: fusion, metadata boosts, link expansion, and deterministic reranking.
 
-It rejects the heavy parts: hosted source of truth, hidden reflection loops, chat-as-storage, opaque memory mutation, and always-on memory daemons. Jianling’s writes are explicit Markdown files with claim/source anchors and run receipts, not hidden database memories.
+It rejects the heavy parts: hosted source of truth, hidden reflection loops, chat-as-storage, opaque memory mutation, and always-on memory daemons. Jianling’s writes are explicit Markdown files with claim/source anchors, Kanban hard-gate manifests, and run receipts, not hidden database memories.
 
 ## Architecture
 
@@ -168,7 +168,7 @@ Agent
 | Module | Responsibility |
 |---|---|
 | `crates/orderk-core` | scan, parse, chunk, embed, store, rank, return JSON |
-| `crates/orderk-cli` | native CLI entrypoint for index/search/status/health/doctor/eval/maintain/capsule/feedback |
+| `crates/orderk-cli` | native CLI entrypoint for index/search/get/status/health/doctor/eval/maintain/capsule/sword/jianling/graph/digest/feedback/MCP |
 | `packages/cli` | npm wrapper that finds or downloads the native binary |
 | `packages/obsidian` | thin Obsidian desktop plugin wrapper |
 
@@ -315,10 +315,21 @@ orderk jianling enable \
 
 orderk jianling status --vault /path/to/vault
 orderk jianling doctor --vault /path/to/vault
+orderk jianling self-check --vault /path/to/vault
+orderk jianling chat-smoke --vault /path/to/vault
 orderk jianling validate-file --vault /path/to/vault --file brain/daily/2026-06-10.md
+orderk jianling validate-run --vault /path/to/vault --run-id <run-id>
 ```
 
-The first shipped slice is intentionally conservative: deterministic P0 digest generation, systemd-user scheduler templates, receipt/evidence/watermark sidecars, and validators. Query-time search still uses the read-only retrieval path; LLM reflection remains behind later provider gates rather than being silently faked.
+Jianling is still conservative, but no longer a stub: deterministic digest generation, systemd-user scheduler templates, receipt/evidence/watermark sidecars, validators, live Anthropic-compatible MiniMax M3 reflection, and a Kanban writer/auditor/foreman hard gate are wired into the product path. LLM reflection is explicit: it only runs when `ORDERK_JIANLING_LLM_ENABLED_<PROFILE>=1` (or global `ORDERK_JIANLING_LLM_ENABLED=1`) and credentials are provided through environment variables such as `ORDERK_SWORD_LLM_API_KEY_ENV`. Provider errors fail closed instead of writing fake-success reflection text. Query-time search still uses the read-only retrieval path.
+
+The generated Markdown path is a hard-gated pipeline, not a receipt afterthought:
+
+```text
+selected sources -> writer draft_markdown + draft_hash -> auditor checks format/trace/source coverage/hash -> foreman acceptance -> final Markdown write
+```
+
+Every non-empty Jianling run writes writer/auditor/foreman cards under `.orderk/jianling/runs/<run>.chunks/`. Final Markdown is written only after `foreman.acceptance.controls_final_write=true`. `validate-run` reopens the foreman card and the referenced writer/auditor cards, so a tampered auditor result or generated note fails validation. Large source windows are explicit `partial_source_file_limit` runs instead of silent truncation. Weekly and monthly output paths are `brain/weekly/YYYY-MM-DD.md` and `brain/monthly/YYYY-MM-DD.md`, guarded by the same profile-wide lock as daily runs.
 
 ### 6) MCP read-only server
 
@@ -331,7 +342,7 @@ orderk mcp \
   --vector-backend sqlite_vec
 ```
 
-The MCP surface is intentionally thin and read-only: `search`, `get`, `status`, and `health`. `search` supports `view: "index"` for compact id/title/score/path cards, and `get` explicitly fetches selected chunk IDs. Search/get open the existing SQLite index in read-only mode and do not run index, feedback, migration, maintenance, or note-write paths. It supports standard `Content-Length` stdio frames and a JSONL compatibility mode for simple smoke tests. It does not expose index, feedback, maintain, save, forget, note-write, or chat tools.
+The MCP surface is intentionally thin and read-only: `search`, `get`, `get_source`, `explain_result`, `graph_neighbors`, `list_concepts`, `list_tags`, `status`, `health`, and `doctor`. `search` supports `view: "index"` for compact id/title/score/path cards, and `get` explicitly fetches selected chunk IDs. Search/get open the existing SQLite index in read-only mode and do not run index, feedback, migration, maintenance, or note-write paths. It supports standard `Content-Length` stdio frames and a JSONL compatibility mode for simple smoke tests. Disabled write-like tool names such as `ingest_raw`, `run_digest`, and `approve_proposal` return an explicit disabled-write response instead of mutating the vault.
 
 ### 6) Inspect status
 
@@ -419,6 +430,7 @@ This is the shortest path for an agent or automation:
 9. If the client supports MCP, use `orderk mcp` for read-only `search`/`get`/`status`/`health` tools instead of asking the agent to guess shell flags.
 10. Use `orderk capsule export` / `orderk capsule inspect` when an agent needs to verify that a portable SQLite index artifact still matches its recorded profile, counts, size, and checksum.
 11. Use `orderk maintain --report-dir ...` as the agent-facing readiness/failure-ticket gate before release or scheduled checks.
+12. For Jianling, run `orderk jianling self-check`, `chat-smoke`, and `validate-run` before trusting scheduled reflection output.
 
 ### Obsidian plugin settings
 
@@ -465,7 +477,7 @@ For the full maintenance contract, see [`docs/MAINTAIN.md`](docs/MAINTAIN.md). F
 | Search returns no vector hits | Re-index with matching provider / model / dim |
 | `index profile mismatch` | Rebuild the SQLite DB with the same embedding provider, model, dimension, and backend |
 | Obsidian plugin cannot find the binary | Set the binary path in plugin settings or use `ORDERK_BIN` |
-| One-click npm install does nothing on macOS/Windows | The packaged binary path is Linux x64 first; use `cargo install` or a local binary |
+| One-click npm install does nothing on macOS/Windows | The packaged binary path is Linux x64 first; use `cargo install`, `ORDERK_BIN`, or a local binary |
 
 ## Security
 
@@ -487,8 +499,8 @@ For the full maintenance contract, see [`docs/MAINTAIN.md`](docs/MAINTAIN.md). F
 - agent orchestration
 - note writing through search/MCP tools
 - automatic summaries through search/MCP tools
-- chat-style generation or memory lifecycle management; reranking is retrieval-only and uses the default Qwen model reranker (`--reranker none` only for tests/migrations)
-- second-brain style lifecycle management
+- chat-style generation through search/MCP tools; reranking is retrieval-only and uses the default Qwen model reranker (`--reranker none` only for tests/migrations)
+- hidden memory lifecycle management; Jianling is an explicit Markdown compiler with generated files, source anchors, receipts, and Kanban hard-gate manifests
 
 ## License
 

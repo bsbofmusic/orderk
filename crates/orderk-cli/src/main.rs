@@ -2,15 +2,15 @@ use anyhow::{anyhow, Context, Result};
 use orderk_core::{
     approve_proposal, classify_error_message, digest_vault, explain_graph, export_capsule_manifest,
     feedback, get_chunks, health_report, index_vault_with_options, init, inspect_capsule_manifest,
-    jianling_disable, jianling_doctor, jianling_enable, jianling_run, jianling_status,
-    jianling_validate_file, jianling_validate_run, jianling_validate_templates, list_proposals,
-    optimize_apply, optimize_dry_run, optimize_reset, optimize_set, optimize_status,
-    provider_from_name, query_with_options, reason_about_vault, rebuild_graph, reject_proposal,
-    resolve_sword_model_profile_from_env, run_sword_spirit, scan_obsidian_adapter, show_proposal,
-    status, sword_spirit_status, write_capsule_manifest, AdapterScanOptions, ChunkGetDetail,
-    ChunkGetOptions, DigestOptions, EmbeddingProvider, FeedbackEvent, FreshnessMode,
-    GraphBuildOptions, IndexOptions, JianlingEnableOptions, JianlingRunMode, JianlingRunOptions,
-    JianlingValidateFileOptions, QueryOptions, QueryResponse, ReasoningOptions,
+    jianling_chat_smoke, jianling_disable, jianling_doctor, jianling_enable, jianling_run,
+    jianling_status, jianling_validate_file, jianling_validate_run, jianling_validate_templates,
+    list_proposals, optimize_apply, optimize_dry_run, optimize_reset, optimize_set,
+    optimize_status, provider_from_name, query_with_options, reason_about_vault, rebuild_graph,
+    reject_proposal, resolve_sword_model_profile_from_env, run_sword_spirit, scan_obsidian_adapter,
+    show_proposal, status, sword_spirit_status, write_capsule_manifest, AdapterScanOptions,
+    ChunkGetDetail, ChunkGetOptions, DigestOptions, EmbeddingProvider, FeedbackEvent,
+    FreshnessMode, GraphBuildOptions, IndexOptions, JianlingEnableOptions, JianlingRunMode,
+    JianlingRunOptions, JianlingValidateFileOptions, QueryOptions, QueryResponse, ReasoningOptions,
     SearchIndexResponse, SwordSpiritBudgetProfile, SwordSpiritOptions, SwordSpiritProposal,
     SwordSpiritThinkingMode, SwordSpiritTraceLevel, VectorBackend,
 };
@@ -580,7 +580,7 @@ fn sword_spirit_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
 fn jianling_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
     if args.is_empty() {
         return Err(anyhow!(
-            "jianling requires a subcommand: run, status, doctor, enable, disable, validate-file, validate-run, or validate-templates"
+            "jianling requires a subcommand: run, status, doctor, chat-smoke, self-check, enable, disable, validate-file, validate-run, or validate-templates"
         ));
     }
     let subcommand = args.remove(0);
@@ -634,6 +634,30 @@ fn jianling_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                 ));
             }
             Ok(serde_json::to_value(jianling_doctor(&vault, &profile)?)?)
+        }
+        "self-check" => {
+            let vault = take_path(args, "--vault")?;
+            let profile = take_string(args, "--profile", "default".to_string())?;
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unexpected jianling self-check arguments: {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(jianling_doctor(&vault, &profile)?)?)
+        }
+        "chat-smoke" => {
+            let vault = take_path(args, "--vault")?;
+            let profile = take_string(args, "--profile", "default".to_string())?;
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unexpected jianling chat-smoke arguments: {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(jianling_chat_smoke(
+                &vault, &profile,
+            )?)?)
         }
         "enable" => {
             let vault = take_path(args, "--vault")?;
@@ -1829,9 +1853,6 @@ fn handle_mcp_tool_call(
         "list_tags" => mcp_list_tags(config, &arguments)?,
         "status" => serde_json::to_value(status(&config.db)?)?,
         "doctor" | "health" => mcp_health(config, &arguments)?,
-        "ingest_raw" | "run_digest" | "approve_proposal" => {
-            mcp_disabled_write_tool(name, &arguments)?
-        }
         other => return Err(anyhow!("unknown orderk MCP tool: {other}")),
     };
     Ok(json!({
@@ -2137,16 +2158,6 @@ fn mcp_list_tags(config: &McpConfig, arguments: &serde_json::Value) -> Result<se
     }))
 }
 
-fn mcp_disabled_write_tool(name: &str, arguments: &serde_json::Value) -> Result<serde_json::Value> {
-    let requested_remote_allow = arguments
-        .get("allow_write")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    Err(anyhow!(
-        "MCP write tool {name} is disabled by default (allow_write={requested_remote_allow}); local allowlist is required and remote self-authorization is not supported"
-    ))
-}
-
 fn normalize_mcp_vault_path(raw: &str) -> Result<String> {
     let path = Path::new(raw);
     if path.is_absolute() {
@@ -2173,7 +2184,7 @@ fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json:
 }
 
 fn mcp_tool_definitions() -> Vec<serde_json::Value> {
-    let mut tools = vec![
+    let tools = vec![
         json!({
             "name": "search",
             "description": "Read-only orderk search over the configured Obsidian vault index. Returns JSON evidence only; it never writes notes or reindexes.",
@@ -2264,35 +2275,7 @@ fn mcp_tool_definitions() -> Vec<serde_json::Value> {
             "inputSchema": {"type": "object", "properties": {"smoke_query": {"type": "string", "description": "Optional query that must return at least one result"}}}
         }),
     ];
-    tools.extend([
-        disabled_mcp_write_tool_definition(
-            "ingest_raw",
-            "Disabled write stub for ingesting raw Markdown; requires local allowlist outside MCP.",
-        ),
-        disabled_mcp_write_tool_definition(
-            "run_digest",
-            "Disabled write stub for running digest/apply; remote self-authorization is refused.",
-        ),
-        disabled_mcp_write_tool_definition(
-            "approve_proposal",
-            "Disabled write stub for proposal approval; use local CLI allowlist workflow.",
-        ),
-    ]);
     tools
-}
-
-fn disabled_mcp_write_tool_definition(name: &str, description: &str) -> serde_json::Value {
-    json!({
-        "name": name,
-        "description": description,
-        "annotations": {"readOnlyHint": false, "destructiveHint": true},
-        "x-orderk": {"write_default": "disabled", "remote_self_authorization": "forbidden"},
-        "inputSchema": {
-            "type": "object",
-            "properties": {"allow_write": {"type": "boolean", "default": false}},
-            "required": []
-        }
-    })
 }
 
 fn write_report(dir: &Path, stem: &str, value: &serde_json::Value) -> Result<PathBuf> {
@@ -2770,7 +2753,7 @@ fn print_usage() {
     eprintln!("sword status flags: --vault <path>");
     eprintln!("jianling run flags: --vault <path> [--profile <name>] [--mode daily|weekly|monthly|yearly|manual] [--dry-run] [--scheduled] [--db <orderk.sqlite>] [--date YYYY-MM-DD]");
     eprintln!("jianling enable flags: --vault <path> [--profile <name>] [--schedule HH:MM] [--timezone <tz>] [--db <orderk.sqlite>] [--orderk-bin <path>] [--systemd-dir <path>] [--dry-run]");
-    eprintln!("jianling status|doctor|disable flags: --vault <path> [--profile <name>]");
+    eprintln!("jianling status|doctor|self-check|chat-smoke|disable flags: --vault <path> [--profile <name>]");
     eprintln!("graph flags: graph rebuild --vault <path> [--dry-run|--apply]; graph explain <id|path> --vault <path> --json");
     eprintln!(
         "digest flags: digest run --vault <path> [--profile <name>] [--dry-run|--apply] [--resume]"
@@ -3744,15 +3727,21 @@ mod tests {
                 "status",
                 "doctor",
                 "health",
-                "ingest_raw",
-                "run_digest",
-                "approve_proposal",
             ]
         );
         assert!(!names.iter().any(|name| {
             matches!(
                 name.as_str(),
-                "index" | "maintain" | "feedback" | "save" | "forget" | "delete" | "chat"
+                "index"
+                    | "maintain"
+                    | "feedback"
+                    | "save"
+                    | "forget"
+                    | "delete"
+                    | "chat"
+                    | "ingest_raw"
+                    | "run_digest"
+                    | "approve_proposal"
             )
         }));
 
@@ -3817,29 +3806,11 @@ mod tests {
             .contains("YYYY-MM-DD"));
 
         for write_tool_name in ["ingest_raw", "run_digest", "approve_proposal"] {
-            let tool = tools
-                .iter()
-                .find(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(write_tool_name))
-                .expect("write tool stub must be listed but disabled");
-            assert_eq!(
-                tool.pointer("/annotations/readOnlyHint")
-                    .and_then(|v| v.as_bool()),
-                Some(false)
-            );
-            assert_eq!(
-                tool.pointer("/annotations/destructiveHint")
-                    .and_then(|v| v.as_bool()),
-                Some(true)
-            );
-            assert_eq!(
-                tool.pointer("/x-orderk/write_default")
-                    .and_then(|v| v.as_str()),
-                Some("disabled")
-            );
-            assert_eq!(
-                tool.pointer("/inputSchema/properties/allow_write/default")
-                    .and_then(|v| v.as_bool()),
-                Some(false)
+            assert!(
+                tools
+                    .iter()
+                    .all(|tool| tool.get("name").and_then(|v| v.as_str()) != Some(write_tool_name)),
+                "disabled write tool {write_tool_name} must not be advertised in tools/list"
             );
         }
     }
@@ -3905,8 +3876,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_write_tool_stubs_reject_remote_self_authorization() {
-        let root = temp_root("mcp-write-stubs");
+    fn mcp_write_like_tool_names_are_not_available_over_mcp() {
+        let root = temp_root("mcp-no-write-tools");
         let config = McpConfig {
             db: root.join("orderk.sqlite"),
             vault: Some(root.join("vault")),
@@ -3925,11 +3896,11 @@ mod tests {
                 .pointer("/error/message")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            assert!(error.contains("disabled by default"), "{name}: {response}");
             assert!(
-                error.contains("remote self-authorization is not supported"),
+                error.contains("unknown orderk MCP tool"),
                 "{name}: {response}"
             );
+            assert!(error.contains(name), "{name}: {response}");
         }
         let _ = fs::remove_dir_all(root);
     }

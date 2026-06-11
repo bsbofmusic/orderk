@@ -41,7 +41,7 @@ This release adds agent-facing retrieval controls without changing orderk's boun
 - `orderk search --reranker qwen` to apply the default SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker after temporal-quality adjustment. `--reranker none` explicitly disables it for testing/migration only; missing model credentials fail closed.
 - `orderk index --chunk-overlap N` to preserve boundary context when chunk sizes cap out.
 - `orderk eval --ab-chunk-overlap N` to compare overlap settings against the baseline eval run.
-- `orderk mcp` as a thin read-only stdio MCP surface exposing only `search`, `status`, and `health` with standard `Content-Length` frames plus JSONL smoke compatibility.
+- `orderk mcp` as a thin read-only stdio MCP surface exposing `search`, `get`, `get_source`, `explain_result`, `graph_neighbors`, `list_concepts`, `list_tags`, `status`, `health`, and `doctor` with standard `Content-Length` frames plus JSONL smoke compatibility.
 
 These features return vault evidence only; they do not write notes, generate summaries, run chat, auto-save memories, or expose index mutation through MCP. The default reranker is the SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker and fails closed when credentials are missing; `--reranker none` is test/migration only.
 
@@ -51,7 +51,7 @@ These features return vault evidence only; they do not write notes, generate sum
 - `orderk-obsidian`: legacy/deprecated on npm; the Obsidian wrapper source remains in `packages/obsidian` for local/plugin builds.
 
 Runtime installs resolve a stable native binary through `ORDERK_BIN`, a package-local vendor binary, or `orderk` on `PATH`; they do not depend on Cargo `target/` build artifacts.
-The v0.1.12 npm one-click path targets Linux x64 first; other platforms can build from source and install/copy the resulting binary to a stable path.
+The v0.1.20 npm one-click path targets Linux x64 first; other platforms can build from source, set `ORDERK_BIN`, or install/copy the resulting binary to a stable path.
 
 ## Obsidian artifact
 

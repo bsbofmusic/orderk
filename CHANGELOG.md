@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-06-11
+
+### Added
+- Wire `orderk jianling chat-smoke` and `self-check` into the CLI, add live Anthropic-compatible MiniMax M3 connectivity receipts, and allow Jianling to consume `ORDERK_SWORD_LLM_API_KEY_ENV` indirection without storing API key values.
+- Add explicit profile-scoped Jianling LLM reflection enablement via `ORDERK_JIANLING_LLM_ENABLED_<PROFILE>` (or global `ORDERK_JIANLING_LLM_ENABLED`), with `jianling run` writing live MiniMax M3 reflection text only when the switch is enabled.
+- Add Jianling self-check coverage for LLM profile configuration, global profile lock availability, and `brain/{daily,weekly,monthly}` output paths.
+
+### Changed
+- Move weekly/monthly Jianling outputs to PRD paths `brain/weekly/YYYY-MM-DD.md` and `brain/monthly/YYYY-MM-DD.md`, replace per-mode locks with a profile-wide global run lock, and make every non-empty run pass a Kanban writer/auditor/foreman harness before final Markdown is written; partial source handling remains explicit when bounded windows are exceeded.
+
+### Verification
+- `cargo fmt --check`, `cargo test -p orderk-core --test jianling_contract`, `cargo test --workspace`, and `cargo clippy --workspace -- -D warnings` passed locally. Live MiniMax M3 `chat-smoke`, live `jianling run`, and a 2026-06-01..2026-06-10 drill passed with 10 daily runs, one weekly run, one monthly run, Kanban writer/auditor/foreman final-write gates, and `validate-run` receipts.
+
 ## [0.1.19] - 2026-06-11
 
 ### Fixed
@@ -20,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Add contract tests for dry-run safety, generated Markdown source anchors, receipt/lock cleanup, validator rejection of unsourced generated notes, scheduler file generation, symlink escape blocking, tampered run validation, and managed-unit deletion safety.
 
 ### Changed
-- Document Jianling as a conservative built-in sidecar: raw transcripts stay untouched, query-time search remains read-only, and LLM reflection is not silently faked before later provider gates.
+- Document the 0.1.18 Jianling state as a conservative built-in sidecar: raw transcripts stay untouched, query-time search remains read-only, and pre-0.1.20 LLM reflection is not silently faked before provider gates.
 
 ### Fixed
 - Supersede the known `v0.1.17` release-line CI caveat with this patch release gate.
@@ -201,7 +214,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/bsbofmusic/orderk/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/bsbofmusic/orderk/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/bsbofmusic/orderk/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/bsbofmusic/orderk/compare/v0.1.16...v0.1.17

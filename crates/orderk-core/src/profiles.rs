@@ -173,11 +173,14 @@ fn resolve_llm_slot() -> Result<SwordModelSlot> {
                 .or_else(|| env_string("ORDERK_SWORD_LLM_MINIMAX_MODEL"))
                 .or_else(|| env_string("ORDERK_SWORD_LLM_MODEL"))
                 .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string()),
-            first_configured_env(&[
-                "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY",
-                "ORDERK_SWORD_LLM_MINIMAX_API_KEY",
-                "ORDERK_SWORD_LLM_API_KEY",
-            ]),
+            configured_env_pointer("ORDERK_SWORD_LLM_API_KEY_ENV").or_else(|| {
+                first_configured_env(&[
+                    "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY",
+                    "ORDERK_SWORD_LLM_MINIMAX_API_KEY",
+                    "ORDERK_SWORD_LLM_API_KEY",
+                    "ORDERK_SWORD_LLM_API_KEY_ENV",
+                ])
+            }),
             env_string("ORDERK_SWORD_LLM_ANTHROPIC_BASE_URL")
                 .or_else(|| env_string("ORDERK_SWORD_LLM_MINIMAX_BASE_URL"))
                 .or_else(|| env_string("ORDERK_SWORD_LLM_BASE_URL")),
@@ -263,6 +266,15 @@ fn first_configured_env(names: &[&str]) -> Option<String> {
         .find_map(|name| env_string(name).map(|_| (*name).to_string()))
 }
 
+fn configured_env_pointer(pointer_name: &str) -> Option<String> {
+    let pointed = env_string(pointer_name)?;
+    if env_string(&pointed).is_some() {
+        Some(pointed)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod slot_tests {
     use super::*;
@@ -295,6 +307,7 @@ mod slot_tests {
         "ORDERK_SILICONFLOW_API_KEY",
         "ORDERK_SWORD_RERANKER_API_KEY",
         "ORDERK_SWORD_LLM_API_KEY",
+        "ORDERK_SWORD_LLM_API_KEY_ENV",
     ];
 
     fn with_saved_env<T>(names: &[&str], f: impl FnOnce() -> T) -> T {
@@ -476,6 +489,22 @@ mod slot_tests {
                     assert_eq!(profile.llm.base_url, None);
                 },
             );
+        });
+    }
+
+    #[test]
+    fn slot_provider_accepts_llm_api_key_env_pointer_without_secret_leak() {
+        with_clean_slot_env(|| {
+            with_saved_env(&["HERMES_MINIMAX_API_KEY"], || {
+                std::env::set_var("HERMES_MINIMAX_API_KEY", "hermes-minimax-secret");
+                std::env::set_var("ORDERK_SWORD_LLM_API_KEY_ENV", "HERMES_MINIMAX_API_KEY");
+                let slot = resolve_sword_model_slot_from_env(SwordModelKind::Llm).unwrap();
+                assert_eq!(slot.provider, "anthropic");
+                assert_eq!(slot.model, DEFAULT_LLM_MODEL);
+                assert_eq!(slot.api_key_env.as_deref(), Some("HERMES_MINIMAX_API_KEY"));
+                assert!(slot.api_key_configured);
+                assert!(!slot.profile_fingerprint.contains("hermes-minimax-secret"));
+            });
         });
     }
 

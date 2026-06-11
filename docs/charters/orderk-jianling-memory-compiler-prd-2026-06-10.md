@@ -1,6 +1,6 @@
 # OrderK V4 Jianling / Sword Spirit PRD — Built-in Sleep Reflection & Markdown Memory Compiler
 
-> Status: **P0/P1 slice implemented in `orderk-cli@0.1.19`; later LLM reflection phases remain gated**
+> Status: **V4 P0/P1 implemented in `orderk-cli@0.1.19`: deterministic Markdown compiler, receipts/validators/scheduler, profile-wide run lock, self-check/chat-smoke, and live MiniMax M3 reflection behind an explicit hot switch. Full autonomous promotion/index-feedback phases remain gated.**
 > Date: 2026-06-10
 > Owner intent: 茶老板提出“剑灵是睡后反思者”，不是外部 Hermes/agent cron，而是 OrderK 自身安装后、配置 LLM 后无感运转的内嵌夜间记忆整理机制。
 > Naming note: The new Jianling / Sword Spirit product generation is **OrderK V4**. V4 is built after the current V3 baseline, but it is not a patch label for V3. The old V3 release line must be archived clearly in npm, GitHub Releases, CHANGELOG, and repo docs before V4 changes the product boundary. Old `orderk-v2-sword-spirit-prd.md` remains historical and is not the active V4 design source.
@@ -54,13 +54,13 @@ V3 archive gate before V4 boundary change:
 
 ### 2.2 Boundary transition / active docs state
 
-This PRD records the V4 product-boundary change. The `0.1.19` implementation promotes the conservative P0/P1 slice: `orderk jianling` exists as an explicit Markdown compiler sidecar with deterministic digest generation, managed systemd-user timer files, receipts/evidence packs, validators, and safety gates. The search/MCP query path remains read-only; later LLM reflection is still behind future provider/eval gates.
+This PRD records the V4 product-boundary change. The `0.1.19` implementation promotes the P0/P1 Jianling slice: `orderk jianling` exists as an explicit Markdown compiler sidecar with deterministic digest generation, managed systemd-user timer files, receipts/evidence packs, validators, safety gates, profile-wide locks, self-check/chat-smoke, and a live Anthropic-compatible MiniMax M3 reflection slot. The search/MCP query path remains read-only; live reflection is **not implicit** and only runs when an explicit Jianling LLM enable switch is set.
 
 Promotion rule:
 
 1. Old `orderk-v2-sword-spirit-prd.md` remains historical and must not be used as the active design source.
-2. `0.1.19` user-facing docs may say “OrderK has Jianling P0/P1” only for the deterministic digest/scheduler/receipt/validator slice.
-3. User-facing docs must not claim autonomous LLM reflection is shipped until provider, budget, death-loop, and eval gates are implemented and pass.
+2. `0.1.19` user-facing docs may say “OrderK has Jianling V4 P0/P1” for deterministic digest/scheduler/receipt/validator/self-check plus the live MiniMax M3 reflection slot behind `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]`.
+3. User-facing docs must not claim always-on autonomous LLM reflection: `jianling run` calls LLM only when the explicit hot switch is enabled, and `chat-smoke` is the separate live connectivity command.
 4. Search/MCP docs must continue to state the query path is read-only; Jianling write behavior is explicit and separate.
 
 ### 2.3 Compatibility with current OrderK
@@ -75,6 +75,34 @@ Required compatibility decisions:
 - Resolution order: explicit CLI flags > profile in `.orderk/config.toml` > environment variables > built-in defaults.
 - DB/vault binding must be explicit in config or CLI; scheduled runs must not guess a vault from cwd.
 - P0 implementation target is Linux x64 with `systemd --user` timer plus one-shot worker; macOS LaunchAgent, Windows Task Scheduler, and server-loop scheduler are later phases.
+- P0/P1 live reflection target uses the existing Sword model profile plumbing: default LLM profile is Anthropic-compatible `MiniMax-M3`, credentials are read through `ORDERK_SWORD_LLM_API_KEY_ENV` or OrderK-scoped LLM key envs, and raw API key values are never written to config, receipts, PRD, or logs.
+
+### 2.4 2026-06-11 implementation update / learned gates
+
+This update records the hard lessons from the V4 implementation drill. It is part of the PRD contract, not a chat-only after-action note.
+
+| Question | PRD answer after implementation |
+|---|---|
+| Is Jianling an explicit switch? | Yes. `orderk jianling enable/disable` controls the scheduler. Live LLM reflection inside `jianling run` has a second explicit hot switch: `ORDERK_JIANLING_LLM_ENABLED_<PROFILE>=1` or global `ORDERK_JIANLING_LLM_ENABLED=1`. Without it, a configured LLM is reported as configured but inactive; no silent live reflection call is made. |
+| Is it hot-swappable? | Yes for the live reflection slot: model/profile/key env/base URL are resolved at run time through the existing Sword model profile. Changing env/profile then rerunning `chat-smoke`, `self-check`, or `run` is enough; no rebuild is required. |
+| Do daily/weekly/monthly runs conflict? | They must not. The implemented lock is profile-wide (`.orderk/jianling/locks/<profile>.lock`), not per-mode; daily, weekly, and monthly runs for the same vault/profile are mutually exclusive. Receipts record mode/run-id and the lock path. |
+| What if the evidence exceeds the LLM/context budget? | The run must fail closed or become explicit partial. Current P0/P1 uses a Kanban harness: writer cards draft bounded evidence slices, auditor cards check format/traceability against writer drafts and final Markdown draft, and a foreman manifest gates the final Markdown write. Receipts record `partial_source_file_limit`, rejected source paths, chunk count, chunk dir, and foreman manifest path. Silent truncation is forbidden. |
+| Is the current LLM MiniMax M3? | The default live slot is `anthropic:MiniMax-M3:<profile_fingerprint>`. Live smoke and live run receipts must show model/profile fingerprint without exposing API key values. |
+| Has a 2026-06-01..2026-06-10 drill run? | Yes, local acceptance evidence ran 10 daily runs plus one weekly run on 2026-06-07 and one monthly run on 2026-06-10. All 12 receipts used `provider_status=called_live`, passed `validate-run`, wrote weekly/monthly to PRD paths, and exercised Kanban writer/auditor/foreman + explicit partial behavior. |
+
+Implementation evidence captured in this repo update:
+
+- `/home/agent/.local/bin/orderk --version` was upgraded from `0.1.17` to `0.1.19` after `cargo install --path crates/orderk-cli --root /home/agent/.local --force`.
+- Live `orderk jianling chat-smoke` with `ORDERK_SWORD_LLM_API_KEY_ENV=HERMES_MINIMAX_API_KEY` returned `ok=true`, `status=connected`, `model=MiniMax-M3` and wrote a smoke receipt.
+- Live `/home/agent/.local/bin/orderk jianling run --mode daily --date 2026-06-10` with `ORDERK_JIANLING_LLM_ENABLED_FINALBIN=1` returned `provider_status=called_live`, generated a daily Markdown file containing `## LLM 反思`, and passed `jianling validate-run`.
+- The 2026-06-01..2026-06-10 gated drill returned `ok=true`, `runs=12`, `daily_runs=10`, `weekly_runs=1`, `monthly_runs=1`, `multi_chunk_runs=6`, `partial_runs=3`, `total_writer_cards=18`, `total_auditor_cards=18`; weekly output path was `brain/weekly/2026-06-07.md`, monthly output path was `brain/monthly/2026-06-10.md`. Every non-empty run emitted `writer-*.json`, `auditor-*.json`, and `foreman-manifest.json`; final Markdown was written only after foreman acceptance with `format_standard`, `traceability`, `draft_hash`, and `controls_final_write` checks passing.
+- Quality gates passed after the update: `git diff --check`, `cargo fmt --check`, `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, plus focused `cargo test -p orderk-core --test jianling_contract`.
+
+Open boundaries that are **not** silently claimed by this update:
+
+- The implemented live reflection writes a bounded LLM reflection section into generated Markdown; full structured card extraction, proposal apply/revert UX, and claim-level `explain` remain later gates.
+- Query-time search remains LLM=0 by default.
+- Whole-vault targeted reindex feedback is still a release/eval gate unless a future implementation proves it with retrieval smoke.
 
 ---
 
@@ -275,7 +303,7 @@ Required behavior:
 - `enable` writes/updates unit files, reloads user systemd, enables timer, and records scheduler backend in `.orderk/config.toml`.
 - `disable` disables/removes only units owned by the current OrderK profile.
 - `status` reports backend, unit names, binary path, vault, DB, next run, last run, last receipt, and whether the timer is active.
-- `doctor` validates binary path exists, env file exists, LLM key env name exists without printing value, vault/DB paths exist, and no stale lock blocks the run.
+- `doctor` / `self-check` validates binary path exists, env file exists, LLM key env name exists without printing value, vault/DB paths exist, profile-wide lock availability, output path policy, latest receipt freshness, and scheduler ownership. `chat-smoke` is the live LLM probe and writes its own smoke receipt.
 - Missed runs use `Persistent=true`; after wake-up, only one catch-up run is allowed per profile.
 - DST/timezone ambiguity is resolved by configured timezone; if unsupported by backend, receipt records `timezone_backend=system_local`.
 - Logs go to journald plus `.orderk/jianling/logs/<run-id>.log` with secret redaction.
@@ -284,14 +312,16 @@ Required behavior:
 
 ```bash
 orderk init --vault ~/obsidian-vault
-orderk config set llm.provider minimax
-orderk config set llm.model M3
-orderk config set llm.api_key_env MINIMAX_API_KEY
+# config/profile path, or env-only for the current implementation slice:
+export ORDERK_SWORD_LLM_API_KEY_ENV=MINIMAX_API_KEY
+export ORDERK_JIANLING_LLM_ENABLED_DEFAULT=1   # explicit hot switch for live run reflection
+orderk jianling chat-smoke --vault ~/obsidian-vault --profile default
+orderk jianling self-check --vault ~/obsidian-vault --profile default
 orderk jianling enable --schedule "03:30" --timezone Asia/Shanghai
-orderk jianling doctor
+orderk jianling doctor --vault ~/obsidian-vault --profile default
 ```
 
-If LLM is not configured, Jianling is disabled by default and `doctor` reports `LLM_MISSING`. Search/index still works.
+If LLM credentials are not configured, `chat-smoke` reports `llm_unconfigured` and writes a failed smoke receipt; Search/index still works. If credentials are configured but `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]` is absent, `jianling run` stays deterministic and reports the live slot as explicitly inactive rather than silently calling LLM.
 
 ### 6.5 Silent success / explicit failure
 
@@ -666,7 +696,7 @@ Purpose:
 - mark duplicate low-value cards as superseded.
 
 Output:
-- `brain/weekly/YYYY-Www.md`;
+- `brain/weekly/YYYY-MM-DD.md` for the weekly closing date;
 - optional `brain/lessons/*.md`;
 - proposal patches for `principles`, `skills`, `wiki/concepts`.
 
@@ -684,7 +714,7 @@ Purpose:
 - detect stale or contradictory old material.
 
 Output:
-- `brain/monthly/YYYY-MM.md`;
+- `brain/monthly/YYYY-MM-DD.md` for the monthly snapshot date;
 - promoted `skill_card/principle/concept` proposals;
 - stale/supersede recommendations.
 
@@ -1017,14 +1047,14 @@ If new evidence contradicts old principle/decision/fact:
 
 ### 11.4 Locks, watermarks, and transaction order
 
-Lock key is `{vault_id, profile, mode}` where mode is `daily|weekly|monthly|yearly|manual`. Lock file lives under `.orderk/jianling/locks/` and uses atomic create-new semantics with `{pid, host, started_at, ttl_seconds, binary_path, run_id}`. Stale lock recovery requires either TTL expiry or explicit `orderk jianling unlock --run-id`.
+Lock key is `{vault_id, profile}` for the active P0/P1 implementation. The lock is intentionally profile-wide, so `daily`, `weekly`, `monthly`, `yearly`, and manual runs for the same vault/profile cannot overlap. Lock file lives under `.orderk/jianling/locks/<profile>.lock` and uses atomic create-new semantics with `{pid, host, started_at, ttl_seconds, binary_path, run_id, mode}`. Stale lock recovery requires either TTL expiry or explicit `orderk jianling unlock --run-id`.
 
 Watermark state lives in `.orderk/jianling/watermarks.json` and records source path, content hash, mtime, last_processed_run, and last_status. Generated Markdown under `brain/` / `wiki/` must be excluded from raw-source collection unless the phase explicitly reads prior generated digests.
 
 Transaction order:
 
 ```text
-collect -> plan -> pre_llm_guard -> retrieve -> llm -> validate -> pre_write_guard -> write/propose -> index smoke -> receipt -> advance watermark
+global_profile_lock -> collect -> plan -> pre_llm_guard -> retrieve -> optional llm when explicit switch is enabled -> validate -> pre_write_guard -> write/propose -> index smoke/queue -> receipt -> advance watermark
 ```
 
 Rules:
@@ -1090,17 +1120,19 @@ Generated result without resolvable claim refs is downgraded or hidden from defa
 orderk jianling enable --schedule "03:30" --timezone Asia/Shanghai
 orderk jianling disable
 orderk jianling doctor --json
+orderk jianling self-check --json
+orderk jianling chat-smoke --json
 orderk jianling status --json
 ```
 
 ### 13.2 Running
 
 ```bash
-orderk jianling run --date today
-orderk jianling run --since 24h
-orderk jianling run --weekly 2026-W24
-orderk jianling run --monthly 2026-06
-orderk jianling run --dry-run --json
+orderk jianling run --mode daily --date 2026-06-10 --json
+orderk jianling run --mode weekly --date 2026-06-07 --json
+orderk jianling run --mode monthly --date 2026-06-10 --json
+orderk jianling run --dry-run --mode daily --date 2026-06-10 --json
+# Live reflection requires explicit env/profile switch, e.g. ORDERK_JIANLING_LLM_ENABLED_DEFAULT=1
 ```
 
 ### 13.3 Review / apply / rollback
@@ -1179,9 +1211,9 @@ Receipt schema:
   "template_registry_hash": "sha256:...",
   "evidence_pack_hash": "sha256:...",
   "evidence_pack_path": ".orderk/jianling/runs/<run-id>.evidence.json.redacted",
-  "provider_status": "called_success|called_timeout|called_pii_guard_blocked|...",
+  "provider_status": "called_live|configured_inactive_explicit_switch_off|configured_not_called_dry_run|llm_unconfigured_skipped|called_timeout|called_pii_guard_blocked|...",
   "schema_validation_status": "passed|failed",
-  "budget_status": "within_budget|truncated|queued",
+  "budget_status": "within_budget|partial_source_file_limit|queued|failed",
   "pre_llm_guard_status": "passed|blocked|redacted|local_only",
   "pre_write_guard_status": "passed|blocked|redacted",
   "index_update": "success|queued|failed",
@@ -1189,6 +1221,12 @@ Receipt schema:
   "fallback_used": false,
   "source_files": 18,
   "source_chars": 240000,
+  "source_total_files": 60,
+  "rejected_source_files": ["raw/transcripts/.../skipped.md"],
+  "chunking_status": "not_needed|planned_kanban_chunks|kanban_foreman_summary_written",
+  "chunk_count": 3,
+  "chunk_dir": ".orderk/jianling/runs/<run-id>.chunks",
+  "foreman_summary_path": ".orderk/jianling/runs/<run-id>.chunks/foreman-manifest.json",
   "retrieved_context_chunks": 80,
   "llm_calls": 3,
   "generated_files": ["brain/daily/2026-06-10.md"],
@@ -1238,7 +1276,7 @@ Receipt schema:
 }
 ```
 
-No receipt may include secret values. A run can be `success` only when every `success_predicate` field is green. If generated Markdown is written but indexing fails, the run is `degraded`, not `success`.
+No receipt may include secret values. A run can be `success` only when every `success_predicate` field is green. If generated Markdown is written but indexing fails, the run is `degraded`, not `success`. Every non-empty run must emit a Kanban harness under `<run-id>.chunks/`: `writer-*.json` drafts bounded source slices, `auditor-*.json` checks format standard and traceability by reading writer drafts, and `foreman-manifest.json` gates the final Markdown write. If the source set exceeds the configured file/context budget, receipt status must be explicit (`partial_source_file_limit` plus rejected paths and Kanban metadata); silent truncation is a release blocker.
 
 ---
 
@@ -1296,12 +1334,14 @@ If budgets are exceeded, job must degrade/queue rather than run away.
 - OrderK-managed schedule install/status/disable works and reports scheduler owner/backend;
 - On Linux P0, installing OrderK + configuring LLM + `orderk jianling enable` can produce a scheduled next run without Hermes/agent/external scripts;
 - Timer mode resident daemon count remains 0 except short-lived `orderk jianling run` worker; server-loop mode reports its resident process explicitly;
-- Missing LLM config disables Jianling fail-closed;
+- Missing LLM config fails closed for live reflection and is visible in `chat-smoke` / `self-check` receipts; a configured LLM without `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]` remains explicitly inactive, not implicitly called;
 - Raw transcripts are never mutated;
 - Generated output is Markdown with valid frontmatter;
 - Every `active_generated` or `active_user_approved` card has source refs and passes source-anchor resolution;
 - Secret scan blocks unsafe output;
-- Search/index still works without Jianling.
+- Search/index still works without Jianling;
+- `orderk jianling self-check` reports LLM profile, profile-wide lock, brain output paths, scheduler/last-run status, and does not require the user to discover broken state manually;
+- `orderk jianling chat-smoke` performs a live MiniMax M3 connectivity check and writes a redacted receipt without leaking API key values.
 
 ### P1 — Daily memory compiler gate
 
@@ -1319,7 +1359,8 @@ Pass:
 - generated-only prior reflection does not generate a new reflection;
 - fact-like claims become proposals by default; only direct-quote `user_stated|project_state|config_state` facts may use the narrow auto exception;
 - output count within budget;
-- receipt complete.
+- receipt complete;
+- live reflection path is covered by at least one fake-provider contract test and one real MiniMax M3 smoke/run drill before release evidence is claimed.
 
 ### P2 — Retrieval feedback gate
 
@@ -1343,7 +1384,20 @@ Pass:
 - repeated reflections merge into lesson;
 - lesson can propose skill/principle;
 - duplicate cards are superseded or referenced, not copied forever;
-- conflicts are surfaced as proposal, not silent overwrite.
+- conflicts are surfaced as proposal, not silent overwrite;
+- weekly and monthly runs use PRD paths `brain/weekly/YYYY-MM-DD.md` and `brain/monthly/YYYY-MM-DD.md`, never the old `brain/reflections/weekly-*` / `monthly-*` bucket;
+- profile-wide lock prevents daily/weekly/monthly overlap for the same vault/profile.
+
+### P3.1 — 2026-06-01..2026-06-10 live drill gate
+
+Fixture: a real or synthetic vault with daily source files from 2026-06-01 through 2026-06-10, `ORDERK_SWORD_LLM_API_KEY_ENV` pointing to the configured MiniMax M3 key env, and `ORDERK_JIANLING_LLM_ENABLED_<PROFILE>=1`.
+
+Pass:
+- 10 daily runs, one weekly run at 2026-06-07, and one monthly run at 2026-06-10 complete with `provider_status=called_live`;
+- every run passes `orderk jianling validate-run`;
+- every non-empty run passes Kanban writer/auditor/foreman before final Markdown write; writer cards contain `draft_markdown`/`draft_hash`, auditor cards reopen writer drafts and verify `format_standard`/`traceability`/`draft_hash`, and large evidence sets produce multiple writer/auditor cards with explicit partial status when the file limit is exceeded;
+- no old weekly/monthly reflection path is created;
+- final report records run counts, chunked runs, partial runs, generated paths, and receipt locations.
 
 ### P4 — Real-vault dry-run gate
 
@@ -1382,22 +1436,24 @@ Pass:
 - define cloud LLM consent text;
 - update only draft charter docs, not active README claims.
 
-### Phase 1 — Linux OrderK-managed scheduler, no LLM writes yet
+### Phase 1 — Linux OrderK-managed scheduler, receipts, validators, and self-check
 
-- Implement `jianling enable/disable/status/doctor`;
+- Implement `jianling enable/disable/status/doctor/self-check/chat-smoke`;
 - Linux systemd user timer backend first, generated and owned by OrderK;
 - explicit vault/DB/profile resolution;
-- atomic lock, watermark, run receipt, stale-lock recovery;
-- dry-run collects sources and reports; no LLM, no Markdown write.
+- profile-wide atomic lock, watermark, run receipt, stale-lock recovery;
+- dry-run collects sources and reports; deterministic run writes guarded generated Markdown only, never raw transcripts;
+- self-check must make broken LLM/lock/path/timer/receipt state visible without waiting for a user complaint.
 
-### Phase 2 — LLM provider + daily compiler MVP
+### Phase 2 — Explicit-switch LLM provider + daily compiler MVP
 
-- Implement `LlmProvider::complete_structured` and MiniMax M3 profile;
+- Implement Anthropic-compatible MiniMax M3 live slot using Sword model profile plumbing and `ORDERK_SWORD_LLM_API_KEY_ENV` indirection;
+- `chat-smoke` performs the live LLM probe and writes redacted smoke receipt;
+- `jianling run` calls live LLM only when `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]` is true; otherwise it stays deterministic and records the explicit inactive status;
 - cloud consent and guard statuses;
-- evidence retriever using existing OrderK search/rerank;
-- structured LLM output validation;
-- write one daily digest + limited validated reflections/open-loops; facts remain proposals except narrow direct-quote exceptions;
-- reuse current whole-vault hash incremental index and run smoke query.
+- bounded evidence bundle with fail-closed or explicit partial/chunk/foreman metadata;
+- write one daily digest with optional live reflection section; full structured card extraction, proposal apply/revert UX, and claim-level explain remain later gates;
+- reuse current whole-vault hash incremental index and run smoke query when that gate is enabled.
 
 ### Phase 3 — Governance, proposals, rollback
 
@@ -1439,7 +1495,7 @@ Pass:
 | Template/prompt drift breaks auditability | template/prompt/schema registries; receipt hashes; validate-template/validate-run gates |
 | Corrupts stable knowledge | candidate/active separation; proposal-first for stable layers |
 | Leaks secrets to LLM | pre-LLM redaction; skip secret-heavy files; no raw API keys in config |
-| Provider failure creates silent gaps | explicit degraded receipts; fail-closed semantics |
+| Provider failure creates silent gaps | `chat-smoke`/`self-check`, explicit inactive switch state, degraded/failed receipts; fail-closed semantics |
 | Search path slows down | query-time LLM = 0 by default; Jianling runs off-path |
 | Cross-profile pollution | profile/vault scope guard and locks |
 | Generated docs become trusted too early | `status=draft/proposed/active_generated/active_user_approved`, source refs, confidence, supersedes |
