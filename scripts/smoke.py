@@ -32,7 +32,7 @@ def main():
     status = json.loads(run(BASE + ["status", "--db", str(db), "--json"]))
     assert status["ok"] and status["notes"] == 3 and status["vector_enabled"], status
 
-    alpha = json.loads(run(BASE + ["search", "--db", str(db), "--query", "sqlite-vec semantic search", "--limit", "3", "--embedding-provider", "mock", "--embedding-dim", "16", "--embedding-model", "mock-16", "--json"]))
+    alpha = json.loads(run(BASE + ["search", "--db", str(db), "--query", "sqlite-vec semantic search", "--limit", "3", "--embedding-provider", "mock", "--embedding-dim", "16", "--embedding-model", "mock-16", "--reranker", "none", "--json"]))
     assert alpha["results"] and alpha["results"][0]["path"] == "projects/alpha.md", alpha
     assert alpha["routing"]["strategy"] in {"hybrid", "exact"}, alpha
     assert alpha["results"][0]["evidence"]["sources"], alpha

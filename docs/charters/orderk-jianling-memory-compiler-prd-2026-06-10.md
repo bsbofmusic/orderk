@@ -1,8 +1,8 @@
 # OrderK V4 Jianling / Sword Spirit PRD — Built-in Sleep Reflection & Markdown Memory Compiler
 
-> Status: **P0/P1 slice implemented in `orderk-cli@0.1.18`; later LLM reflection phases remain gated**  
-> Date: 2026-06-10  
-> Owner intent: 茶老板提出“剑灵是睡后反思者”，不是外部 Hermes/agent cron，而是 OrderK 自身安装后、配置 LLM 后无感运转的内嵌夜间记忆整理机制。  
+> Status: **P0/P1 slice implemented in `orderk-cli@0.1.19`; later LLM reflection phases remain gated**
+> Date: 2026-06-10
+> Owner intent: 茶老板提出“剑灵是睡后反思者”，不是外部 Hermes/agent cron，而是 OrderK 自身安装后、配置 LLM 后无感运转的内嵌夜间记忆整理机制。
 > Naming note: The new Jianling / Sword Spirit product generation is **OrderK V4**. V4 is built after the current V3 baseline, but it is not a patch label for V3. The old V3 release line must be archived clearly in npm, GitHub Releases, CHANGELOG, and repo docs before V4 changes the product boundary. Old `orderk-v2-sword-spirit-prd.md` remains historical and is not the active V4 design source.
 
 ---
@@ -37,7 +37,7 @@ V4 work must start by preserving the V3 line as a clean historical baseline. Cur
 - GitHub repo: `https://github.com/bsbofmusic/orderk.git`.
 - Latest GitHub Release observed: `v0.1.17`, name `orderk v0.1.17`, published `2026-06-10T07:00:23Z`, asset `orderk-v0.1.17-linux-x64`, size `10,280,008`, digest `sha256:2d09addccc4824f3f586cd100b5609d24562ee770e3ae57ed318fbc30af7ab0b`.
 - npm maintained package: `orderk-cli`, version `0.1.17`, tarball `https://registry.npmjs.org/orderk-cli/-/orderk-cli-0.1.17.tgz`, repository `git+https://github.com/bsbofmusic/orderk.git`.
-- Workspace version files for the P0/P1 implementation line say `0.1.18`.
+- Workspace version files for the P0/P1 implementation line say `0.1.19`.
 - Important caveat: `npm view orderk` returns 404; release checks must use `orderk-cli`, not bare `orderk`.
 - Current V3 capability baseline: read-only Markdown search blade, full-vault-smart source-tier retrieval, default real Qwen3 reranker, MCP/CLI evidence tools, no automatic note generation in active product docs.
 
@@ -54,12 +54,12 @@ V3 archive gate before V4 boundary change:
 
 ### 2.2 Boundary transition / active docs state
 
-This PRD records the V4 product-boundary change. The `0.1.18` implementation promotes the conservative P0/P1 slice: `orderk jianling` exists as an explicit Markdown compiler sidecar with deterministic digest generation, managed systemd-user timer files, receipts/evidence packs, validators, and safety gates. The search/MCP query path remains read-only; later LLM reflection is still behind future provider/eval gates.
+This PRD records the V4 product-boundary change. The `0.1.19` implementation promotes the conservative P0/P1 slice: `orderk jianling` exists as an explicit Markdown compiler sidecar with deterministic digest generation, managed systemd-user timer files, receipts/evidence packs, validators, and safety gates. The search/MCP query path remains read-only; later LLM reflection is still behind future provider/eval gates.
 
 Promotion rule:
 
 1. Old `orderk-v2-sword-spirit-prd.md` remains historical and must not be used as the active design source.
-2. `0.1.18` user-facing docs may say “OrderK has Jianling P0/P1” only for the deterministic digest/scheduler/receipt/validator slice.
+2. `0.1.19` user-facing docs may say “OrderK has Jianling P0/P1” only for the deterministic digest/scheduler/receipt/validator slice.
 3. User-facing docs must not claim autonomous LLM reflection is shipped until provider, budget, death-loop, and eval gates are implemented and pass.
 4. Search/MCP docs must continue to state the query path is read-only; Jianling write behavior is explicit and separate.
 
@@ -82,25 +82,25 @@ Required compatibility decisions:
 
 ### 3.1 Goals
 
-1. **内置调度，不依赖外部 agent cron**  
+1. **内置调度，不依赖外部 agent cron**
    用户安装 OrderK 并配置 LLM 后，OrderK 自己管理 nightly reflection schedule。可以通过系统 timer/service 实现，但 timer 的创建、状态、日志、禁用、恢复均由 `orderk` 命令管理，不依赖 Hermes cron、外部 agent、手写 shell glue。
 
-2. **Markdown-first consolidation**  
+2. **Markdown-first consolidation**
    Jianling 的所有长期产物必须是 `.md`；SQLite/vector/reranker cache 只是索引，可删可重建。
 
-3. **睡后反思，不阻塞白天搜索**  
+3. **睡后反思，不阻塞白天搜索**
    默认 search/query path 不调用 LLM 反思；Jianling 在夜间或用户手动 `orderk jianling run` 时运行。
 
-4. **正反馈闭环**  
+4. **正反馈闭环**
    `raw session -> Jianling digest/reflection md -> orderk incremental index -> future search/rerank better -> next Jianling has better context`。
 
-5. **主动但克制**  
+5. **主动但克制**
    只沉淀高价值经验；普通闲聊、一次性进度、状态废话、无复用价值材料不写入长期层。
 
-6. **可审计、可回滚**  
+6. **可审计、可回滚**
    每次 Jianling run 生成 run receipt、source refs、prompt/profile hash、文件 diff、secret scan 结果；必要时可按 run-id 回滚自动生成文件或撤销 patch。
 
-7. **轻量资源边界**  
+7. **轻量资源边界**
    常态无重 DB、无常驻大模型、无图数据库；夜间短时运行，云端 LLM；本地 RSS 和磁盘增长有硬预算。
 
 ### 3.2 Non-goals
@@ -474,7 +474,7 @@ Jianling templates are not hard-coded prose. They are versioned product artifact
     "deprecated_after": null,
     "read_until": null,
     "migration_required_for_active": [],
-    "min_orderk_version": "0.1.18",
+    "min_orderk_version": "0.1.19",
     "max_orderk_version": null
   },
   "migrations": []
@@ -1244,25 +1244,25 @@ No receipt may include secret values. A run can be `success` only when every `su
 
 ## 15. Security / Privacy
 
-1. **Secret guard before LLM**  
+1. **Secret guard before LLM**
    Source bundles sent to cloud LLM are redacted. If a file is secret-heavy, skip and report.
 
-2. **PII / private-fact guard before LLM**  
+2. **PII / private-fact guard before LLM**
    PII taxonomy includes email, phone, address, government IDs, financial account details, health data, private relationship/family facts, and precise location traces. Policies: `block`, `redact`, `hash`, `local_only`, or `allow_by_config`. Default for cloud LLM is `redact` for ordinary contact info and `block/local_only` for high-risk identifiers.
 
-3. **Secret and PII guard before write**  
+3. **Secret and PII guard before write**
    Generated Markdown is scanned. Any secret-like output blocks write or writes only to rejected quarantine with redacted content. PII output follows the same policy matrix and records `pii_findings` plus `pre_write_guard_status` in the receipt.
 
-4. **Config never stores raw API keys**  
+4. **Config never stores raw API keys**
    Only `api_key_env` or OS keychain references.
 
-5. **No raw mutation**  
+5. **No raw mutation**
    LLM cannot edit source transcripts.
 
-6. **Profile guard**  
+6. **Profile guard**
    Multi-vault / multi-profile installs must not cross-ingest or cross-write without explicit scope.
 
-7. **Cloud disclosure awareness**  
+7. **Cloud disclosure awareness**
    Enabling Jianling means configured source excerpts may be sent to the selected LLM provider. `orderk jianling enable` must say this clearly and require `--accept-cloud-llm` unless using a local model.
 
 ---

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-06-11
+
+### Fixed
+- Fix CI smoke tests by making mock-provider search explicitly use `--reranker none`, preserving the real Qwen reranker fail-closed default for normal search while allowing keyless CI/test fixtures.
+- Supersede `0.1.18` after its npm tarball was already published; npm packages are immutable, so this patch release carries the CI fix instead of rewriting history.
+
 ## [0.1.18] - 2026-06-11
 
 ### Added
@@ -195,7 +201,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/bsbofmusic/orderk/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/bsbofmusic/orderk/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/bsbofmusic/orderk/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/bsbofmusic/orderk/compare/v0.1.15...v0.1.16
