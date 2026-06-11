@@ -1,18 +1,19 @@
 use anyhow::{anyhow, Context, Result};
 use orderk_core::{
     approve_proposal, classify_error_message, digest_vault, explain_graph, export_capsule_manifest,
-    feedback, get_chunks, health_report, index_vault_with_options, init, inspect_capsule_manifest,
-    jianling_chat_smoke, jianling_disable, jianling_doctor, jianling_enable, jianling_run,
-    jianling_status, jianling_validate_file, jianling_validate_run, jianling_validate_templates,
-    list_proposals, optimize_apply, optimize_dry_run, optimize_reset, optimize_set,
-    optimize_status, provider_from_name, query_with_options, reason_about_vault, rebuild_graph,
-    reject_proposal, resolve_sword_model_profile_from_env, run_sword_spirit, scan_obsidian_adapter,
-    show_proposal, status, sword_spirit_status, write_capsule_manifest, AdapterScanOptions,
-    ChunkGetDetail, ChunkGetOptions, DigestOptions, EmbeddingProvider, FeedbackEvent,
-    FreshnessMode, GraphBuildOptions, IndexOptions, JianlingEnableOptions, JianlingRunMode,
-    JianlingRunOptions, JianlingValidateFileOptions, QueryOptions, QueryResponse, ReasoningOptions,
-    SearchIndexResponse, SwordSpiritBudgetProfile, SwordSpiritOptions, SwordSpiritProposal,
-    SwordSpiritThinkingMode, SwordSpiritTraceLevel, VectorBackend,
+    feedback, get_chunks, health_report, index_paths_with_options, index_vault_with_options, init,
+    inspect_capsule_manifest, jianling_chat_smoke, jianling_disable, jianling_doctor,
+    jianling_enable, jianling_run, jianling_status, jianling_validate_file, jianling_validate_run,
+    jianling_validate_templates, jianling_worker, list_proposals, optimize_apply, optimize_dry_run,
+    optimize_reset, optimize_set, optimize_status, provider_from_name, query_with_options,
+    reason_about_vault, rebuild_graph, reject_proposal, resolve_sword_model_profile_from_env,
+    run_sword_spirit, scan_obsidian_adapter, show_proposal, status, sword_spirit_status,
+    write_capsule_manifest, AdapterScanOptions, ChunkGetDetail, ChunkGetOptions, DigestOptions,
+    EmbeddingProvider, FeedbackEvent, FreshnessMode, GraphBuildOptions, IndexOptions,
+    IndexPathOptions, JianlingEnableOptions, JianlingRunMode, JianlingRunOptions,
+    JianlingValidateFileOptions, JianlingWorkerOptions, QueryOptions, QueryResponse,
+    ReasoningOptions, SearchIndexResponse, SwordSpiritBudgetProfile, SwordSpiritOptions,
+    SwordSpiritProposal, SwordSpiritThinkingMode, SwordSpiritTraceLevel, VectorBackend,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -127,23 +128,40 @@ fn run_cli_args(mut args: Vec<String>) -> Result<()> {
             let profile = resolve_embedding_profile(&mut args, Some(&db))?;
             let chunk_max_chars = take_usize(&mut args, "--chunk-max-chars", 1200)?;
             let chunk_overlap_chars = take_usize(&mut args, "--chunk-overlap", 0)?;
+            let paths = take_repeated_strings(&mut args, "--path")?;
             let provider = provider_from_name(
                 &profile.embedding_provider,
                 profile.embedding_dim,
                 Some(profile.embedding_model.clone()),
             )?;
-            let summary = index_vault_with_options(
-                &vault,
-                &db,
-                provider.as_ref(),
-                profile.embedding_dim,
-                &profile.embedding_model,
-                profile.vector_backend,
-                &IndexOptions {
-                    chunk_max_chars,
-                    chunk_overlap_chars,
-                },
-            )?;
+            let index_options = IndexOptions {
+                chunk_max_chars,
+                chunk_overlap_chars,
+            };
+            let summary = if paths.is_empty() {
+                index_vault_with_options(
+                    &vault,
+                    &db,
+                    provider.as_ref(),
+                    profile.embedding_dim,
+                    &profile.embedding_model,
+                    profile.vector_backend,
+                    &index_options,
+                )?
+            } else {
+                index_paths_with_options(
+                    &vault,
+                    &db,
+                    provider.as_ref(),
+                    profile.embedding_dim,
+                    &profile.embedding_model,
+                    profile.vector_backend,
+                    &IndexPathOptions {
+                        paths,
+                        index: index_options,
+                    },
+                )?
+            };
             print_json(&summary)?;
         }
         "search" => {
@@ -607,6 +625,34 @@ fn jianling_command(args: &mut Vec<String>) -> Result<serde_json::Value> {
                     mode,
                     dry_run,
                     scheduled,
+                    db,
+                    date,
+                    max_source_files,
+                },
+            )?)?)
+        }
+        "worker" => {
+            let vault = take_path(args, "--vault")?;
+            let profile = take_string(args, "--profile", "default".to_string())?;
+            let once = take_flag(args, "--once");
+            let db = take_optional_path(args, "--db")?;
+            let date = take_optional_string(args, "--date")?;
+            let max_source_files = take_usize(args, "--max-source-files", 120)?;
+            if !once {
+                return Err(anyhow!(
+                    "jianling worker currently requires --once; embedded daemon loop is not implemented"
+                ));
+            }
+            if !args.is_empty() {
+                return Err(anyhow!(
+                    "unexpected jianling worker arguments: {}",
+                    args.join(" ")
+                ));
+            }
+            Ok(serde_json::to_value(jianling_worker(
+                &vault,
+                &JianlingWorkerOptions {
+                    profile,
                     db,
                     date,
                     max_source_files,
@@ -2742,7 +2788,7 @@ fn print_usage() {
     eprintln!(
         "search flags include: --query <text> [--view full|index] [--filter \"tag == 'rust' && confidence == 'high'\"] [--min-score <n>] [--context-chunks <n>] [--include-links] [--retrieval-depth 1] [--query-expansion] [--reranker qwen|none] [--json-lines] [--explain]"
     );
-    eprintln!("index flags: --vault <path> --db <orderk.sqlite> [--chunk-max-chars <n>] [--chunk-overlap <n>]");
+    eprintln!("index flags: --vault <path> --db <orderk.sqlite> [--path <vault-relative.md> ...] [--chunk-max-chars <n>] [--chunk-overlap <n>]");
     eprintln!("eval flags: --db <orderk.sqlite> --queries <queries.json> [--ab-chunk-overlap <n>] [--vault <path>]");
     eprintln!("optimize flags: --db <orderk.sqlite> [--status|--dry-run|--apply|--reset|tune|set] [--min-events <n>] [--text-only-penalty <0.65-1.0>] [--add-stopword <term>] [--remove-stopword <term>] (set is a compatibility alias for tune)");
     eprintln!(
@@ -2752,6 +2798,7 @@ fn print_usage() {
     eprintln!("sword run flags: --vault <path> [--max-files <n>] [--max-proposals <n>] [--llm-provider <provider>] [--llm-model <model>]");
     eprintln!("sword status flags: --vault <path>");
     eprintln!("jianling run flags: --vault <path> [--profile <name>] [--mode daily|weekly|monthly|yearly|manual] [--dry-run] [--scheduled] [--db <orderk.sqlite>] [--date YYYY-MM-DD]");
+    eprintln!("jianling worker flags: --once --vault <path> [--profile <name>] [--db <orderk.sqlite>] [--date YYYY-MM-DD] [--max-source-files N]");
     eprintln!("jianling enable flags: --vault <path> [--profile <name>] [--schedule HH:MM] [--timezone <tz>] [--db <orderk.sqlite>] [--orderk-bin <path>] [--systemd-dir <path>] [--dry-run]");
     eprintln!("jianling status|doctor|self-check|chat-smoke|disable flags: --vault <path> [--profile <name>]");
     eprintln!("graph flags: graph rebuild --vault <path> [--dry-run|--apply]; graph explain <id|path> --vault <path> --json");

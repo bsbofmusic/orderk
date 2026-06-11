@@ -3,7 +3,7 @@ use crate::filter::compile_filter;
 use crate::models::*;
 use crate::optimizer;
 use crate::reranker::{self, RerankerProvider};
-use crate::scanner::scan_vault;
+use crate::scanner::{scan_vault, scan_vault_paths};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -424,6 +424,120 @@ impl IndexStore {
         })
     }
 
+    pub fn index_paths_with_options<P: EmbeddingProvider + ?Sized>(
+        conn: &mut Connection,
+        vault: &Path,
+        provider: &P,
+        embedding_dim: usize,
+        embedding_model: &str,
+        vector_backend: &VectorBackend,
+        options: &IndexPathOptions,
+    ) -> Result<IndexSummary> {
+        let started = Instant::now();
+        if options.paths.is_empty() {
+            return Err(anyhow!(
+                "--path requires at least one vault-relative Markdown path"
+            ));
+        }
+        init_schema(conn, embedding_dim, embedding_model, vector_backend)?;
+        provider.health()?;
+        ensure_runtime_profile(
+            conn,
+            provider,
+            embedding_dim,
+            embedding_model,
+            vector_backend,
+        )?;
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('embedding_provider', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![provider.provider_id()],
+        )?;
+
+        let scanned = scan_vault_paths(vault, &options.paths)?;
+        let chunk_options = options.index.normalized();
+        let chunk_strategy = chunk_options.strategy().to_string();
+        let settings = load_settings_map(conn)?;
+        let profile_changed = !chunk_profile_matches(&settings, &chunk_options);
+        if profile_changed && indexed_embedding_count(conn)? > 0 {
+            return Err(anyhow!(
+                "--path incremental index cannot change chunk profile; run full `orderk index` with the new chunk options"
+            ));
+        }
+
+        let mut added = 0usize;
+        let mut updated = 0usize;
+        let mut unchanged = 0usize;
+        let mut embedded = 0usize;
+        let mut reused = 0usize;
+        let mut total_chunks = 0usize;
+        for file in &scanned {
+            let existing_hash = conn
+                .query_row(
+                    "SELECT hash FROM files WHERE path = ?1",
+                    params![file.path],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match existing_hash.as_deref() {
+                None => added += 1,
+                Some(hash) if hash != file.hash => updated += 1,
+                Some(_) => unchanged += 1,
+            }
+            if existing_hash.as_deref() == Some(file.hash.as_str()) && !profile_changed {
+                continue;
+            }
+            let file_summary = reindex_file_with_options(
+                conn,
+                file,
+                provider,
+                embedding_dim,
+                embedding_model,
+                vector_backend,
+                &chunk_options,
+            )?;
+            total_chunks += file_summary.chunks;
+            embedded += file_summary.embedded;
+            reused += file_summary.reused;
+        }
+
+        upsert_setting(conn, "embedding_provider", provider.provider_id())?;
+        upsert_setting(conn, "embedding_model", embedding_model)?;
+        upsert_setting(conn, "embedding_dim", &embedding_dim.to_string())?;
+        upsert_setting(conn, "vector_backend", vector_backend.as_str())?;
+        upsert_setting(conn, "chunk_strategy", &chunk_strategy)?;
+        upsert_setting(
+            conn,
+            "chunk_max_chars",
+            &chunk_options.chunk_max_chars.to_string(),
+        )?;
+        upsert_setting(
+            conn,
+            "chunk_overlap_chars",
+            &chunk_options.chunk_overlap_chars.to_string(),
+        )?;
+
+        Ok(IndexSummary {
+            ok: true,
+            vault: vault.to_string_lossy().to_string(),
+            db: String::new(),
+            added,
+            updated,
+            unchanged,
+            deleted: 0,
+            files: scanned.len(),
+            chunks: total_chunks,
+            embedded,
+            reused,
+            embedding_provider: provider.provider_id().to_string(),
+            embedding_model: provider.model_id().to_string(),
+            vector_backend: vector_backend.as_str().to_string(),
+            chunk_strategy,
+            chunk_max_chars: chunk_options.chunk_max_chars,
+            chunk_overlap_chars: chunk_options.chunk_overlap_chars,
+            took_ms: started.elapsed().as_millis(),
+        })
+    }
+
     pub fn query<P: EmbeddingProvider + ?Sized>(
         conn: &Connection,
         query: &str,
@@ -752,6 +866,93 @@ mod tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap()
+    }
+
+    #[test]
+    fn index_paths_reindexes_only_requested_vault_relative_markdown() {
+        let vault = sample_vault();
+        let db_path = std::env::temp_dir().join(format!(
+            "orderk-index-paths-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let provider = MockEmbeddingProvider::new(8);
+        let mut conn = open_db(
+            &db_path,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        IndexStore::index_vault(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        fs::write(
+            vault.join("delta.md"),
+            "# Delta\nincremental-jianling-smoke unique generated digest text\n",
+        )
+        .unwrap();
+
+        let summary = IndexStore::index_paths_with_options(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+            &IndexPathOptions {
+                paths: vec!["delta.md".to_string()],
+                index: IndexOptions::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.files, 1);
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.deleted, 0);
+        assert!(summary.chunks > 0);
+        let files_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(files_count, 3);
+        let delta_chunks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE file_path = 'delta.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(delta_chunks > 0);
+        let res = query_without_external_reranker(
+            &conn,
+            "incremental-jianling-smoke",
+            3,
+            &provider,
+            &VectorBackend::Exact,
+        )
+        .unwrap();
+        assert!(res.results.iter().any(|result| result.path == "delta.md"));
+        assert!(IndexStore::index_paths_with_options(
+            &mut conn,
+            &vault,
+            &provider,
+            provider.dimension(),
+            provider.model_id(),
+            &VectorBackend::Exact,
+            &IndexPathOptions {
+                paths: vec!["../escape.md".to_string()],
+                index: IndexOptions::default(),
+            },
+        )
+        .is_err());
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&db_path);
     }
 
     #[test]

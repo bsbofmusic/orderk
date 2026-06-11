@@ -51,7 +51,7 @@ These features return vault evidence only; they do not write notes, generate sum
 - `orderk-obsidian`: legacy/deprecated on npm; the Obsidian wrapper source remains in `packages/obsidian` for local/plugin builds.
 
 Runtime installs resolve a stable native binary through `ORDERK_BIN`, a package-local vendor binary, or `orderk` on `PATH`; they do not depend on Cargo `target/` build artifacts.
-The v0.1.20 npm one-click path targets Linux x64 first; other platforms can build from source, set `ORDERK_BIN`, or install/copy the resulting binary to a stable path.
+The v0.1.21 npm one-click path targets Linux x64 first; other platforms can build from source, set `ORDERK_BIN`, or install/copy the resulting binary to a stable path.
 
 ## Obsidian artifact
 

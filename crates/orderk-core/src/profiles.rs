@@ -178,7 +178,6 @@ fn resolve_llm_slot() -> Result<SwordModelSlot> {
                     "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY",
                     "ORDERK_SWORD_LLM_MINIMAX_API_KEY",
                     "ORDERK_SWORD_LLM_API_KEY",
-                    "ORDERK_SWORD_LLM_API_KEY_ENV",
                 ])
             }),
             env_string("ORDERK_SWORD_LLM_ANTHROPIC_BASE_URL")
@@ -504,6 +503,21 @@ mod slot_tests {
                 assert_eq!(slot.api_key_env.as_deref(), Some("HERMES_MINIMAX_API_KEY"));
                 assert!(slot.api_key_configured);
                 assert!(!slot.profile_fingerprint.contains("hermes-minimax-secret"));
+            });
+        });
+    }
+
+    #[test]
+    fn slot_provider_does_not_treat_llm_api_key_env_pointer_as_direct_secret() {
+        with_clean_slot_env(|| {
+            with_saved_env(&["HERMES_MINIMAX_API_KEY"], || {
+                std::env::remove_var("HERMES_MINIMAX_API_KEY");
+                std::env::set_var("ORDERK_SWORD_LLM_API_KEY_ENV", "HERMES_MINIMAX_API_KEY");
+                let slot = resolve_sword_model_slot_from_env(SwordModelKind::Llm).unwrap();
+                assert_eq!(slot.provider, "anthropic");
+                assert_eq!(slot.model, DEFAULT_LLM_MODEL);
+                assert_eq!(slot.api_key_env, None);
+                assert!(!slot.api_key_configured);
             });
         });
     }

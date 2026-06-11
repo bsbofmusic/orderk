@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use orderk_core::{
     jianling_chat_smoke, jianling_doctor, jianling_enable, jianling_run, jianling_status,
-    jianling_validate_file, jianling_validate_run, JianlingEnableOptions, JianlingRunMode,
-    JianlingRunOptions, JianlingValidateFileOptions,
+    jianling_validate_file, jianling_validate_run, jianling_worker, JianlingEnableOptions,
+    JianlingRunMode, JianlingRunOptions, JianlingValidateFileOptions, JianlingWorkerOptions,
 };
 
 fn temp_vault(name: &str) -> PathBuf {
@@ -339,12 +339,15 @@ fn jianling_enable_writes_orderk_managed_systemd_units() {
     assert!(systemd_dir.join("orderk-jianling@default.timer").is_file());
     let service = fs::read_to_string(systemd_dir.join("orderk-jianling@default.service")).unwrap();
     assert!(service.contains("# Managed by orderk jianling; do not hand-edit"));
-    assert!(service.contains("jianling run --profile default --scheduled"));
+    assert!(service.contains("jianling worker --once --profile default"));
+    assert!(service.contains("EnvironmentFile=-%h/.config/orderk/default.env"));
+    assert!(service.contains("WorkingDirectory="));
     assert!(service.contains("--vault"));
     assert!(service.contains("--db"));
     let timer = fs::read_to_string(systemd_dir.join("orderk-jianling@default.timer")).unwrap();
     assert!(timer.contains("OnCalendar=*-*-* 03:30:00"));
     assert!(timer.contains("Persistent=true"));
+    assert!(timer.contains("RandomizedDelaySec=300"));
 
     let doctor = jianling_doctor(&vault, "default").unwrap();
     assert!(doctor.ok, "doctor should pass after enable: {doctor:#?}");
@@ -357,7 +360,7 @@ fn jianling_enable_writes_orderk_managed_systemd_units() {
 }
 
 fn seed_many_raw_dialogues(vault: &Path, count: usize) {
-    let raw = vault.join("raw/transcripts/hermes-sessions/2026/06/large");
+    let raw = vault.join("raw/transcripts/hermes-sessions/2026/06/10");
     fs::create_dir_all(&raw).unwrap();
     for idx in 0..count {
         fs::write(
@@ -366,6 +369,173 @@ fn seed_many_raw_dialogues(vault: &Path, count: usize) {
         )
         .unwrap();
     }
+}
+
+#[test]
+fn jianling_daily_selects_only_requested_date_window() {
+    let vault = temp_vault("daily-date-window");
+    let day10 = vault.join("raw/transcripts/hermes-sessions/2026/06/10");
+    let day11 = vault.join("raw/transcripts/hermes-sessions/2026/06/11");
+    fs::create_dir_all(&day10).unwrap();
+    fs::create_dir_all(&day11).unwrap();
+    fs::write(day10.join("old.md"), "# old\n\n不应该进 6/11 日反思\n").unwrap();
+    fs::write(day11.join("today.md"), "# today\n\n应该进入 6/11 日反思\n").unwrap();
+    fs::create_dir_all(vault.join("raw/system-snapshots/2026/06/11")).unwrap();
+    fs::write(
+        vault.join("raw/system-snapshots/2026/06/11/noise.md"),
+        "# noisy snapshot\n",
+    )
+    .unwrap();
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: true,
+            scheduled: true,
+            db: None,
+            date: Some("2026-06-11".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.source_total_files, 1);
+    assert_eq!(report.source_files, 1);
+    assert_eq!(
+        report.source_anchors[0].path,
+        "raw/transcripts/hermes-sessions/2026/06/11/today.md"
+    );
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_weekly_monthly_yearly_select_expected_date_windows() {
+    let vault = temp_vault("calendar-source-window");
+    for (date, name) in [
+        ("2025/12/31", "old-year"),
+        ("2026/01/01", "year-start"),
+        ("2026/05/31", "old-month"),
+        ("2026/06/01", "week-start"),
+        ("2026/06/07", "sunday"),
+        ("2026/06/10", "today"),
+        ("2026/06/11", "future"),
+    ] {
+        let dir = vault.join("raw/transcripts/hermes-sessions").join(date);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{name}.md")), format!("# {name}\n")).unwrap();
+    }
+
+    let weekly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Weekly,
+            dry_run: true,
+            scheduled: true,
+            db: None,
+            date: Some("2026-06-07".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(weekly.source_total_files, 2);
+    assert!(weekly.source_anchors.iter().all(|anchor| {
+        anchor.path.contains("2026/06/01") || anchor.path.contains("2026/06/07")
+    }));
+
+    let monthly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Monthly,
+            dry_run: true,
+            scheduled: true,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(monthly.source_total_files, 3);
+    assert!(monthly
+        .source_anchors
+        .iter()
+        .all(|anchor| anchor.path.contains("2026/06/")));
+    assert!(!monthly
+        .source_anchors
+        .iter()
+        .any(|anchor| anchor.path.contains("2026/06/11")));
+
+    let yearly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Yearly,
+            dry_run: true,
+            scheduled: true,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(yearly.source_total_files, 5);
+    assert!(!yearly
+        .source_anchors
+        .iter()
+        .any(|anchor| anchor.path.contains("2025/")));
+    assert!(!yearly
+        .source_anchors
+        .iter()
+        .any(|anchor| anchor.path.contains("2026/06/11")));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_worker_plans_calendar_modes_without_external_cron() {
+    let vault = temp_vault("worker-planner");
+    let day01 = vault.join("raw/transcripts/hermes-sessions/2026/06/01");
+    let day07 = vault.join("raw/transcripts/hermes-sessions/2026/06/07");
+    fs::create_dir_all(&day01).unwrap();
+    fs::create_dir_all(&day07).unwrap();
+    fs::write(day01.join("session.md"), "# day 1\n").unwrap();
+    fs::write(day07.join("session.md"), "# sunday\n").unwrap();
+
+    let monthly = jianling_worker(
+        &vault,
+        &JianlingWorkerOptions {
+            profile: "default".to_string(),
+            db: None,
+            date: Some("2026-06-01".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(monthly.modes_planned, vec!["daily", "monthly"]);
+    assert_eq!(monthly.runs.len(), 2);
+    assert!(vault.join("brain/daily/2026-06-01.md").is_file());
+    assert!(vault.join("brain/monthly/2026-06-01.md").is_file());
+
+    let weekly = jianling_worker(
+        &vault,
+        &JianlingWorkerOptions {
+            profile: "default".to_string(),
+            db: None,
+            date: Some("2026-06-07".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(weekly.modes_planned, vec!["daily", "weekly"]);
+    assert_eq!(weekly.runs.len(), 2);
+    assert!(vault.join("brain/daily/2026-06-07.md").is_file());
+    assert!(vault.join("brain/weekly/2026-06-07.md").is_file());
+
+    let _ = fs::remove_dir_all(vault);
 }
 
 #[test]
@@ -627,6 +797,48 @@ fn jianling_chat_smoke_receipts_unconfigured_llm_without_secret_leak() {
 }
 
 #[test]
+fn jianling_apply_configured_llm_without_hot_switch_does_not_call_provider() {
+    let vault = temp_vault("live-llm-switch-off");
+    seed_raw_dialogue(&vault);
+    let server = FakeAnthropicServer::start("- should not be called\n");
+    let _guard = ScopedEnv::set_with_clear(
+        &[
+            ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+            ("ORDERK_TEST_LLM_KEY", "test-secret"),
+            ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+        ],
+        &[
+            "ORDERK_JIANLING_LLM_ENABLED",
+            "ORDERK_JIANLING_LLM_ENABLED_SWITCHOFF",
+        ],
+    );
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "switchoff".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.provider_status,
+        "configured_inactive_explicit_switch_off"
+    );
+    assert_eq!(server.request_count(), 0);
+    let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
+    assert!(!daily_text.contains("## LLM 反思（MiniMax M3）"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
 fn jianling_apply_calls_configured_llm_and_writes_reflection() {
     let vault = temp_vault("live-llm-run");
     seed_raw_dialogue(&vault);
@@ -672,27 +884,35 @@ impl FakeAnthropicServer {
     fn start(text: &'static str) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        listener.set_nonblocking(false).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count_for_thread = count.clone();
         let handle = std::thread::spawn(move || {
-            for _ in 0..3 {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    use std::io::{Read, Write};
-                    count_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let mut buf = [0_u8; 8192];
-                    let _ = stream.read(&mut buf);
-                    let body = serde_json::json!({
-                        "content": [{"type":"text", "text": text}]
-                    })
-                    .to_string();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                    break;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline
+                && count_for_thread.load(std::sync::atomic::Ordering::SeqCst) < 3
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        use std::io::{Read, Write};
+                        count_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let mut buf = [0_u8; 8192];
+                        let _ = stream.read(&mut buf);
+                        let body = serde_json::json!({
+                            "content": [{"type":"text", "text": text}]
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
                 }
             }
         });
@@ -738,11 +958,22 @@ impl ScopedEnv {
     }
 
     fn set(values: &[(&'static str, &str)]) -> Self {
+        Self::set_with_clear(values, &[])
+    }
+
+    fn set_with_clear(values: &[(&'static str, &str)], clear_names: &[&'static str]) -> Self {
         let guard = jianling_test_env_lock();
-        let saved = values
+        let mut names = clear_names.to_vec();
+        names.extend(values.iter().map(|(name, _)| *name));
+        names.sort();
+        names.dedup();
+        let saved = names
             .iter()
-            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .map(|name| (*name, std::env::var(name).ok()))
             .collect::<Vec<_>>();
+        for name in clear_names {
+            std::env::remove_var(name);
+        }
         for (name, value) in values {
             std::env::set_var(name, value);
         }

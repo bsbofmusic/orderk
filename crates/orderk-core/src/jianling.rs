@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -87,6 +88,14 @@ pub struct JianlingEnableOptions {
     pub orderk_bin: PathBuf,
     pub systemd_user_dir: Option<PathBuf>,
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JianlingWorkerOptions {
+    pub profile: String,
+    pub db: Option<PathBuf>,
+    pub date: Option<String>,
+    pub max_source_files: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +181,8 @@ pub struct JianlingRunReport {
     pub chunk_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreman_summary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,7 +200,21 @@ pub struct JianlingStatusResponse {
     pub latest_run_path: Option<String>,
     pub last_run_status: Option<String>,
     pub next_run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_runtime: Option<JianlingSystemdRuntime>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JianlingSystemdRuntime {
+    pub timer_unit: String,
+    pub checked: bool,
+    pub active_state: Option<String>,
+    pub sub_state: Option<String>,
+    pub unit_file_state: Option<String>,
+    pub next_elapse: Option<String>,
+    pub last_trigger: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,8 +265,27 @@ pub struct JianlingEnableReport {
     pub timezone: String,
     pub service_path: String,
     pub timer_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_path: Option<String>,
     pub dry_run: bool,
     pub written_files: Vec<String>,
+    pub activation_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_runtime: Option<JianlingSystemdRuntime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JianlingWorkerReport {
+    pub ok: bool,
+    pub schema_version: String,
+    pub vault: String,
+    pub profile: String,
+    pub date: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub modes_planned: Vec<String>,
+    pub runs: Vec<JianlingRunReport>,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -271,6 +315,8 @@ struct JianlingSchedulerState {
     timezone: String,
     service_path: String,
     timer_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    env_path: Option<String>,
     orderk_bin: String,
     vault: String,
     db: Option<String>,
@@ -333,6 +379,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
     );
     let root = control_root(&vault);
     let runs_root = root.join("runs");
+    let logs_root = root.join("logs");
     let lock_path = root.join("locks").join(format!("{profile}.lock"));
     let target_rel = target_rel_for_mode(&options.mode, &date);
 
@@ -345,7 +392,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         None
     };
 
-    let selection = select_source_files(&vault, options.max_source_files)?;
+    let selection = select_source_files(&vault, &options.mode, &date, options.max_source_files)?;
     let selected = selection.selected;
     let mut warnings = Vec::new();
     if !selection.rejected_paths.is_empty() {
@@ -390,15 +437,16 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         &selection.rejected_paths,
     );
     if !options.dry_run && jianling_live_llm_enabled(&profile) {
-        if let Some(reflection) = generate_live_llm_reflection(
-            &options.mode,
-            &date,
-            &run_id,
-            &source_anchors,
-            &evidence_sources,
-            selection.total_files,
-            &selection.rejected_paths,
-        )? {
+        if let Some(reflection) = generate_live_llm_reflection(LiveReflectionInput {
+            profile: &profile,
+            mode: &options.mode,
+            date: &date,
+            run_id: &run_id,
+            anchors: &source_anchors,
+            sources: &evidence_sources,
+            source_total_files: selection.total_files,
+            rejected_source_files: &selection.rejected_paths,
+        })? {
             provider_status = "called_live".to_string();
             generated_body.push_str("\n## LLM 反思（MiniMax M3）\n");
             generated_body.push_str(&reflection);
@@ -504,6 +552,16 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         chunk_count: chunk_count_for(selected.len()),
         chunk_dir: None,
         foreman_summary_path: None,
+        log_path: if options.dry_run {
+            None
+        } else {
+            Some(
+                logs_root
+                    .join(format!("{run_id}.log"))
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        },
     };
 
     if options.dry_run {
@@ -512,6 +570,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
 
     prepare_jianling_root(&vault, &root)?;
     prepare_child_dir(&runs_root, "jianling runs")?;
+    prepare_child_dir(&logs_root, "jianling logs")?;
     prepare_child_dir(&root.join("locks"), "jianling locks")?;
     let lock = create_lock(&lock_path, &run_id, &profile, options.mode.as_str())?;
     let write_result = (|| -> Result<()> {
@@ -574,12 +633,12 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         fs::write(&evidence_path, evidence_json)?;
         report.finished_at = Utc::now().to_rfc3339();
         ensure_plain_output_file(&receipt_path, "jianling run receipt")?;
-        fs::write(
-            &receipt_path,
-            serde_json::to_string_pretty(&report)?
-                + "
-",
-        )?;
+        fs::write(&receipt_path, serde_json::to_string_pretty(&report)? + "\n")?;
+        if let Some(log_path) = &report.log_path {
+            let log_path = PathBuf::from(log_path);
+            ensure_plain_output_file(&log_path, "jianling run log")?;
+            fs::write(&log_path, render_run_log(&report))?;
+        }
         Ok(())
     })();
     drop(lock);
@@ -596,6 +655,9 @@ pub fn jianling_status(vault: &Path, profile: &str) -> Result<JianlingStatusResp
     let root = control_root(&vault);
     let scheduler = read_scheduler_state(&root, &profile)?;
     let latest = latest_run_report(&root)?;
+    let scheduler_runtime = scheduler
+        .as_ref()
+        .and_then(|state| inspect_scheduler_runtime_if_managed(state).ok().flatten());
     Ok(JianlingStatusResponse {
         ok: true,
         schema_version: "orderk.jianling.status.v1".to_string(),
@@ -612,7 +674,11 @@ pub fn jianling_status(vault: &Path, profile: &str) -> Result<JianlingStatusResp
         latest_run_id: latest.as_ref().map(|report| report.run_id.clone()),
         latest_run_path: latest.as_ref().map(|report| report.receipt_path.clone()),
         last_run_status: latest.as_ref().map(|report| report.status.clone()),
-        next_run: scheduler.map(|state| state.schedule),
+        next_run: scheduler_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.next_elapse.clone())
+            .or_else(|| scheduler.as_ref().map(|state| state.schedule.clone())),
+        scheduler_runtime,
         warnings: Vec::new(),
     })
 }
@@ -643,22 +709,38 @@ pub fn jianling_doctor(vault: &Path, profile: &str) -> Result<JianlingDoctorResp
         .to_string(),
         detail: serde_json::json!({"path": root}),
     });
-    let scheduler_ok = scheduler
+    let scheduler_runtime = scheduler
+        .as_ref()
+        .and_then(|state| inspect_scheduler_runtime_if_managed(state).ok().flatten());
+    let scheduler_files_ok = scheduler
         .as_ref()
         .map(|state| {
             Path::new(&state.service_path).is_file() && Path::new(&state.timer_path).is_file()
         })
         .unwrap_or(false);
+    let scheduler_runtime_ok = match (&scheduler, &scheduler_runtime) {
+        (Some(state), Some(runtime)) if is_default_systemd_state(state) => {
+            runtime.error.is_none()
+                && runtime.active_state.as_deref() == Some("active")
+                && runtime.unit_file_state.as_deref() == Some("enabled")
+        }
+        (Some(state), None) if is_default_systemd_state(state) => false,
+        (Some(_), _) => true,
+        (None, _) => false,
+    };
+    let scheduler_ok = scheduler_files_ok && scheduler_runtime_ok;
     checks.push(JianlingDoctorCheck {
         component: "scheduler".to_string(),
         ok: scheduler_ok,
         status: if scheduler_ok {
             "enabled"
+        } else if scheduler_files_ok {
+            "unit_files_present_but_timer_not_active"
         } else {
             "not_enabled"
         }
         .to_string(),
-        detail: serde_json::json!({"state": scheduler}),
+        detail: serde_json::json!({"state": scheduler, "runtime": scheduler_runtime}),
     });
     checks.push(JianlingDoctorCheck {
         component: "last_run".to_string(),
@@ -796,6 +878,51 @@ pub fn jianling_chat_smoke(vault: &Path, profile: &str) -> Result<JianlingChatSm
     Ok(response)
 }
 
+pub fn jianling_worker(
+    vault: &Path,
+    options: &JianlingWorkerOptions,
+) -> Result<JianlingWorkerReport> {
+    let started_at = Utc::now();
+    let vault = vault
+        .canonicalize()
+        .with_context(|| format!("vault path not found: {}", vault.display()))?;
+    let profile = clean_profile(&options.profile)?;
+    let date = options
+        .date
+        .clone()
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+    let parsed_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+        .with_context(|| format!("invalid Jianling worker date: {date}"))?;
+    let modes = planned_modes_for_date(parsed_date);
+    let mut runs = Vec::new();
+    for mode in modes.iter().cloned() {
+        runs.push(jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: profile.clone(),
+                mode,
+                dry_run: false,
+                scheduled: true,
+                db: options.db.clone(),
+                date: Some(date.clone()),
+                max_source_files: options.max_source_files,
+            },
+        )?);
+    }
+    Ok(JianlingWorkerReport {
+        ok: true,
+        schema_version: "orderk.jianling.worker.v1".to_string(),
+        vault: vault.to_string_lossy().to_string(),
+        profile,
+        date,
+        started_at: started_at.to_rfc3339(),
+        finished_at: Utc::now().to_rfc3339(),
+        modes_planned: modes.iter().map(|mode| mode.as_str().to_string()).collect(),
+        runs,
+        status: "success".to_string(),
+    })
+}
+
 pub fn jianling_enable(
     vault: &Path,
     options: &JianlingEnableOptions,
@@ -806,30 +933,55 @@ pub fn jianling_enable(
     let profile = clean_profile(&options.profile)?;
     validate_schedule(&options.schedule)?;
     let root = control_root(&vault);
-    let systemd_dir = match &options.systemd_user_dir {
-        Some(path) => path.clone(),
-        None => home_dir()?.join(".config/systemd/user"),
-    };
+    let default_systemd_dir = systemd_user_home_dir()?.join(".config/systemd/user");
+    let systemd_dir = options
+        .systemd_user_dir
+        .clone()
+        .unwrap_or_else(|| default_systemd_dir.clone());
     let service_path = systemd_dir.join(format!("orderk-jianling@{profile}.service"));
     let timer_path = systemd_dir.join(format!("orderk-jianling@{profile}.timer"));
+    let env_path = if options.systemd_user_dir.is_some() {
+        root.join(format!("{profile}.env"))
+    } else {
+        systemd_user_home_dir()?
+            .join(".config/orderk")
+            .join(format!("{profile}.env"))
+    };
     let db = options
         .db
         .clone()
         .unwrap_or_else(|| vault.join(".obsidian/orderk/orderk.sqlite"));
     let service = render_systemd_service(&options.orderk_bin, &profile, &vault, &db);
     let timer = render_systemd_timer(&profile, &options.schedule, &options.timezone);
+    let env_file = render_orderk_profile_env(&profile)?;
     let written_files = vec![
         service_path.to_string_lossy().to_string(),
         timer_path.to_string_lossy().to_string(),
+        env_path.to_string_lossy().to_string(),
         root.join("scheduler.json").to_string_lossy().to_string(),
     ];
+    let timer_unit = format!("orderk-jianling@{profile}.timer");
+    let mut activation_status = if options.dry_run {
+        "dry_run".to_string()
+    } else if options.systemd_user_dir.is_some() {
+        "skipped_custom_systemd_dir".to_string()
+    } else {
+        "not_run".to_string()
+    };
+    let mut scheduler_runtime = None;
     if !options.dry_run {
         prepare_jianling_root(&vault, &root)?;
         prepare_child_dir(&systemd_dir, "systemd user unit")?;
+        prepare_child_dir(
+            env_path.parent().context("orderk profile env parent")?,
+            "orderk profile env",
+        )?;
         ensure_plain_output_file(&service_path, "jianling systemd service")?;
         fs::write(&service_path, service)?;
         ensure_plain_output_file(&timer_path, "jianling systemd timer")?;
         fs::write(&timer_path, timer)?;
+        ensure_plain_output_file(&env_path, "orderk profile env")?;
+        fs::write(&env_path, env_file)?;
         let state = JianlingSchedulerState {
             schema_version: "orderk.jianling.scheduler.v1".to_string(),
             profile: profile.clone(),
@@ -838,16 +990,36 @@ pub fn jianling_enable(
             timezone: options.timezone.clone(),
             service_path: service_path.to_string_lossy().to_string(),
             timer_path: timer_path.to_string_lossy().to_string(),
+            env_path: Some(env_path.to_string_lossy().to_string()),
             orderk_bin: options.orderk_bin.to_string_lossy().to_string(),
             vault: vault.to_string_lossy().to_string(),
             db: Some(db.to_string_lossy().to_string()),
         };
         let scheduler_path = root.join("scheduler.json");
         ensure_plain_output_file(&scheduler_path, "jianling scheduler state")?;
-        fs::write(scheduler_path, serde_json::to_string_pretty(&state)? + "\n")?;
+        fs::write(
+            &scheduler_path,
+            serde_json::to_string_pretty(&state)? + "\n",
+        )?;
+        if options.systemd_user_dir.is_none() {
+            import_systemd_user_environment(&profile)?;
+            run_systemctl_user(&["daemon-reload"])?;
+            run_systemctl_user(&["enable", "--now", &timer_unit])?;
+            scheduler_runtime = Some(inspect_systemd_timer(&profile));
+            let active = scheduler_runtime.as_ref().is_some_and(|runtime| {
+                runtime.error.is_none()
+                    && runtime.active_state.as_deref() == Some("active")
+                    && runtime.unit_file_state.as_deref() == Some("enabled")
+            });
+            if active {
+                activation_status = "enabled_active".to_string();
+            } else {
+                activation_status = "activation_unverified".to_string();
+            }
+        }
     }
     Ok(JianlingEnableReport {
-        ok: true,
+        ok: activation_status != "activation_unverified",
         schema_version: "orderk.jianling.enable.v1".to_string(),
         vault: vault.to_string_lossy().to_string(),
         profile,
@@ -856,8 +1028,11 @@ pub fn jianling_enable(
         timezone: options.timezone.clone(),
         service_path: service_path.to_string_lossy().to_string(),
         timer_path: timer_path.to_string_lossy().to_string(),
+        env_path: Some(env_path.to_string_lossy().to_string()),
         dry_run: options.dry_run,
         written_files,
+        activation_status,
+        scheduler_runtime,
     })
 }
 
@@ -1287,11 +1462,20 @@ struct JianlingChunkWriteReport {
     foreman_summary_path: PathBuf,
 }
 
-fn select_source_files(vault: &Path, max_source_files: usize) -> Result<JianlingSourceSelection> {
+fn select_source_files(
+    vault: &Path,
+    mode: &JianlingRunMode,
+    date: &str,
+    max_source_files: usize,
+) -> Result<JianlingSourceSelection> {
     let limit = max_source_files.max(1);
+    let (window_start, window_end) = source_window_for_mode(mode, date)?;
     let primary: Vec<crate::models::ScannedFile> = scan_vault(vault)?
         .into_iter()
-        .filter(|file| is_primary_jianling_source(&file.path))
+        .filter(|file| {
+            is_primary_jianling_source(&file.path)
+                && source_file_in_window(file, &window_start, &window_end)
+        })
         .collect();
     let total_files = primary.len();
     let mut selected = Vec::new();
@@ -1313,6 +1497,49 @@ fn select_source_files(vault: &Path, max_source_files: usize) -> Result<Jianling
 fn is_primary_jianling_source(path: &str) -> bool {
     (path.starts_with("raw/transcripts/") || path.starts_with("raw/articles/"))
         && !path.starts_with("raw/system-snapshots/")
+}
+
+fn source_window_for_mode(mode: &JianlingRunMode, date: &str) -> Result<(NaiveDate, NaiveDate)> {
+    let end = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .with_context(|| format!("parse Jianling date: {date}"))?;
+    let start = match mode {
+        JianlingRunMode::Daily | JianlingRunMode::Manual => end,
+        JianlingRunMode::Weekly => {
+            end - ChronoDuration::days(end.weekday().num_days_from_monday() as i64)
+        }
+        JianlingRunMode::Monthly => NaiveDate::from_ymd_opt(end.year(), end.month(), 1)
+            .ok_or_else(|| anyhow!("invalid Jianling monthly window for {date}"))?,
+        JianlingRunMode::Yearly => NaiveDate::from_ymd_opt(end.year(), 1, 1)
+            .ok_or_else(|| anyhow!("invalid Jianling yearly window for {date}"))?,
+    };
+    Ok((start, end))
+}
+
+fn source_file_in_window(
+    file: &crate::models::ScannedFile,
+    window_start: &NaiveDate,
+    window_end: &NaiveDate,
+) -> bool {
+    let Some(source_date) = transcript_path_date(&file.path).or_else(|| mtime_date(file.mtime))
+    else {
+        return false;
+    };
+    &source_date >= window_start && &source_date <= window_end
+}
+
+fn transcript_path_date(path: &str) -> Option<NaiveDate> {
+    let rest = path.strip_prefix("raw/transcripts/hermes-sessions/")?;
+    let mut parts = rest.split('/');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    NaiveDate::from_ymd_opt(year, month, day)
+}
+
+fn mtime_date(mtime: i64) -> Option<NaiveDate> {
+    Utc.timestamp_opt(mtime, 0)
+        .single()
+        .map(|dt| dt.date_naive())
 }
 
 fn target_rel_for_mode(mode: &JianlingRunMode, date: &str) -> String {
@@ -1467,6 +1694,27 @@ fn ensure_existing_generated_target_is_managed(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+fn render_run_log(report: &JianlingRunReport) -> String {
+    format!(
+        "run_id={}\nmode={}\nstatus={}\nscheduled={}\nscheduler_backend={}\nstarted_at={}\nfinished_at={}\nprovider_status={}\nbudget_status={}\nsource_files={}\nsource_total_files={}\nrejected_source_files={}\ngenerated_files={}\nreceipt_path={}\nevidence_pack_path={}\n",
+        report.run_id,
+        report.mode,
+        report.status,
+        report.scheduled,
+        report.scheduler_backend,
+        report.started_at,
+        report.finished_at,
+        report.provider_status,
+        report.budget_status,
+        report.source_files,
+        report.source_total_files,
+        report.rejected_source_files.len(),
+        report.generated_files.join(","),
+        report.receipt_path,
+        report.evidence_pack_path
+    )
+}
+
 fn write_watermark(
     path: &Path,
     profile: &str,
@@ -1537,7 +1785,9 @@ fn read_scheduler_state(root: &Path, profile: &str) -> Result<Option<JianlingSch
 
 fn render_systemd_service(orderk_bin: &Path, profile: &str, vault: &Path, db: &Path) -> String {
     format!(
-        "# Managed by orderk jianling; do not hand-edit\n[Unit]\nDescription=OrderK Jianling nightly Markdown memory compiler (%i)\n\n[Service]\nType=oneshot\nExecStart={} jianling run --profile {} --scheduled --vault {} --db {}\n",
+        "# Managed by orderk jianling; do not hand-edit\n[Unit]\nDescription=OrderK Jianling nightly Markdown memory compiler (%i)\n\n[Service]\nType=oneshot\nWorkingDirectory={}\nEnvironmentFile=-%h/.config/orderk/{}.env\nExecStart={} jianling worker --once --profile {} --vault {} --db {}\n",
+        systemd_path(vault),
+        profile,
         systemd_quote(orderk_bin),
         profile,
         systemd_quote(vault),
@@ -1547,8 +1797,235 @@ fn render_systemd_service(orderk_bin: &Path, profile: &str, vault: &Path, db: &P
 
 fn render_systemd_timer(profile: &str, schedule: &str, timezone: &str) -> String {
     format!(
-        "# Managed by orderk jianling; do not hand-edit\n[Unit]\nDescription=OrderK Jianling nightly timer ({profile})\n\n[Timer]\nOnCalendar=*-*-* {schedule}:00\nTimezone={timezone}\nPersistent=true\nUnit=orderk-jianling@{profile}.service\n\n[Install]\nWantedBy=timers.target\n"
+        "# Managed by orderk jianling; do not hand-edit\n# Requested timezone: {timezone}; backend: system-local if this systemd build lacks Timer/Timezone.\n[Unit]\nDescription=OrderK Jianling nightly timer ({profile})\n\n[Timer]\nOnCalendar=*-*-* {schedule}:00\nPersistent=true\nRandomizedDelaySec=300\nUnit=orderk-jianling@{profile}.service\n\n[Install]\nWantedBy=timers.target\n"
     )
+}
+
+fn planned_modes_for_date(date: NaiveDate) -> Vec<JianlingRunMode> {
+    let mut modes = vec![JianlingRunMode::Daily];
+    if date.weekday().num_days_from_monday() == 6 {
+        modes.push(JianlingRunMode::Weekly);
+    }
+    if date.day() == 1 {
+        modes.push(JianlingRunMode::Monthly);
+    }
+    if date.month() == 1 && date.day() == 1 {
+        modes.push(JianlingRunMode::Yearly);
+    }
+    modes
+}
+
+fn render_orderk_profile_env(profile: &str) -> Result<String> {
+    let slot = resolve_sword_model_profile_from_env()?.llm;
+    let mut lines = vec![
+        "# Managed by orderk jianling; do not hand-edit".to_string(),
+        format!(
+            "ORDERK_SWORD_LLM_PROVIDER={}",
+            shell_env_value(&slot.provider)
+        ),
+        format!("ORDERK_SWORD_LLM_MODEL={}", shell_env_value(&slot.model)),
+    ];
+    if let Some(base_url) = slot
+        .base_url
+        .as_ref()
+        .or(Some(&DEFAULT_ANTHROPIC_MINIMAX_BASE_URL.to_string()))
+    {
+        lines.push(format!(
+            "ORDERK_SWORD_LLM_BASE_URL={}",
+            shell_env_value(base_url)
+        ));
+    }
+    let api_key_env = slot
+        .api_key_env
+        .clone()
+        .or_else(|| std::env::var("ORDERK_SWORD_LLM_API_KEY_ENV").ok())
+        .filter(|value| !value.trim().is_empty());
+    if let Some(api_key_env) = api_key_env {
+        lines.push(format!(
+            "ORDERK_SWORD_LLM_API_KEY_ENV={}",
+            shell_env_value(&api_key_env)
+        ));
+    }
+    for key in [
+        "ORDERK_JIANLING_LLM_ENABLED",
+        &format!(
+            "ORDERK_JIANLING_LLM_ENABLED_{}",
+            env_profile_suffix(profile)
+        ),
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            lines.push(format!("{key}={}", shell_env_value(&value)));
+        }
+    }
+    lines.push(String::new());
+    Ok(lines.join("\n"))
+}
+
+fn shell_env_value(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '+'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn env_profile_suffix(profile: &str) -> String {
+    profile
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn inspect_scheduler_runtime_if_managed(
+    state: &JianlingSchedulerState,
+) -> Result<Option<JianlingSystemdRuntime>> {
+    if is_default_systemd_state(state) {
+        Ok(Some(inspect_systemd_timer(&state.profile)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_default_systemd_state(state: &JianlingSchedulerState) -> bool {
+    systemd_user_home_dir()
+        .map(|home| {
+            state.timer_path.starts_with(
+                &home
+                    .join(".config/systemd/user")
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn inspect_systemd_timer(profile: &str) -> JianlingSystemdRuntime {
+    let timer_unit = format!("orderk-jianling@{profile}.timer");
+    match run_systemctl_user(&[
+        "show",
+        &timer_unit,
+        "--property=ActiveState,SubState,UnitFileState,NextElapseUSecRealtime,LastTriggerUSecRealtime",
+        "--no-pager",
+    ]) {
+        Ok(output) => {
+            let mut map = BTreeMap::new();
+            for line in output.lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    if !value.is_empty() {
+                        map.insert(key.to_string(), value.to_string());
+                    }
+                }
+            }
+            JianlingSystemdRuntime {
+                timer_unit,
+                checked: true,
+                active_state: map.get("ActiveState").cloned(),
+                sub_state: map.get("SubState").cloned(),
+                unit_file_state: map.get("UnitFileState").cloned(),
+                next_elapse: map.get("NextElapseUSecRealtime").cloned(),
+                last_trigger: map.get("LastTriggerUSecRealtime").cloned(),
+                error: None,
+            }
+        }
+        Err(err) => JianlingSystemdRuntime {
+            timer_unit,
+            checked: true,
+            active_state: None,
+            sub_state: None,
+            unit_file_state: None,
+            next_elapse: None,
+            last_trigger: None,
+            error: Some(compact_one_line(&err.to_string())),
+        },
+    }
+}
+
+fn import_systemd_user_environment(profile: &str) -> Result<()> {
+    let mut names = vec![
+        "ORDERK_SWORD_LLM_PROVIDER".to_string(),
+        "ORDERK_SWORD_LLM_MODEL".to_string(),
+        "ORDERK_SWORD_LLM_BASE_URL".to_string(),
+        "ORDERK_SWORD_LLM_API_KEY_ENV".to_string(),
+        "ORDERK_JIANLING_LLM_ENABLED".to_string(),
+        format!(
+            "ORDERK_JIANLING_LLM_ENABLED_{}",
+            env_profile_suffix(profile)
+        ),
+        "HERMES_MINIMAX_API_KEY".to_string(),
+        "ORDERK_SWORD_LLM_MINIMAX_API_KEY".to_string(),
+        "ORDERK_SWORD_LLM_API_KEY".to_string(),
+        "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY".to_string(),
+    ];
+    names.sort();
+    names.dedup();
+    let present: Vec<String> = names
+        .into_iter()
+        .filter(|name| std::env::var(name).is_ok())
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["import-environment"];
+    for name in &present {
+        args.push(name.as_str());
+    }
+    run_systemctl_user(&args).map(|_| ())
+}
+
+fn run_systemctl_user(args: &[&str]) -> Result<String> {
+    let mut command = Command::new("systemctl");
+    command.arg("--user");
+    command.args(args);
+    apply_systemd_runtime_env(&mut command);
+    let output = command
+        .output()
+        .with_context(|| format!("run systemctl --user {}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(anyhow!(
+            "systemctl --user {} failed: {}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim(),
+            if output.stdout.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; stdout={}",
+                    String::from_utf8_lossy(&output.stdout).trim()
+                )
+            }
+        ))
+    }
+}
+
+fn apply_systemd_runtime_env(command: &mut Command) {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_some() {
+        return;
+    }
+    if let Some(uid) = current_uid_string() {
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        if runtime.is_dir() {
+            command.env("XDG_RUNTIME_DIR", runtime);
+        }
+    }
+}
+
+fn current_uid_string() -> Option<String> {
+    let output = Command::new("id").arg("-u").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn validate_schedule(schedule: &str) -> Result<()> {
@@ -1567,6 +2044,10 @@ fn validate_schedule(schedule: &str) -> Result<()> {
 fn systemd_quote(path: &Path) -> String {
     let s = path.to_string_lossy().replace('"', "\\\"");
     format!("\"{s}\"")
+}
+
+fn systemd_path(path: &Path) -> String {
+    path.to_string_lossy().to_string()
 }
 
 fn control_root(vault: &Path) -> PathBuf {
@@ -1783,6 +2264,24 @@ fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("HOME is not set; pass --systemd-dir"))
 }
 
+fn systemd_user_home_dir() -> Result<PathBuf> {
+    if let Ok(user) = std::env::var("USER") {
+        if let Ok(output) = Command::new("getent").arg("passwd").arg(&user).output() {
+            if output.status.success() {
+                let raw = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = raw.lines().next() {
+                    if let Some(home) = line.split(':').nth(5) {
+                        if !home.is_empty() {
+                            return Ok(PathBuf::from(home));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    home_dir()
+}
+
 fn file_hash_if_exists(path: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
@@ -1903,23 +2402,30 @@ fn jianling_live_llm_enabled(profile: &str) -> bool {
     })
 }
 
-fn generate_live_llm_reflection(
-    mode: &JianlingRunMode,
-    date: &str,
-    run_id: &str,
-    anchors: &[JianlingSourceAnchor],
-    sources: &[EvidenceSource],
+struct LiveReflectionInput<'a> {
+    profile: &'a str,
+    mode: &'a JianlingRunMode,
+    date: &'a str,
+    run_id: &'a str,
+    anchors: &'a [JianlingSourceAnchor],
+    sources: &'a [EvidenceSource],
     source_total_files: usize,
-    rejected_source_files: &[String],
-) -> Result<Option<String>> {
+    rejected_source_files: &'a [String],
+}
+
+fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option<String>> {
+    if !jianling_live_llm_enabled(input.profile) {
+        return Ok(None);
+    }
     let slot = resolve_sword_model_profile_from_env()?.llm;
     if slot.provider == "disabled" || !slot.api_key_configured {
         return Ok(None);
     }
     let mut client = AnthropicCompatibleChatClient::from_slot(&slot)?;
-    let evidence = sources
+    let evidence = input
+        .sources
         .iter()
-        .zip(anchors.iter())
+        .zip(input.anchors.iter())
         .take(12)
         .map(|(source, anchor)| {
             format!(
@@ -1933,10 +2439,13 @@ fn generate_live_llm_reflection(
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
-        "你是 OrderK Jianling V4 睡后反思者。只根据证据写一段可落入 Obsidian 的中文反思。\n\n约束：\n- 不要编造证据外事实。\n- 每条结论尽量引用 [S1] 这种 source anchor。\n- 识别今日/本周/本月的主线、风险、下一步。\n- 返回 Markdown 列表，不要代码块，不要泄露凭证。\n\nrun_id={run_id}\nmode={}\ndate={date}\nsource_total_files={source_total_files}\nselected_sources={}\nrejected_sources={}\n证据：\n{evidence}",
-        mode.as_str(),
-        sources.len(),
-        rejected_source_files.len()
+        "你是 OrderK Jianling V4 睡后反思者。只根据证据写一段可落入 Obsidian 的中文反思。\n\n约束：\n- 不要编造证据外事实。\n- 每条结论尽量引用 [S1] 这种 source anchor。\n- 识别今日/本周/本月的主线、风险、下一步。\n- 返回 Markdown 列表，不要代码块，不要泄露凭证。\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\n证据：\n{evidence}",
+        input.run_id,
+        input.mode.as_str(),
+        input.date,
+        input.source_total_files,
+        input.sources.len(),
+        input.rejected_source_files.len()
     );
     let text = client.send_prompt(&prompt)?;
     Ok(Some(text.trim().to_string()))

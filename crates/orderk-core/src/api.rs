@@ -70,6 +70,37 @@ pub fn index_vault_with_options(
     })
 }
 
+pub fn index_paths_with_options(
+    vault: &Path,
+    db_path: &Path,
+    provider: &dyn EmbeddingProvider,
+    embedding_dim: usize,
+    embedding_model: &str,
+    vector_backend: VectorBackend,
+    options: &IndexPathOptions,
+) -> Result<IndexSummary> {
+    let mut store = IndexStore::open(
+        db_path,
+        embedding_dim,
+        embedding_model,
+        &vector_backend,
+        vault,
+    )?;
+    let summary = IndexStore::index_paths_with_options(
+        &mut store.conn,
+        vault,
+        provider,
+        embedding_dim,
+        embedding_model,
+        &vector_backend,
+        options,
+    )?;
+    Ok(IndexSummary {
+        db: db_path.to_string_lossy().to_string(),
+        ..summary
+    })
+}
+
 pub fn query(
     db_path: &Path,
     query: &str,

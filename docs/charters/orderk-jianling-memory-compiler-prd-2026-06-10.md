@@ -1,6 +1,6 @@
 # OrderK V4 Jianling / Sword Spirit PRD — Built-in Sleep Reflection & Markdown Memory Compiler
 
-> Status: **V4 P0/P1 implemented in `orderk-cli@0.1.19`: deterministic Markdown compiler, receipts/validators/scheduler, profile-wide run lock, self-check/chat-smoke, and live MiniMax M3 reflection behind an explicit hot switch. Full autonomous promotion/index-feedback phases remain gated.**
+> Status: **V4 P0/P1 production launch on `orderk-cli@0.1.21` release: deterministic Markdown compiler, receipts/validators, OrderK-managed `systemd --user` timer, `jianling worker --once` planner, profile-wide run lock, self-check/chat-smoke, persistent run logs, live MiniMax M3 reflection behind an explicit hot switch, and verified single-file `orderk index --path` feedback for generated Markdown. Full autonomous card/proposal UX remains gated.**
 > Date: 2026-06-10
 > Owner intent: 茶老板提出“剑灵是睡后反思者”，不是外部 Hermes/agent cron，而是 OrderK 自身安装后、配置 LLM 后无感运转的内嵌夜间记忆整理机制。
 > Naming note: The new Jianling / Sword Spirit product generation is **OrderK V4**. V4 is built after the current V3 baseline, but it is not a patch label for V3. The old V3 release line must be archived clearly in npm, GitHub Releases, CHANGELOG, and repo docs before V4 changes the product boundary. Old `orderk-v2-sword-spirit-prd.md` remains historical and is not the active V4 design source.
@@ -9,7 +9,7 @@
 
 ## 1. 一句话定义
 
-**OrderK Jianling 是 OrderK 内置的“睡后反思者”：它在夜间读取当天新增的原始 session / Markdown 事件，用 OrderK 自己的检索与 reranker 找回相关旧知识，再调用配置好的 LLM，把当天经验沉淀成可读、可审计、可 Git 管理的 Markdown；这些新 Markdown 随后被 OrderK 重新索引，形成向量与 reranker 更准的正反馈。**
+**OrderK Jianling 是 OrderK 内置的“睡后反思者”：它在夜间读取当天新增的原始 session / Markdown 事件，用 OrderK 自己的源选择和后续检索上下文，把当天经验沉淀成可读、可审计、可 Git 管理的 Markdown。P0/P1 的正式成功条件是 Markdown、receipt、evidence、log 和 scheduler 全部可验；这些新 Markdown 的实时/单文件增量索引反馈是后续 gated 阶段，不能在 full sync 或增量索引未验证时宣称已闭环。**
 
 费曼比喻：白天 OrderK 像图书管理员，帮你快速找书；晚上 Jianling 像闭馆后的馆员，把白天散落的纸条整理成日记、经验卡、决策卡、技能卡和概念页。第二天再搜索时，图书馆不是只多了一堆纸，而是真的多了整理好的书架。
 
@@ -54,12 +54,12 @@ V3 archive gate before V4 boundary change:
 
 ### 2.2 Boundary transition / active docs state
 
-This PRD records the V4 product-boundary change. The `0.1.19` implementation promotes the P0/P1 Jianling slice: `orderk jianling` exists as an explicit Markdown compiler sidecar with deterministic digest generation, managed systemd-user timer files, receipts/evidence packs, validators, safety gates, profile-wide locks, self-check/chat-smoke, and a live Anthropic-compatible MiniMax M3 reflection slot. The search/MCP query path remains read-only; live reflection is **not implicit** and only runs when an explicit Jianling LLM enable switch is set.
+This PRD records the V4 product-boundary change. The `0.1.21` release promotes the P0/P1 Jianling slice: `orderk jianling` exists as an explicit Markdown compiler sidecar with deterministic digest generation, an OrderK-managed active `systemd --user` timer, `jianling worker --once` calendar planner, receipts/evidence packs, validators, safety gates, profile-wide locks, persistent run logs, self-check/chat-smoke, a live Anthropic-compatible MiniMax M3 reflection slot, and verified single-file `orderk index --path` feedback for generated Markdown. The search/MCP query path remains read-only; live reflection is **not implicit** and only runs when an explicit Jianling LLM enable switch is set.
 
 Promotion rule:
 
 1. Old `orderk-v2-sword-spirit-prd.md` remains historical and must not be used as the active design source.
-2. `0.1.19` user-facing docs may say “OrderK has Jianling V4 P0/P1” for deterministic digest/scheduler/receipt/validator/self-check plus the live MiniMax M3 reflection slot behind `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]`.
+2. `0.1.21` user-facing docs may say “OrderK has Jianling V4 P0/P1 production scheduler” for deterministic digest/scheduler/receipt/validator/self-check/logs plus the live MiniMax M3 reflection slot behind `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]`.
 3. User-facing docs must not claim always-on autonomous LLM reflection: `jianling run` calls LLM only when the explicit hot switch is enabled, and `chat-smoke` is the separate live connectivity command.
 4. Search/MCP docs must continue to state the query path is read-only; Jianling write behavior is explicit and separate.
 
@@ -90,19 +90,23 @@ This update records the hard lessons from the V4 implementation drill. It is par
 | Is the current LLM MiniMax M3? | The default live slot is `anthropic:MiniMax-M3:<profile_fingerprint>`. Live smoke and live run receipts must show model/profile fingerprint without exposing API key values. |
 | Has a 2026-06-01..2026-06-10 drill run? | Yes, local acceptance evidence ran 10 daily runs plus one weekly run on 2026-06-07 and one monthly run on 2026-06-10. All 12 receipts used `provider_status=called_live`, passed `validate-run`, wrote weekly/monthly to PRD paths, and exercised Kanban writer/auditor/foreman + explicit partial behavior. |
 
-Implementation evidence captured in this repo update:
+Implementation evidence captured in this repo update and the 2026-06-11 production launch:
 
-- `/home/agent/.local/bin/orderk --version` was upgraded from `0.1.17` to `0.1.19` after `cargo install --path crates/orderk-cli --root /home/agent/.local --force`.
-- Live `orderk jianling chat-smoke` with `ORDERK_SWORD_LLM_API_KEY_ENV=HERMES_MINIMAX_API_KEY` returned `ok=true`, `status=connected`, `model=MiniMax-M3` and wrote a smoke receipt.
-- Live `/home/agent/.local/bin/orderk jianling run --mode daily --date 2026-06-10` with `ORDERK_JIANLING_LLM_ENABLED_FINALBIN=1` returned `provider_status=called_live`, generated a daily Markdown file containing `## LLM 反思`, and passed `jianling validate-run`.
-- The 2026-06-01..2026-06-10 gated drill returned `ok=true`, `runs=12`, `daily_runs=10`, `weekly_runs=1`, `monthly_runs=1`, `multi_chunk_runs=6`, `partial_runs=3`, `total_writer_cards=18`, `total_auditor_cards=18`; weekly output path was `brain/weekly/2026-06-07.md`, monthly output path was `brain/monthly/2026-06-10.md`. Every non-empty run emitted `writer-*.json`, `auditor-*.json`, and `foreman-manifest.json`; final Markdown was written only after foreman acceptance with `format_standard`, `traceability`, `draft_hash`, and `controls_final_write` checks passing.
-- Quality gates passed after the update: `git diff --check`, `cargo fmt --check`, `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, plus focused `cargo test -p orderk-core --test jianling_contract`.
+- `/home/agent/.local/bin/orderk --version` and repo `target/release/orderk --version` both report `0.1.21`; stale in-memory MCP binaries must be restarted after deploy.
+- Live `orderk jianling chat-smoke` with `ORDERK_SWORD_LLM_API_KEY_ENV` pointing at the MiniMax key env returned `ok=true`, `status=connected`, `provider=anthropic`, `model=MiniMax-M3` and wrote a smoke receipt.
+- `orderk jianling enable --vault /home/agent/obsidian-vault --profile default --schedule 03:30 --timezone Asia/Shanghai --db /home/agent/obsidian-vault/.obsidian/orderk/orderk-clean.sqlite --orderk-bin /home/agent/.local/bin/orderk` wrote `/home/agent/.config/systemd/user/orderk-jianling@default.{service,timer}`, `/home/agent/.config/orderk/default.env`, and `.orderk/jianling/scheduler.json`.
+- Live `systemd --user` state: `orderk-jianling@default.timer` is `enabled`, `active (waiting)`, next run `Fri 2026-06-12 03:34:04 CST`; `systemd-analyze --user verify` exits 0.
+- Manual production entrypoint verification used `systemctl --user start orderk-jianling@default.service`; it ran `/home/agent/.local/bin/orderk jianling worker --once ...`, produced scheduled run `jianling-20260611T115446Z-2588643`, `provider_status=called_live`, generated `brain/daily/2026-06-11.md`, and wrote receipt/evidence/log under `.orderk/jianling/`.
+- `orderk jianling doctor` is `ok=true`; `orderk jianling validate-run --run-id jianling-20260611T115446Z-2588643` is `ok=true`; `orderk jianling chat-smoke` is `ok=true`, `status=connected`, `model=MiniMax-M3`.
+- Quality gates passed after the launch fix: `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, focused `cargo test -p orderk-core --test jianling_contract` (19 tests), profile slot regression tests (8 tests), incremental `index --path` regression, and `cargo build --release --locked`.
+- The generated daily Markdown was indexed without full rebuild using `orderk index --path brain/daily/2026-06-11.md`; the summary was `ok=true`, `files=1`, `added=1`, `deleted=0`, `chunks=7`, `embedded=7`, embedding profile `siliconflow:Qwen/Qwen3-Embedding-4B`. `orderk search --query jianling-20260611T115446Z-2588643 --view index --reranker none` returned `brain/daily/2026-06-11.md` in top results, proving the generated run is searchable through the active OrderK DB.
+- The 2026-06-01..2026-06-10 gated drill returned `ok=true`, `runs=12`, `daily_runs=10`, `weekly_runs=1`, `monthly_runs=1`, `multi_chunk_runs=6`, `partial_runs=3`, `total_writer_cards=18`, `total_auditor_cards=18`; weekly output path was `brain/weekly/2026-06-07.md`, monthly output path was `brain/monthly/2026-06-10.md`. Every non-empty run emitted `writer-*.json`, `auditor-*.json`, and `foreman-manifest.json`; final Markdown was written only after foreman acceptance.
 
 Open boundaries that are **not** silently claimed by this update:
 
 - The implemented live reflection writes a bounded LLM reflection section into generated Markdown; full structured card extraction, proposal apply/revert UX, and claim-level `explain` remain later gates.
 - Query-time search remains LLM=0 by default.
-- Whole-vault targeted reindex feedback is still a release/eval gate unless a future implementation proves it with retrieval smoke.
+- Whole-vault automatic reindex policy remains a later release/eval gate; P0/P1 currently proves the safer bounded path: explicit single-file `orderk index --path <generated.md>` plus retrieval smoke. Nightly worker generation and index feedback are separate steps unless future scheduler code wires them together with the same validator gates.
 
 ---
 
@@ -119,8 +123,8 @@ Open boundaries that are **not** silently claimed by this update:
 3. **睡后反思，不阻塞白天搜索**
    默认 search/query path 不调用 LLM 反思；Jianling 在夜间或用户手动 `orderk jianling run` 时运行。
 
-4. **正反馈闭环**
-   `raw session -> Jianling digest/reflection md -> orderk incremental index -> future search/rerank better -> next Jianling has better context`。
+4. **正反馈闭环（P0/P1 bounded path, P2 automation gate）**
+   `raw session -> Jianling digest/reflection md -> orderk index --path generated.md -> retrieval smoke -> future search/rerank better -> next Jianling has better context`。P0/P1 已验证单文件增量索引和检索回查；自动 nightly index wiring、全库策略、以及更强的 context-feedback planner 仍是后续门禁。
 
 5. **主动但克制**
    只沉淀高价值经验；普通闲聊、一次性进度、状态废话、无复用价值材料不写入长期层。
@@ -265,8 +269,10 @@ OrderK should support two scheduling backends behind the same product surface:
 Both modes run the same command equivalent:
 
 ```bash
-orderk jianling run --profile <profile> --scheduled
+orderk jianling worker --once --profile <profile> --scheduled-equivalent
 ```
+
+`worker --once` is the OrderK-owned one-shot scheduler worker. It plans daily every run, weekly on Sunday, monthly on day 1, and yearly on Jan 1, then serializes those modes through the same profile-wide lock and `jianling run` receipt path.
 
 ### 6.3 Linux P0 scheduler spec
 
@@ -284,7 +290,7 @@ Service contract:
 ```ini
 [Service]
 Type=oneshot
-ExecStart=<absolute-orderk-bin> jianling run --profile <profile> --scheduled --vault <absolute-vault> --db <absolute-db>
+ExecStart=<absolute-orderk-bin> jianling worker --once --profile <profile> --vault <absolute-vault> --db <absolute-db>
 EnvironmentFile=%h/.config/orderk/<profile>.env
 WorkingDirectory=<absolute-vault>
 ```
@@ -1085,10 +1091,10 @@ If indexing fails, generated Markdown remains a generated artifact on disk, but 
 
 MVP index integration contract:
 
-- P0/P1 may reuse existing whole-vault hash-based indexing instead of a targeted `index --paths` implementation.
+- P0/P1 implements the safer bounded path `orderk index --path <vault-relative.md>` for generated Markdown; full-vault hash-based indexing remains available for maintenance/rebuilds but is not required for Jianling launch smoke.
 - Scheduled runs must pass explicit `--vault` and `--db` from config; cwd must not decide the active vault.
 - Receipt records embedding profile fingerprint, chunk options, index command/method, files_seen, files_changed, chunks_changed, and index duration.
-- Future optimization may add targeted single-file indexing, but it must preserve the same receipt schema.
+- Future optimization may wire this bounded indexing step into the nightly worker, but it must preserve the same receipt schema and retrieval-smoke gate.
 - Smoke query: search for `{date + top topic + generated title}` and require the generated daily digest or reflection in top 5; otherwise mark `index_smoke_status=failed`.
 
 Feedback-to-second-brain contract:

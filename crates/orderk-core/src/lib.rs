@@ -26,9 +26,9 @@ pub use adapters::{
     AdapterScanReport, AdapterTag,
 };
 pub use api::{
-    feedback, get_chunks, index_vault, index_vault_with_options, init, optimize_apply,
-    optimize_dry_run, optimize_reset, optimize_set, optimize_status, provider_from_env,
-    provider_from_name, query, query_with_filter, query_with_options, status,
+    feedback, get_chunks, index_paths_with_options, index_vault, index_vault_with_options, init,
+    optimize_apply, optimize_dry_run, optimize_reset, optimize_set, optimize_status,
+    provider_from_env, provider_from_name, query, query_with_filter, query_with_options, status,
 };
 pub use capsule::{export_capsule_manifest, inspect_capsule_manifest, write_capsule_manifest};
 pub use digest::{digest_vault, DigestOptions, DigestReport, DigestState};
@@ -44,10 +44,11 @@ pub use health::{classify_error_message, health_report};
 pub use jianling::{
     jianling_chat_smoke, jianling_disable, jianling_doctor, jianling_enable, jianling_run,
     jianling_status, jianling_validate_file, jianling_validate_run, jianling_validate_templates,
-    JianlingChatSmokeResponse, JianlingDisableReport, JianlingDoctorCheck, JianlingDoctorResponse,
-    JianlingEnableOptions, JianlingEnableReport, JianlingFileOp, JianlingRunMode,
-    JianlingRunOptions, JianlingRunReport, JianlingSourceAnchor, JianlingStatusResponse,
-    JianlingSuccessPredicate, JianlingValidateFileOptions, JianlingValidationResponse,
+    jianling_worker, JianlingChatSmokeResponse, JianlingDisableReport, JianlingDoctorCheck,
+    JianlingDoctorResponse, JianlingEnableOptions, JianlingEnableReport, JianlingFileOp,
+    JianlingRunMode, JianlingRunOptions, JianlingRunReport, JianlingSourceAnchor,
+    JianlingStatusResponse, JianlingSuccessPredicate, JianlingValidateFileOptions,
+    JianlingValidationResponse, JianlingWorkerOptions, JianlingWorkerReport,
 };
 pub use models::*;
 pub use profiles::{

@@ -117,6 +117,13 @@ pub fn default_chunk_max_chars() -> usize {
     1200
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexPathOptions {
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub index: IndexOptions,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSummary {
     pub ok: bool,

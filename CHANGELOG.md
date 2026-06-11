@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-06-11
+
+### Added
+- Promote Jianling V4 production scheduling with `jianling worker --once`, OrderK-owned systemd-user status/doctor evidence, persistent run logs, and bounded `orderk index --path` feedback for generated Markdown.
+
+### Fixed
+- Prevent custom-systemd-dir tests from overwriting the production OrderK env file.
+- Treat `ORDERK_SWORD_LLM_API_KEY_ENV` strictly as a key-env pointer, never as a direct API key value.
+- Harden Jianling launch evidence so generated Markdown searchability is only claimed after single-file index plus retrieval smoke.
+
+### Verification
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test -p orderk-core --test jianling_contract`, profile slot regressions, incremental `index --path` regression, and `cargo build --release --locked` passed locally. Live systemd-user production smoke generated `brain/daily/2026-06-11.md`, called MiniMax M3, validated the run, indexed the generated Markdown, and found it via `orderk search --reranker none`.
+
 ## [0.1.20] - 2026-06-11
 
 ### Added
@@ -214,7 +227,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/bsbofmusic/orderk/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/bsbofmusic/orderk/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/bsbofmusic/orderk/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/bsbofmusic/orderk/compare/v0.1.17...v0.1.18
