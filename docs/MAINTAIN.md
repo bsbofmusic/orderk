@@ -3,7 +3,7 @@
 orderk is a headless retrieval blade plus an opt-in Jianling Markdown compiler, not a chat brain. The maintenance loop is intentionally mechanical:
 
 ```text
-open -> health/doctor -> index/search only when profile is valid -> emit JSON evidence -> run fixture gates before release
+open -> health/doctor -> index/search only when profile is valid -> emit JSON evidence -> run fixture gates before release -> distill any hard lesson into PRD/skill/Obsidian/test gate
 ```
 
 ## Product weapons
@@ -12,6 +12,24 @@ open -> health/doctor -> index/search only when profile is valid -> emit JSON ev
 - **Musk — first principles:** retrieval quality must be measured by index freshness, profile validity, vector backend health, and deterministic eval results, not by vibes.
 - **Naval — leverage:** every failure should become a reusable gate, report, or troubleshooting entry so the agent does not pay the same debugging cost twice.
 - **Karpathy — keep the loop tight:** small changes, regression tests, no hidden assumptions, no unverified completion.
+
+## Reflective action loop
+
+Use this loop after any non-trivial maintenance, production launch, release, or “满血全开” audit:
+
+```text
+live state -> diagnose -> fix/gate -> real smoke -> bounded index/search feedback -> distill lesson -> route docs -> verify docs
+```
+
+Routing rules:
+
+- Product boundary / acceptance semantics belong in PRD or charter docs.
+- Repeatable commands and pitfalls belong in the relevant skill.
+- Long run IDs, exact historical evidence, and session notes belong in skill references or Obsidian system notes.
+- User-facing second-brain truth belongs in Obsidian Markdown, then should be indexed through OrderK.
+- Mechanical recurrence prevention belongs in tests, release gates, doctor/status/chat-smoke, or a smoke probe.
+
+Do not treat “fixed once” as complete if the same mistake can be avoided by a small reusable gate or route update.
 
 ## Commands
 
@@ -29,7 +47,7 @@ orderk doctor \
   --vault /path/to/vault \
   --smoke-query "known phrase" \
   --embedding-provider siliconflow \
-  --embedding-model BAAI/bge-m3 \
+  --embedding-model Qwen/Qwen3-Embedding-4B \
   --embedding-dim 1024 \
   --vector-backend sqlite_vec
 ```
@@ -47,7 +65,7 @@ orderk maintain \
   --limit 10 \
   --report-dir /path/to/reports \
   --embedding-provider siliconflow \
-  --embedding-model BAAI/bge-m3 \
+  --embedding-model Qwen/Qwen3-Embedding-4B \
   --embedding-dim 1024 \
   --vector-backend sqlite_vec
 ```
@@ -123,7 +141,7 @@ For MCP-capable clients, run a thin stdio server:
 orderk mcp \
   --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
   --embedding-provider siliconflow \
-  --embedding-model BAAI/bge-m3 \
+  --embedding-model Qwen/Qwen3-Embedding-4B \
   --embedding-dim 1024 \
   --vector-backend sqlite_vec
 ```
@@ -179,7 +197,7 @@ It emits `orderk.release_gate.v1` JSON and fails on the first broken gate.
 
 ## Maintenance policy
 
-- Production defaults stay `siliconflow + BAAI/bge-m3 + 1024 + sqlite_vec`.
+- Production defaults stay `siliconflow + Qwen/Qwen3-Embedding-4B + 1024 + sqlite_vec`, with `Qwen/Qwen3-Reranker-4B` default-on for model reranking unless `--reranker none` is explicitly selected for tests/migrations.
 - Mock embeddings are only for tests/offline smoke paths or explicit user flags.
 - Profile mismatches are hard failures, not silent fallbacks.
 - Feedback is recorded as evidence and future interface; v1 ranking does not consume feedback.

@@ -21,6 +21,9 @@ orderk is a scanner with a fault ticket printer:
 | Obsidian plugin cannot run | Native CLI is missing | Set plugin binary path or `ORDERK_BIN` | `Orderk: Health Check` in Obsidian |
 | npm package installed but CLI missing | Wrapper cannot resolve native binary | Check `ORDERK_BIN`, the npm vendor binary, GitHub release asset, or `orderk` on `PATH` | `orderk --version` |
 | Startup indexing did not run | `indexOnStartup` disabled or vault path missing | Enable plugin setting and set vault path | Obsidian notice + `orderk status` |
+| OrderK CLI is updated but MCP tools still behave like the old version | Existing `orderk mcp` process holds `/home/agent/.local/bin/orderk (deleted)` after binary replacement | Kill the stale MCP process and let the wrapper respawn, then re-run MCP status/health/search | `readlink /proc/<pid>/exe` is not `(deleted)` and `mcp_orderk_status/health/search` work |
+| Jianling config looks right but live reflection is not called | Explicit hot switch is off or key-env pointer is unresolved | Set `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]=1`; ensure `ORDERK_SWORD_LLM_API_KEY_ENV` points to the real key env, not a raw secret | `orderk jianling chat-smoke` and latest receipt show `provider_status=called_live` |
+| Generated Jianling Markdown exists but search cannot find it | The generated file was not fed back into the active index | Run bounded `orderk index --path <generated.md>` against the active clean DB | `orderk search --query <run-id-or-title> --view index` returns the generated file |
 
 ## Evidence-first commands
 
@@ -32,7 +35,7 @@ orderk doctor \
   --vault /path/to/vault \
   --smoke-query "known phrase" \
   --embedding-provider siliconflow \
-  --embedding-model BAAI/bge-m3 \
+  --embedding-model Qwen/Qwen3-Embedding-4B \
   --embedding-dim 1024
 
 orderk maintain \
@@ -43,7 +46,7 @@ orderk maintain \
   --limit 10 \
   --report-dir /tmp/orderk-reports \
   --embedding-provider siliconflow \
-  --embedding-model BAAI/bge-m3 \
+  --embedding-model Qwen/Qwen3-Embedding-4B \
   --embedding-dim 1024
 ```
 

@@ -16,6 +16,28 @@ It now also exposes explicit health and evaluation contracts:
 - `capsule export` / `capsule inspect` for a Memvid-inspired portable manifest that binds a SQLite index to schema/profile/counts/size/checksum without copying notes or replacing the DB
 - `jianling run/status/doctor/enable/disable/validate-*` for the V4 Markdown compiler slice; scheduler files are opt-in systemd-user units managed by the CLI
 
+## Reflective loop boundary
+
+Jianling is the explicit write-capable reflection subsystem, not a generic memory daemon. The architectural loop is:
+
+```text
+raw/human-authored evidence -> generated Markdown with source anchors -> receipt/evidence/log -> bounded index feedback -> retrieval smoke -> reusable lesson in PRD/skill/Obsidian/test gate
+```
+
+Search/MCP remain read-only. Jianling writes are CLI-owned and auditable. A production run is incomplete if it creates Markdown but does not leave receipts/logs, or if an operator claims searchability without `index --path` plus retrieval smoke.
+
+## Configuration and audit surfaces
+
+OrderK's live state is layered:
+
+- CLI flags decide an individual command's vault/DB/profile/model inputs.
+- SQLite `settings` record the active index profile and vector backend.
+- Env model slots resolve embedding/reranker/LLM providers and credential pointers.
+- Jianling scheduler state is split across systemd-user units, `/home/agent/.config/orderk/<profile>.env`, and `.orderk/jianling/scheduler.json`.
+- Jianling audit is split across receipts, redacted evidence packs, human run logs, smoke receipts, and journald service logs.
+
+A config/logging answer is only architectural if it is tied back to live checks: `status/health/doctor`, MCP tool calls, `jianling doctor/chat-smoke/validate-run`, and process freshness for `orderk mcp` after binary replacement.
+
 ## Runtime flow
 
 ```text

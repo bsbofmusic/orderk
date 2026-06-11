@@ -9,7 +9,7 @@
 
 ## 1. 一句话定义
 
-**OrderK Jianling 是 OrderK 内置的“睡后反思者”：它在夜间读取当天新增的原始 session / Markdown 事件，用 OrderK 自己的源选择和后续检索上下文，把当天经验沉淀成可读、可审计、可 Git 管理的 Markdown。P0/P1 的正式成功条件是 Markdown、receipt、evidence、log 和 scheduler 全部可验；这些新 Markdown 的实时/单文件增量索引反馈是后续 gated 阶段，不能在 full sync 或增量索引未验证时宣称已闭环。**
+**OrderK Jianling 是 OrderK 内置的“睡后反思者”：它在夜间读取当天新增的原始 session / Markdown 事件，用 OrderK 自己的源选择和后续检索上下文，把当天经验沉淀成可读、可审计、可 Git 管理的 Markdown。P0/P1 的正式成功条件是 Markdown、receipt、evidence、log、scheduler、以及至少一个 bounded `orderk index --path <generated.md>` + retrieval smoke 全部可验；全库自动 reindex 和更强的 autonomous proposal UX 仍是后续 gated 阶段。**
 
 费曼比喻：白天 OrderK 像图书管理员，帮你快速找书；晚上 Jianling 像闭馆后的馆员，把白天散落的纸条整理成日记、经验卡、决策卡、技能卡和概念页。第二天再搜索时，图书馆不是只多了一堆纸，而是真的多了整理好的书架。
 
@@ -107,6 +107,43 @@ Open boundaries that are **not** silently claimed by this update:
 - The implemented live reflection writes a bounded LLM reflection section into generated Markdown; full structured card extraction, proposal apply/revert UX, and claim-level `explain` remain later gates.
 - Query-time search remains LLM=0 by default.
 - Whole-vault automatic reindex policy remains a later release/eval gate; P0/P1 currently proves the safer bounded path: explicit single-file `orderk index --path <generated.md>` plus retrieval smoke. Nightly worker generation and index feedback are separate steps unless future scheduler code wires them together with the same validator gates.
+
+### 2.5 Reflective action loop / documentation routing / config-log contract
+
+The 0.1.21 production drill changed the operating model: Jianling is not a one-time repair script. It is OrderK's reflective operating loop. A hard run is only complete when the experience has moved through this loop:
+
+```text
+live state -> diagnose -> fix/gate -> real smoke -> bounded index/search feedback -> distill lesson -> route docs -> verify docs
+```
+
+Landing-surface routing is part of the product contract:
+
+| Lesson class | Durable landing surface |
+|---|---|
+| Product boundary, acceptance gates, roadmap semantics | this PRD / `docs/charters/README.md` |
+| Repeatable operator procedure, pitfalls, full-open audits | `orderk-jianling-production-ops` skill |
+| Long run evidence, exact commands, run IDs, historical receipts | skill `references/*.md` and Obsidian system records |
+| User-facing second-brain truth | Obsidian `brain/systems/*.md` |
+| Search/MCP read-only route rules | `orderk-search-blade` skill |
+| Mechanical recurrence prevention | Rust tests, release gate, doctor/status/chat-smoke, or a smoke probe |
+
+Configuration and logging are layered, not a single hidden daemon:
+
+| Surface | Current role |
+|---|---|
+| CLI flags | Highest-confidence runtime input: vault, DB, profile, provider/model, `--path` |
+| SQLite `settings` | Active index profile and vector backend truth; verify via `orderk status` |
+| Env model slots | Embedding/reranker/LLM slot resolution; key env names are pointers, not secrets |
+| `/home/agent/.config/orderk/<profile>.env` | systemd-user scheduler profile env with flags/pointers only |
+| `.orderk/jianling/scheduler.json` | scheduler ownership/state inside the vault |
+| `.orderk/jianling/runs/*.json` | machine receipts for every Jianling run |
+| `.orderk/jianling/runs/*.evidence.json.redacted` | redacted source/evidence packs |
+| `.orderk/jianling/logs/*.log` | compact human-readable run logs |
+| `.orderk/jianling/smoke/*.json` | live LLM smoke receipts |
+| journald user unit | service runtime evidence for `orderk-jianling@<profile>.service` |
+| MCP tool output | live agent-facing search surface; must be tested after binary replacement |
+
+A run must not be called “满血全开” merely because config files look right. It must verify active binary, active DB, default reranker, fresh MCP process, MCP tool calls, Jianling scheduler, live LLM smoke, latest receipt/log, and bounded index/search feedback. Stale `/home/agent/.local/bin/orderk (deleted)` MCP processes are an explicit P1 operational hazard after deploy.
 
 ---
 
