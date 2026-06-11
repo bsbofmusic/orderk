@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-06-11
+
+### Added
+- Ship the first `orderk jianling` Markdown memory-compiler slice with deterministic digest generation, `run/status/doctor/enable/disable/validate-*` CLI subcommands, managed systemd-user unit/timer templates, and `.orderk/jianling/` receipt/evidence/watermark sidecars.
+- Add contract tests for dry-run safety, generated Markdown source anchors, receipt/lock cleanup, validator rejection of unsourced generated notes, scheduler file generation, symlink escape blocking, tampered run validation, and managed-unit deletion safety.
+
+### Changed
+- Document Jianling as a conservative built-in sidecar: raw transcripts stay untouched, query-time search remains read-only, and LLM reflection is not silently faked before later provider gates.
+
+### Fixed
+- Supersede the known `v0.1.17` release-line CI caveat with this patch release gate.
+- Harden Jianling writes/validation against symlink escape, tampered evidence packs, stale file-op hashes, and unsafe scheduler sidecar deletion.
+
 ## [0.1.17] - 2026-06-10
 
 ### Added
@@ -182,7 +195,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/bsbofmusic/orderk/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/bsbofmusic/orderk/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/bsbofmusic/orderk/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/bsbofmusic/orderk/compare/v0.1.14...v0.1.15

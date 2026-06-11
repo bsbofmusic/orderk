@@ -58,11 +58,11 @@ If `python3 scripts/release_gate.py` fails:
 
 Do not publish from a partially green run.
 
-## Non-goals to preserve
+## Search/MCP non-goals to preserve
 
 - No chat layer.
 - No agent orchestrator.
-- No note writing.
-- No automatic summaries.
+- No note writing through search/MCP tools.
+- No automatic summaries through search/MCP tools.
 - No chat/generative answer layer; search reranking is retrieval-only and defaults to SiliconFlow `Qwen/Qwen3-Reranker-4B` (`--reranker none` only for tests/migrations).
-- No background daemon or automatic polling by default.
+- No background daemon or automatic polling in the default search path. `orderk jianling enable` is the explicit opt-in managed timer path for generated Markdown under `brain/`.

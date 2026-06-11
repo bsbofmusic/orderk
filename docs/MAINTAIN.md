@@ -1,6 +1,6 @@
 # orderk maintenance contract
 
-orderk is a headless retrieval blade, not a chat brain. The maintenance loop is intentionally mechanical:
+orderk is a headless retrieval blade plus an opt-in Jianling Markdown compiler, not a chat brain. The maintenance loop is intentionally mechanical:
 
 ```text
 open -> health/doctor -> index/search only when profile is valid -> emit JSON evidence -> run fixture gates before release
@@ -8,7 +8,7 @@ open -> health/doctor -> index/search only when profile is valid -> emit JSON ev
 
 ## Product weapons
 
-- **Jobs — one clean object:** one CLI, one Rust core, one SQLite file, one JSON contract. Do not add chat, note writing, daemon sprawl, or UI lifecycle bloat.
+- **Jobs — one clean object:** one CLI, one Rust core, one SQLite file, one JSON contract. Do not add chat, opaque database memories, daemon sprawl, or UI lifecycle bloat. Jianling writes are the explicit exception: generated Markdown under `brain/` with receipts and source anchors.
 - **Musk — first principles:** retrieval quality must be measured by index freshness, profile validity, vector backend health, and deterministic eval results, not by vibes.
 - **Naval — leverage:** every failure should become a reusable gate, report, or troubleshooting entry so the agent does not pay the same debugging cost twice.
 - **Karpathy — keep the loop tight:** small changes, regression tests, no hidden assumptions, no unverified completion.
@@ -113,7 +113,7 @@ Any scheduler can wrap this:
 run maintain --queries → parse JSON → if ok=false or eval hits < threshold → alert
 ```
 
-The tool itself stays headless and one-shot; the scheduler is external (cron, systemd timer, CI pipeline, health-check endpoint). No daemon, no background polling inside orderk.
+The retrieval maintenance tool itself stays headless and one-shot; any scheduler can wrap it (cron, systemd timer, CI pipeline, health-check endpoint). Jianling is different: `orderk jianling enable` writes orderk-managed systemd-user service/timer files for the optional nightly Markdown compiler, still without a resident orderk server or background polling loop.
 
 ### Read-only MCP recall surface
 
@@ -129,6 +129,8 @@ orderk mcp \
 ```
 
 Only `search`, `status`, and `health` are exposed. The MCP server supports standard `Content-Length` stdio frames plus JSONL compatibility for smoke tests, opens the index through read-only search/status/health paths, and deliberately omits `index`, `maintain`, `feedback`, note-write, save, forget, summary, and chat tools.
+
+Jianling write actions are CLI-only in this slice. They are not exposed as MCP write tools.
 
 Search can request thicker evidence with `min_score`/`threshold`, `context_chunks`, `include_links`, and the same metadata `filter` DSL as CLI search.
 

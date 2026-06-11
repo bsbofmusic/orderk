@@ -2,7 +2,9 @@
 
 ## Boundary
 
-orderk only does retrieval. It does not do chat, agent orchestration, note writing, or automatic summaries. It applies a default SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker for second-pass ranking; `--reranker none` is reserved for tests/migrations.
+orderk’s default query path only does retrieval. Search, get, status, doctor, eval, and MCP do not do chat, agent orchestration, note writing, or automatic summaries. It applies a default SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker for second-pass ranking; `--reranker none` is reserved for tests/migrations.
+
+`orderk jianling` is the explicit V4 sidecar: an opt-in Markdown memory compiler. It reads selected raw/human-authored vault evidence, writes generated Markdown under `brain/`, and records receipts/evidence/watermarks under `.orderk/jianling/`. It is not exposed through write-capable MCP tools, and it does not rewrite raw transcripts.
 
 It now also exposes explicit health and evaluation contracts:
 
@@ -12,6 +14,7 @@ It now also exposes explicit health and evaluation contracts:
 - `eval` for black-box retrieval regression checks
 - `maintain` for the cdper-style readiness/failure-ticket gate that nests health plus optional eval evidence and can persist a JSON report
 - `capsule export` / `capsule inspect` for a Memvid-inspired portable manifest that binds a SQLite index to schema/profile/counts/size/checksum without copying notes or replacing the DB
+- `jianling run/status/doctor/enable/disable/validate-*` for the V4 Markdown compiler slice; scheduler files are opt-in systemd-user units managed by the CLI
 
 ## Runtime flow
 

@@ -8,6 +8,7 @@ pub mod filter;
 pub mod graph;
 pub mod health;
 pub mod index;
+pub mod jianling;
 pub mod markdown;
 pub mod models;
 pub mod optimizer;
@@ -40,6 +41,14 @@ pub use graph::{
     GraphEdgeRelation, GraphEdgeState, GraphExplain, GraphStore,
 };
 pub use health::{classify_error_message, health_report};
+pub use jianling::{
+    jianling_disable, jianling_doctor, jianling_enable, jianling_run, jianling_status,
+    jianling_validate_file, jianling_validate_run, jianling_validate_templates,
+    JianlingDisableReport, JianlingDoctorCheck, JianlingDoctorResponse, JianlingEnableOptions,
+    JianlingEnableReport, JianlingFileOp, JianlingRunMode, JianlingRunOptions, JianlingRunReport,
+    JianlingSourceAnchor, JianlingStatusResponse, JianlingSuccessPredicate,
+    JianlingValidateFileOptions, JianlingValidationResponse,
+};
 pub use models::*;
 pub use profiles::{
     resolve_sword_model_profile_from_env, resolve_sword_model_slot_from_env, SwordModelKind,

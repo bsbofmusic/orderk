@@ -1,10 +1,10 @@
 # orderk
 
-orderk is a tiny, local, read-only retrieval blade for Obsidian Markdown vaults.
+orderk is a tiny, local retrieval blade for Obsidian Markdown vaults, with an optional built-in Markdown memory compiler called Jianling.
 
-It turns your vault into fast, structured evidence for humans, scripts, and AI agents. It does not write notes, generate summaries, run a background memory daemon, or try to become your second brain.
+By default it turns your vault into fast, structured read-only evidence for humans, scripts, and AI agents. When explicitly enabled, `orderk jianling` can also write generated Markdown digests only under `brain/`, with receipts and source anchors under `.orderk/jianling/`. Raw notes and raw transcripts remain human-owned source of truth.
 
-Search your vault, feed agents grounded context, and keep your notes untouched.
+Search your vault, feed agents grounded context, and optionally let Jianling compile selected raw/human evidence into auditable Markdown sidecars.
 
 ## What it is
 
@@ -29,7 +29,7 @@ It is built for people who want better recall without giving another app permiss
 | Feature | Benefit |
 |---|---|
 | Single Rust binary | Small surface area and fast startup. The installed Linux x64 binary for v0.1.9 is 23,886,168 bytes, about 22.8 MiB, under a 30 MiB release-gate ceiling. |
-| On-demand CLI | No always-on orderk daemon. Normal runtime is one command, one result, then exit. |
+| On-demand search CLI | Search/index/get/status are one command, one result, then exit. Jianling scheduling is opt-in and uses managed systemd-user timer files rather than a resident orderk server. |
 | Low runtime memory | A live search probe on the maintainer machine used about 9.2 MiB VmRSS and 12.3 MiB VmPeak, under a 15 MiB baseline ceiling. |
 | Disposable SQLite index | Files, chunks, embeddings, FTS, vector rows, settings, and feedback live in one rebuildable DB. Delete the index and your Markdown vault is still intact. |
 | Hybrid retrieval | Keyword search, vector search, query-aware routing, path/tag/recency signals, and RRF-style fusion work together instead of pretending one score explains everything. |
@@ -110,20 +110,20 @@ In representative live-vault queries, compact recall cut output size by **41–4
 
 ### vs alternatives
 
-orderk is not a memory OS. It is the small retrieval layer beside your existing Markdown vault.
+orderk is not a hosted memory OS. It is the small retrieval layer beside your existing Markdown vault plus an opt-in Markdown compiler that writes inspectable notes back into that same vault.
 
 | Dimension | orderk | agentmemory / mem0 / Letta class tools | Built-in note search |
 |---|---|---|---|
 | Type | Local retrieval blade | Memory engine / API / agent runtime | App search |
 | Source of truth | Markdown vault | Memory DB / service-runtime layer | Markdown vault |
-| Writes notes | No | memory writes / API state | manual only |
-| Daemon/server | No | common | app runtime only |
+| Writes notes | Search/MCP: no. Jianling: opt-in generated Markdown with source anchors and receipts. | memory writes / API state | manual only |
+| Daemon/server | Search: no resident daemon. Jianling: optional managed systemd-user timer. | common | app runtime only |
 | Search | BM25 + vector + metadata + links | vector / graph varies | keyword / app index |
 | Agent surface | CLI + read-only MCP | MCP / REST / hooks / runtime | none or manual |
 | Token control | `--view index` + `get --ids` | memory budget / integration-dependent | manual / context-heavy |
 | Best for | Grounded evidence retrieval | Persistent memory lifecycle | Human note search |
 
-If you want a memory operating system, use a memory system. If you want a small, local, read-only retrieval blade for your Markdown vault, use orderk. See [`benchmarks/COMPARISON.md`](benchmarks/COMPARISON.md).
+If you want a memory operating system, use a memory system. If you want a small, local retrieval blade for your Markdown vault, with optional auditable Markdown compilation through Jianling, use orderk. See [`benchmarks/COMPARISON.md`](benchmarks/COMPARISON.md).
 
 ### Fast, precise, sharp, stable
 
@@ -143,7 +143,7 @@ orderk borrows useful ideas from memory tools without becoming one.
 - From agent memory systems: structured retrieval APIs and evidence-rich context.
 - From ranking systems: fusion, metadata boosts, link expansion, and deterministic reranking.
 
-It rejects the heavy parts: note generation, automatic memory mutation, chat, hosted source of truth, hidden reflection loops, and always-on memory daemons.
+It rejects the heavy parts: hosted source of truth, hidden reflection loops, chat-as-storage, opaque memory mutation, and always-on memory daemons. Jianling’s writes are explicit Markdown files with claim/source anchors and run receipts, not hidden database memories.
 
 ## Architecture
 
@@ -295,7 +295,32 @@ orderk search \
 - `--query-expansion`: enable deterministic lexical query expansion for short or synonym-heavy searches.
 - `--json-lines`: emit one JSON object per line for scripts and pipes.
 
-### 5) MCP read-only server
+### 5) Jianling Markdown memory compiler
+
+`orderk jianling` is the built-in, Markdown-first sidecar for nightly reflection. It does **not** rewrite raw transcripts and it does **not** add MCP write tools. It reads selected raw/human-authored vault sources, writes generated Markdown only under `brain/`, records claim-level source anchors, and stores receipts/watermarks under `.orderk/jianling/` so every run is inspectable and rollback-aware. If the deterministic target already contains a human/non-Jianling note, it refuses to overwrite it.
+
+```bash
+# Safe preview: no generated note, receipt, lock, or watermark is written.
+orderk jianling run \
+  --vault /path/to/vault \
+  --date 2026-06-10 \
+  --dry-run
+
+# Enable the managed Linux user timer. This writes orderk-managed systemd unit files.
+orderk jianling enable \
+  --vault /path/to/vault \
+  --db /path/to/vault/.obsidian/orderk/orderk.sqlite \
+  --schedule 03:30 \
+  --timezone Asia/Shanghai
+
+orderk jianling status --vault /path/to/vault
+orderk jianling doctor --vault /path/to/vault
+orderk jianling validate-file --vault /path/to/vault --file brain/daily/2026-06-10.md
+```
+
+The first shipped slice is intentionally conservative: deterministic P0 digest generation, systemd-user scheduler templates, receipt/evidence/watermark sidecars, and validators. Query-time search still uses the read-only retrieval path; LLM reflection remains behind later provider gates rather than being silently faked.
+
+### 6) MCP read-only server
 
 ```bash
 orderk mcp \
@@ -456,12 +481,12 @@ For the full maintenance contract, see [`docs/MAINTAIN.md`](docs/MAINTAIN.md). F
 - `orderk-obsidian` is legacy/deprecated on npm; the Obsidian wrapper source remains in `packages/obsidian`.
 - Linux x64 one-click install is served from GitHub Releases.
 
-## What orderk deliberately does not do
+## What orderk deliberately does not do in the search/MCP path
 
 - chat
 - agent orchestration
-- note writing
-- automatic summaries
+- note writing through search/MCP tools
+- automatic summaries through search/MCP tools
 - chat-style generation or memory lifecycle management; reranking is retrieval-only and uses the default Qwen model reranker (`--reranker none` only for tests/migrations)
 - second-brain style lifecycle management
 

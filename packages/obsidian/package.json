@@ -1,7 +1,7 @@
 {
   "name": "orderk-obsidian",
   "private": true,
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Thin Obsidian wrapper for orderk",
   "license": "MIT",
   "type": "module",
