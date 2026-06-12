@@ -40,6 +40,23 @@ class ReleaseGateStaticChecksTest(unittest.TestCase):
         self.assertIn("--all-targets", clippy_commands[0])
         self.assertIn("--all-features", clippy_commands[0])
 
+    def test_release_gate_sanitizes_production_jianling_llm_env(self) -> None:
+        env = {
+            "ORDERK_JIANLING_LLM_ENABLED": "1",
+            "ORDERK_JIANLING_LLM_ENABLED_DEFAULT": "1",
+            "ORDERK_SWORD_LLM_BASE_URL": "https://api.minimaxi.com/anthropic",
+            "ORDERK_SWORD_LLM_API_KEY_ENV": "HERMES_MINIMAX_API_KEY",
+            "HERMES_MINIMAX_API_KEY": "secret",
+            "ORDERK_SWORD_EMBEDDING_PROVIDER": "siliconflow",
+        }
+        sanitized = release_gate.sanitize_release_gate_env(env)
+        self.assertNotIn("ORDERK_JIANLING_LLM_ENABLED", sanitized)
+        self.assertNotIn("ORDERK_JIANLING_LLM_ENABLED_DEFAULT", sanitized)
+        self.assertNotIn("ORDERK_SWORD_LLM_BASE_URL", sanitized)
+        self.assertNotIn("ORDERK_SWORD_LLM_API_KEY_ENV", sanitized)
+        self.assertNotIn("HERMES_MINIMAX_API_KEY", sanitized)
+        self.assertEqual(sanitized["ORDERK_SWORD_EMBEDDING_PROVIDER"], "siliconflow")
+
     def test_release_gate_runs_5topic_retrieval_non_regression_bench(self) -> None:
         self.assertIn(["python3", "scripts/sword_5topic_hs_vs_v2_bench.py"], release_gate.COMMANDS)
 

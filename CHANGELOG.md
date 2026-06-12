@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-06-13
+
+### Fixed
+- Isolate deterministic release gates from production Jianling LLM environment switches, so local release verification does not accidentally call live LLM endpoints or fail because a production profile is enabled.
+- Extend profile-slot test cleanup to include LLM base URL environment variables.
+
+### Verification
+- `python3 -m py_compile scripts/release_gate.py scripts/test_release_gate.py`, `python3 -m unittest scripts/test_release_gate.py`, and `python3 scripts/release_gate.py` passed while intentionally injecting production-like Jianling LLM environment variables.
+
 ## [0.1.24] - 2026-06-13
 
 ### Added
@@ -262,7 +271,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.24...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.25...HEAD
+[0.1.25]: https://github.com/bsbofmusic/orderk/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/bsbofmusic/orderk/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/bsbofmusic/orderk/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/bsbofmusic/orderk/compare/v0.1.21...v0.1.22

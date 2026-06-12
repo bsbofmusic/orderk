@@ -98,6 +98,33 @@ PACKAGE_DIRECT_PREFIX_EXCLUDES = (
     ".codegraph/",
 )
 DANGEROUS_PACKAGE_PARTS = {"__pycache__"}
+RELEASE_GATE_ENV_UNSET = {
+    "HERMES_MINIMAX_API_KEY",
+    "ORDERK_JIANLING_LLM_ENABLED",
+    "ORDERK_SWORD_LLM_PROVIDER",
+    "ORDERK_SWORD_LLM_MODEL",
+    "ORDERK_SWORD_LLM_API_KEY",
+    "ORDERK_SWORD_LLM_API_KEY_ENV",
+    "ORDERK_SWORD_LLM_BASE_URL",
+    "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY",
+    "ORDERK_SWORD_LLM_ANTHROPIC_MODEL",
+    "ORDERK_SWORD_LLM_ANTHROPIC_BASE_URL",
+    "ORDERK_SWORD_LLM_MINIMAX_API_KEY",
+    "ORDERK_SWORD_LLM_MINIMAX_MODEL",
+    "ORDERK_SWORD_LLM_MINIMAX_BASE_URL",
+}
+RELEASE_GATE_ENV_PREFIX_UNSET = ("ORDERK_JIANLING_LLM_ENABLED_",)
+
+
+def sanitize_release_gate_env(env: dict[str, str]) -> dict[str, str]:
+    """Keep deterministic gates isolated from production Jianling LLM toggles."""
+    sanitized = dict(env)
+    for name in RELEASE_GATE_ENV_UNSET:
+        sanitized.pop(name, None)
+    for name in list(sanitized):
+        if name.startswith(RELEASE_GATE_ENV_PREFIX_UNSET):
+            sanitized.pop(name, None)
+    return sanitized
 
 
 def make_result(name: str, ok: bool, started: float, stdout: str = "", stderr: str = "") -> dict[str, object]:
@@ -113,7 +140,7 @@ def make_result(name: str, ok: bool, started: float, stdout: str = "", stderr: s
 
 def run(cmd: list[str]) -> dict[str, object]:
     started = time.time()
-    env = os.environ.copy()
+    env = sanitize_release_gate_env(dict(os.environ))
     if cmd and cmd[0] == "npm":
         env["ORDERK_SKIP_BINARY_DOWNLOAD"] = "1"
         env["ORDERK_BIN"] = str(TARGET_ORDERK)
