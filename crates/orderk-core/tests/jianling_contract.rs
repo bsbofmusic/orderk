@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orderk_core::{
-    jianling_chat_smoke, jianling_doctor, jianling_enable, jianling_run, jianling_status,
-    jianling_validate_file, jianling_validate_run, jianling_worker, JianlingEnableOptions,
-    JianlingRunMode, JianlingRunOptions, JianlingValidateFileOptions, JianlingWorkerOptions,
+    index_vault, index_vault_with_options, jianling_chat_smoke, jianling_doctor, jianling_enable,
+    jianling_run, jianling_status, jianling_validate_file, jianling_validate_run, jianling_worker,
+    EmbeddingProvider, IndexOptions, JianlingEnableOptions, JianlingRunMode, JianlingRunOptions,
+    JianlingValidateFileOptions, JianlingWorkerOptions, MockEmbeddingProvider, VectorBackend,
 };
+use rusqlite::Connection;
 
 fn temp_vault(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -50,6 +52,33 @@ fn seed_raw_dialogue(vault: &Path) {
     .unwrap();
 }
 
+fn seed_mock_index_db(vault: &Path, db: &Path) {
+    let provider = MockEmbeddingProvider::new(8);
+    index_vault(
+        vault,
+        db,
+        &provider,
+        provider.dimension(),
+        provider.model_id(),
+        VectorBackend::Exact,
+    )
+    .unwrap();
+}
+
+fn seed_mock_index_db_with_options(vault: &Path, db: &Path, options: &IndexOptions) {
+    let provider = MockEmbeddingProvider::new(8);
+    index_vault_with_options(
+        vault,
+        db,
+        &provider,
+        provider.dimension(),
+        provider.model_id(),
+        VectorBackend::Exact,
+        options,
+    )
+    .unwrap();
+}
+
 #[test]
 fn jianling_dry_run_reports_sources_without_writing_generated_memory() {
     let vault = temp_vault("dry-run");
@@ -77,6 +106,8 @@ fn jianling_dry_run_reports_sources_without_writing_generated_memory() {
     assert_eq!(report.generated_files[0], "brain/daily/2026-06-10.md");
     assert_eq!(report.source_files, 1, "system snapshots must be excluded");
     assert_eq!(report.generated_source_tier, "generated_memory");
+    assert_eq!(report.index_update, "skipped_dry_run");
+    assert_eq!(report.index_smoke_status, "skipped_dry_run");
     assert!(report.success_predicate.pre_write_guard == "passed");
     assert!(!vault.join("brain/daily/2026-06-10.md").exists());
     assert!(!vault.join(".orderk/jianling/watermarks.json").exists());
@@ -87,8 +118,16 @@ fn jianling_dry_run_reports_sources_without_writing_generated_memory() {
 #[test]
 fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
     let vault = temp_vault("apply");
+    let _env = ScopedEnv::set(&[
+        ("ORDERK_SWORD_EMBEDDING_PROVIDER", "mock"),
+        ("ORDERK_SWORD_EMBEDDING_MODEL", "mock-8"),
+        ("ORDERK_SWORD_EMBEDDING_DIM", "8"),
+        ("ORDERK_SWORD_VECTOR_BACKEND", "exact"),
+    ]);
     seed_raw_dialogue(&vault);
 
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
     let report = jianling_run(
         &vault,
         &JianlingRunOptions {
@@ -96,7 +135,7 @@ fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
             mode: JianlingRunMode::Daily,
             dry_run: false,
             scheduled: true,
-            db: Some(vault.join(".obsidian/orderk/orderk.sqlite")),
+            db: Some(db.clone()),
             date: Some("2026-06-10".to_string()),
             max_source_files: 20,
         },
@@ -121,7 +160,29 @@ fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
     assert!(chunk_dir.join("foreman-manifest.json").is_file());
     assert!(Path::new(report.foreman_summary_path.as_ref().unwrap()).is_file());
     assert!(vault.join(".orderk/jianling/watermarks.json").is_file());
-    assert_eq!(report.index_update, "skipped_no_db_index_run");
+    assert_eq!(report.index_update, "success");
+    assert_eq!(report.index_smoke_status, "passed");
+    assert_eq!(report.success_predicate.index_smoke, "passed");
+    let index_summary = report.index_summary.as_ref().expect("index summary");
+    assert_eq!(index_summary.path, "brain/daily/2026-06-10.md");
+    assert_eq!(index_summary.files, 1);
+    assert!(index_summary.added + index_summary.updated + index_summary.unchanged >= 1);
+    assert!(index_summary.chunks > 0);
+    assert!(index_summary.embedded > 0);
+    let conn = Connection::open(&db).unwrap();
+    let indexed: (i64, i64, String) = conn
+        .query_row(
+            "SELECT size, (SELECT COUNT(*) FROM chunks WHERE file_path = files.path), hash FROM files WHERE path = ?1",
+            ["brain/daily/2026-06-10.md"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(indexed.0 as usize, report.file_ops[0].byte_count);
+    assert!(indexed.1 > 0);
+    assert_eq!(
+        format!("sha256:{}", indexed.2),
+        report.file_ops[0].postimage_hash
+    );
     assert!(report.lock_clean);
 
     let status = jianling_status(&vault, "default").unwrap();
@@ -139,6 +200,83 @@ fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
     )
     .unwrap();
     assert!(validation.ok, "validation should pass: {validation:#?}");
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_apply_degrades_when_index_db_is_missing() {
+    let vault = temp_vault("missing-index-db");
+    seed_raw_dialogue(&vault);
+    let db = vault.join(".obsidian/orderk/missing.sqlite");
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db.clone()),
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(!report.ok);
+    assert_eq!(report.status, "degraded_index_failed");
+    assert_eq!(report.index_update, "failed");
+    assert_eq!(report.index_smoke_status, "skipped_index_profile_failed");
+    assert!(report.index_summary.is_none());
+    assert!(
+        !db.exists(),
+        "Jianling must not create a wrong DB during feedback"
+    );
+    assert!(vault.join("brain/daily/2026-06-10.md").is_file());
+    let status = jianling_status(&vault, "default").unwrap();
+    assert_eq!(
+        status.last_run_status.as_deref(),
+        Some("degraded_index_failed")
+    );
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_index_feedback_reuses_existing_db_chunk_profile() {
+    let vault = temp_vault("chunk-profile");
+    seed_raw_dialogue(&vault);
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    let options = IndexOptions {
+        chunk_max_chars: 800,
+        chunk_overlap_chars: 100,
+    };
+    seed_mock_index_db_with_options(&vault, &db, &options);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db),
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        report.ok,
+        "run should pass with inherited chunk profile: {report:#?}"
+    );
+    assert_eq!(report.index_update, "success");
+    let summary = report.index_summary.as_ref().unwrap();
+    assert_eq!(summary.chunk_max_chars, 800);
+    assert_eq!(summary.chunk_overlap_chars, 100);
+    assert_eq!(summary.chunk_strategy, "heading_overlap");
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -504,12 +642,14 @@ fn jianling_worker_plans_calendar_modes_without_external_cron() {
     fs::create_dir_all(&day07).unwrap();
     fs::write(day01.join("session.md"), "# day 1\n").unwrap();
     fs::write(day07.join("session.md"), "# sunday\n").unwrap();
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
 
     let monthly = jianling_worker(
         &vault,
         &JianlingWorkerOptions {
             profile: "default".to_string(),
-            db: None,
+            db: Some(db.clone()),
             date: Some("2026-06-01".to_string()),
             max_source_files: 20,
         },
@@ -517,6 +657,18 @@ fn jianling_worker_plans_calendar_modes_without_external_cron() {
     .unwrap();
     assert_eq!(monthly.modes_planned, vec!["daily", "monthly"]);
     assert_eq!(monthly.runs.len(), 2);
+    assert!(monthly.ok, "monthly worker should pass: {monthly:#?}");
+    assert_eq!(monthly.status, "success");
+    assert_ne!(monthly.runs[0].run_id, monthly.runs[1].run_id);
+    assert!(monthly.runs.iter().all(|run| run.index_update == "success"));
+    assert!(monthly
+        .runs
+        .iter()
+        .all(|run| run.index_smoke_status == "passed"));
+    assert!(monthly.runs.iter().all(|run| run
+        .index_summary
+        .as_ref()
+        .is_some_and(|summary| summary.files == 1)));
     assert!(vault.join("brain/daily/2026-06-01.md").is_file());
     assert!(vault.join("brain/monthly/2026-06-01.md").is_file());
 
@@ -524,7 +676,7 @@ fn jianling_worker_plans_calendar_modes_without_external_cron() {
         &vault,
         &JianlingWorkerOptions {
             profile: "default".to_string(),
-            db: None,
+            db: Some(db.clone()),
             date: Some("2026-06-07".to_string()),
             max_source_files: 20,
         },
@@ -532,6 +684,18 @@ fn jianling_worker_plans_calendar_modes_without_external_cron() {
     .unwrap();
     assert_eq!(weekly.modes_planned, vec!["daily", "weekly"]);
     assert_eq!(weekly.runs.len(), 2);
+    assert!(weekly.ok, "weekly worker should pass: {weekly:#?}");
+    assert_eq!(weekly.status, "success");
+    assert_ne!(weekly.runs[0].run_id, weekly.runs[1].run_id);
+    assert!(weekly.runs.iter().all(|run| run.index_update == "success"));
+    assert!(weekly
+        .runs
+        .iter()
+        .all(|run| run.index_smoke_status == "passed"));
+    assert!(weekly.runs.iter().all(|run| run
+        .index_summary
+        .as_ref()
+        .is_some_and(|summary| summary.files == 1)));
     assert!(vault.join("brain/daily/2026-06-07.md").is_file());
     assert!(vault.join("brain/weekly/2026-06-07.md").is_file());
 

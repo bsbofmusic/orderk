@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -11,6 +12,10 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::api::{
+    index_paths_with_options, provider_from_name, query_with_options, status as orderk_status,
+};
+use crate::models::{IndexOptions, IndexPathOptions, IndexSummary, QueryOptions, VectorBackend};
 use crate::profiles::{resolve_sword_model_profile_from_env, SwordModelSlot};
 use crate::scanner::scan_vault;
 
@@ -134,6 +139,69 @@ pub struct JianlingFileOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JianlingIndexSummary {
+    pub path: String,
+    pub db: String,
+    pub files: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub deleted: usize,
+    pub chunks: usize,
+    pub embedded: usize,
+    pub reused: usize,
+    pub embedding_provider: String,
+    pub embedding_model: String,
+    pub vector_backend: String,
+    pub chunk_strategy: String,
+    pub chunk_max_chars: usize,
+    pub chunk_overlap_chars: usize,
+    pub took_ms: u128,
+}
+
+impl JianlingIndexSummary {
+    fn from_index_summary(path: &str, summary: IndexSummary) -> Self {
+        Self {
+            path: path.to_string(),
+            db: summary.db,
+            files: summary.files,
+            added: summary.added,
+            updated: summary.updated,
+            unchanged: summary.unchanged,
+            deleted: summary.deleted,
+            chunks: summary.chunks,
+            embedded: summary.embedded,
+            reused: summary.reused,
+            embedding_provider: summary.embedding_provider,
+            embedding_model: summary.embedding_model,
+            vector_backend: summary.vector_backend,
+            chunk_strategy: summary.chunk_strategy,
+            chunk_max_chars: summary.chunk_max_chars,
+            chunk_overlap_chars: summary.chunk_overlap_chars,
+            took_ms: summary.took_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JianlingIndexFeedbackOutcome {
+    index_update: String,
+    index_smoke_status: String,
+    index_summary: Option<JianlingIndexSummary>,
+    warnings: Vec<String>,
+    degraded: bool,
+}
+
+#[derive(Debug, Clone)]
+struct JianlingIndexProfile {
+    embedding_provider: String,
+    embedding_dim: usize,
+    embedding_model: String,
+    vector_backend: VectorBackend,
+    index_options: IndexOptions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JianlingRunReport {
     pub ok: bool,
     pub schema_version: String,
@@ -155,6 +223,8 @@ pub struct JianlingRunReport {
     pub pre_write_guard_status: String,
     pub index_update: String,
     pub index_smoke_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_summary: Option<JianlingIndexSummary>,
     pub fallback_used: bool,
     pub success_predicate: JianlingSuccessPredicate,
     pub source_files: usize,
@@ -372,9 +442,14 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         .date
         .clone()
         .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+    let run_stamp = started_at
+        .format("%Y%m%dT%H%M%S%.fZ")
+        .to_string()
+        .replace('.', "");
     let run_id = format!(
-        "jianling-{}-{}",
-        Utc::now().format("%Y%m%dT%H%M%SZ"),
+        "jianling-{}-{}-{}",
+        options.mode.as_str(),
+        run_stamp,
         std::process::id()
     );
     let root = control_root(&vault);
@@ -476,10 +551,12 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
     let evidence_hash = format!("sha256:{}", sha256_hex(evidence_json.as_bytes()));
     let receipt_path = runs_root.join(format!("{run_id}.json"));
     let evidence_path = runs_root.join(format!("{run_id}.evidence.json.redacted"));
-    let index_update = if options.db.is_some() {
-        "skipped_no_db_index_run"
+    let (index_update, index_smoke_status) = if options.dry_run {
+        ("skipped_dry_run", "skipped_dry_run")
+    } else if options.db.is_some() {
+        ("pending", "pending")
     } else {
-        "skipped_no_db"
+        ("skipped_no_db", "skipped_no_db")
     };
 
     let mut report = JianlingRunReport {
@@ -519,7 +596,8 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         pre_llm_guard_status: "passed".to_string(),
         pre_write_guard_status: "passed".to_string(),
         index_update: index_update.to_string(),
-        index_smoke_status: "skipped_p0_whole_vault_reindex_not_invoked".to_string(),
+        index_smoke_status: index_smoke_status.to_string(),
+        index_summary: None,
         fallback_used: false,
         success_predicate: JianlingSuccessPredicate {
             provider: provider_status.clone(),
@@ -622,13 +700,24 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             index_update_required: true,
         }];
         write_generated_file(&vault, &target_rel, &generated_body)?;
-        write_watermark(
-            &root.join("watermarks.json"),
-            &profile,
+        let index_feedback = run_jianling_index_feedback(
+            &vault,
+            options.db.as_deref(),
+            &target_rel,
             &run_id,
-            "success",
-            &selected,
-        )?;
+            generated_title_for_mode(&options.mode),
+        );
+        report.index_update = index_feedback.index_update;
+        report.index_smoke_status = index_feedback.index_smoke_status;
+        report.index_summary = index_feedback.index_summary;
+        report.warnings.extend(index_feedback.warnings);
+        if index_feedback.degraded {
+            report.ok = false;
+            report.status = "degraded_index_failed".to_string();
+            report.success_predicate.index_smoke = "failed".to_string();
+        } else if report.index_smoke_status == "passed" {
+            report.success_predicate.index_smoke = "passed".to_string();
+        }
         ensure_plain_output_file(&evidence_path, "jianling evidence pack")?;
         fs::write(&evidence_path, evidence_json)?;
         report.finished_at = Utc::now().to_rfc3339();
@@ -639,12 +728,205 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             ensure_plain_output_file(&log_path, "jianling run log")?;
             fs::write(&log_path, render_run_log(&report))?;
         }
+        write_watermark(
+            &root.join("watermarks.json"),
+            &profile,
+            &run_id,
+            &report.status,
+            &selected,
+        )?;
         Ok(())
     })();
     drop(lock);
     let _ = fs::remove_file(&lock_path);
     write_result?;
     Ok(report)
+}
+
+fn run_jianling_index_feedback(
+    vault: &Path,
+    db: Option<&Path>,
+    target_rel: &str,
+    run_id: &str,
+    smoke_title: &str,
+) -> JianlingIndexFeedbackOutcome {
+    let Some(db) = db else {
+        return JianlingIndexFeedbackOutcome {
+            index_update: "skipped_no_db".to_string(),
+            index_smoke_status: "skipped_no_db".to_string(),
+            index_summary: None,
+            warnings: Vec::new(),
+            degraded: false,
+        };
+    };
+
+    let profile = match resolve_jianling_index_profile(db) {
+        Ok(profile) => profile,
+        Err(err) => {
+            return JianlingIndexFeedbackOutcome {
+                index_update: "failed".to_string(),
+                index_smoke_status: "skipped_index_profile_failed".to_string(),
+                index_summary: None,
+                warnings: vec![format!("index feedback profile resolution failed: {err}")],
+                degraded: true,
+            };
+        }
+    };
+    let provider = match provider_from_name(
+        &profile.embedding_provider,
+        profile.embedding_dim,
+        Some(profile.embedding_model.clone()),
+    ) {
+        Ok(provider) => provider,
+        Err(err) => {
+            return JianlingIndexFeedbackOutcome {
+                index_update: "failed".to_string(),
+                index_smoke_status: "skipped_index_provider_failed".to_string(),
+                index_summary: None,
+                warnings: vec![format!("index feedback provider setup failed: {err}")],
+                degraded: true,
+            };
+        }
+    };
+
+    let index_summary = match index_paths_with_options(
+        vault,
+        db,
+        provider.as_ref(),
+        profile.embedding_dim,
+        &profile.embedding_model,
+        profile.vector_backend.clone(),
+        &IndexPathOptions {
+            paths: vec![target_rel.to_string()],
+            index: profile.index_options.clone(),
+        },
+    ) {
+        Ok(summary) => summary,
+        Err(err) => {
+            return JianlingIndexFeedbackOutcome {
+                index_update: "failed".to_string(),
+                index_smoke_status: "skipped_index_failed".to_string(),
+                index_summary: None,
+                warnings: vec![format!("index feedback failed: {err}")],
+                degraded: true,
+            };
+        }
+    };
+    let compact_summary = JianlingIndexSummary::from_index_summary(target_rel, index_summary);
+
+    let mut smoke_options = QueryOptions::new(5);
+    smoke_options.rerank = false;
+    smoke_options.external_reranker = false;
+    let smoke_query = format!("{run_id} {smoke_title}");
+    let smoke_result = query_with_options(
+        db,
+        &smoke_query,
+        &smoke_options,
+        provider.as_ref(),
+        profile.vector_backend,
+    );
+    match smoke_result {
+        Ok(response) => {
+            let found = response
+                .results
+                .iter()
+                .any(|result| result.path == target_rel);
+            if found {
+                JianlingIndexFeedbackOutcome {
+                    index_update: "success".to_string(),
+                    index_smoke_status: "passed".to_string(),
+                    index_summary: Some(compact_summary),
+                    warnings: Vec::new(),
+                    degraded: false,
+                }
+            } else {
+                JianlingIndexFeedbackOutcome {
+                    index_update: "success".to_string(),
+                    index_smoke_status: "failed".to_string(),
+                    index_summary: Some(compact_summary),
+                    warnings: vec![format!(
+                        "index smoke failed: query did not return generated path {target_rel} in top 5"
+                    )],
+                    degraded: true,
+                }
+            }
+        }
+        Err(err) => JianlingIndexFeedbackOutcome {
+            index_update: "success".to_string(),
+            index_smoke_status: "failed".to_string(),
+            index_summary: Some(compact_summary),
+            warnings: vec![format!("index smoke failed: {err}")],
+            degraded: true,
+        },
+    }
+}
+
+fn resolve_jianling_index_profile(db: &Path) -> Result<JianlingIndexProfile> {
+    if !db.is_file() {
+        return Err(anyhow!(
+            "index db does not exist; refusing to create a new DB during Jianling feedback: {}",
+            db.display()
+        ));
+    }
+    existing_db_index_profile(db).ok_or_else(|| {
+        anyhow!(
+            "index db profile is not readable; run full `orderk index` for the active DB first: {}",
+            db.display()
+        )
+    })
+}
+
+fn existing_db_index_profile(db: &Path) -> Option<JianlingIndexProfile> {
+    let response = orderk_status(db).ok()?;
+    if response.embedding_dim == 0 {
+        return None;
+    }
+    Some(JianlingIndexProfile {
+        embedding_provider: non_unknown(response.embedding_provider)?,
+        embedding_dim: response.embedding_dim,
+        embedding_model: non_unknown(response.embedding_model)?,
+        vector_backend: parse_vector_backend(&non_unknown(response.vector_backend)?).ok()?,
+        index_options: existing_db_index_options(db).unwrap_or_default(),
+    })
+}
+
+fn existing_db_index_options(db: &Path) -> Option<IndexOptions> {
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let chunk_max_chars = read_usize_setting(&conn, "chunk_max_chars")
+        .unwrap_or_else(|| IndexOptions::default().chunk_max_chars);
+    let chunk_overlap_chars = read_usize_setting(&conn, "chunk_overlap_chars")
+        .unwrap_or_else(|| IndexOptions::default().chunk_overlap_chars);
+    Some(IndexOptions {
+        chunk_max_chars,
+        chunk_overlap_chars,
+    })
+}
+
+fn read_usize_setting(conn: &Connection, key: &str) -> Option<usize> {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn non_unknown(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn parse_vector_backend(value: &str) -> Result<VectorBackend> {
+    match value.trim() {
+        "sqlite_vec" => Ok(VectorBackend::SqliteVec),
+        "exact" => Ok(VectorBackend::Exact),
+        other => Err(anyhow!("unknown vector backend: {other}")),
+    }
 }
 
 pub fn jianling_status(vault: &Path, profile: &str) -> Result<JianlingStatusResponse> {
@@ -800,9 +1082,7 @@ pub fn jianling_doctor(vault: &Path, profile: &str) -> Result<JianlingDoctorResp
         "checked",
         json!({"verification_mode":"static", "paths": brain_dirs}),
     ));
-    let ok = checks
-        .iter()
-        .all(|check| check.ok || check.component == "last_run");
+    let ok = checks.iter().all(|check| check.ok);
     Ok(JianlingDoctorResponse {
         ok,
         schema_version: "orderk.jianling.doctor.v1".to_string(),
@@ -909,8 +1189,16 @@ pub fn jianling_worker(
             },
         )?);
     }
+    let ok = runs.iter().all(|run| run.ok);
+    let status = if ok {
+        "success"
+    } else if runs.iter().any(|run| run.status == "degraded_index_failed") {
+        "degraded_index_failed"
+    } else {
+        "degraded"
+    };
     Ok(JianlingWorkerReport {
-        ok: true,
+        ok,
         schema_version: "orderk.jianling.worker.v1".to_string(),
         vault: vault.to_string_lossy().to_string(),
         profile,
@@ -919,7 +1207,7 @@ pub fn jianling_worker(
         finished_at: Utc::now().to_rfc3339(),
         modes_planned: modes.iter().map(|mode| mode.as_str().to_string()).collect(),
         runs,
-        status: "success".to_string(),
+        status: status.to_string(),
     })
 }
 
@@ -1548,6 +1836,15 @@ fn target_rel_for_mode(mode: &JianlingRunMode, date: &str) -> String {
         JianlingRunMode::Weekly => format!("brain/weekly/{date}.md"),
         JianlingRunMode::Monthly => format!("brain/monthly/{date}.md"),
         JianlingRunMode::Yearly => format!("brain/yearly/{date}.md"),
+    }
+}
+
+fn generated_title_for_mode(mode: &JianlingRunMode) -> &'static str {
+    match mode {
+        JianlingRunMode::Daily | JianlingRunMode::Manual => "Jianling Daily Digest",
+        JianlingRunMode::Weekly => "Jianling Weekly Reflection",
+        JianlingRunMode::Monthly => "Jianling Monthly Reflection",
+        JianlingRunMode::Yearly => "Jianling Yearly Reflection",
     }
 }
 

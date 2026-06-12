@@ -46,9 +46,10 @@ pub use jianling::{
     jianling_status, jianling_validate_file, jianling_validate_run, jianling_validate_templates,
     jianling_worker, JianlingChatSmokeResponse, JianlingDisableReport, JianlingDoctorCheck,
     JianlingDoctorResponse, JianlingEnableOptions, JianlingEnableReport, JianlingFileOp,
-    JianlingRunMode, JianlingRunOptions, JianlingRunReport, JianlingSourceAnchor,
-    JianlingStatusResponse, JianlingSuccessPredicate, JianlingValidateFileOptions,
-    JianlingValidationResponse, JianlingWorkerOptions, JianlingWorkerReport,
+    JianlingIndexSummary, JianlingRunMode, JianlingRunOptions, JianlingRunReport,
+    JianlingSourceAnchor, JianlingStatusResponse, JianlingSuccessPredicate,
+    JianlingValidateFileOptions, JianlingValidationResponse, JianlingWorkerOptions,
+    JianlingWorkerReport,
 };
 pub use models::*;
 pub use profiles::{

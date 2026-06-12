@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-06-12
+
+### Fixed
+- Wire Jianling non-dry runs to automatically refresh the generated Markdown catalogue card with bounded `index --path`, then run a no-external-reranker retrieval smoke before writing the receipt.
+- Mark Jianling runs `degraded_index_failed` instead of `success` when generated Markdown is written but index/profile/provider/smoke feedback fails.
+- Harden Jianling feedback after read-only subagent audit: unique mode-aware run IDs for worker multi-mode runs, worker/doctor degraded propagation, mode-specific smoke titles, active DB chunk-profile reuse, refusal to create a wrong DB path during feedback, and watermark advancement only after evidence/receipt/log writes.
+
+### Verification
+- Focused `cargo test -p orderk-core --test jianling_contract jianling_apply_writes_daily_digest_receipt_evidence_and_watermark -- --nocapture` passed with a mock embedding profile and direct SQLite freshness assertions.
+- Full `cargo test -p orderk-core --test jianling_contract -- --nocapture` passed: 21/21.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo build --release --locked` passed locally; installed `/home/agent/.local/bin/orderk` was refreshed from `target/release/orderk`.
+- Live `orderk jianling worker --once --profile default` generated `brain/daily/2026-06-12.md` with `run_id=jianling-daily-20260612T041449819516829Z-2940543`, `provider_status=called_live`, `index_update=success`, `index_smoke_status=passed`, `index_summary.files=1`, `chunks=7`, `embedded=7`; SQLite `files.size/hash` matched the generated file postimage, `validate-run` and `jianling doctor` returned `ok=true`, and MCP `status/health/search` returned ready results for the same run ID.
+
 ## [0.1.21] - 2026-06-11
 
 ### Added
@@ -227,7 +240,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.22...HEAD
+[0.1.22]: https://github.com/bsbofmusic/orderk/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/bsbofmusic/orderk/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/bsbofmusic/orderk/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/bsbofmusic/orderk/compare/v0.1.18...v0.1.19

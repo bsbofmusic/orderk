@@ -106,7 +106,7 @@ Open boundaries that are **not** silently claimed by this update:
 
 - The implemented live reflection writes a bounded LLM reflection section into generated Markdown; full structured card extraction, proposal apply/revert UX, and claim-level `explain` remain later gates.
 - Query-time search remains LLM=0 by default.
-- Whole-vault automatic reindex policy remains a later release/eval gate; P0/P1 currently proves the safer bounded path: explicit single-file `orderk index --path <generated.md>` plus retrieval smoke. Nightly worker generation and index feedback are separate steps unless future scheduler code wires them together with the same validator gates.
+- Whole-vault automatic reindex policy remains a later release/eval gate. P0/P1 now wires the safer bounded path into each non-dry Jianling run: after generated Markdown is written, the worker runs single-file `orderk index --path <generated.md>` through the active DB/profile, performs a retrieval smoke without external reranker, records `index_summary`, and marks the run degraded if the index or smoke gate fails.
 
 ### 2.5 Reflective action loop / documentation routing / config-log contract
 
@@ -160,8 +160,8 @@ A run must not be called “满血全开” merely because config files look rig
 3. **睡后反思，不阻塞白天搜索**
    默认 search/query path 不调用 LLM 反思；Jianling 在夜间或用户手动 `orderk jianling run` 时运行。
 
-4. **正反馈闭环（P0/P1 bounded path, P2 automation gate）**
-   `raw session -> Jianling digest/reflection md -> orderk index --path generated.md -> retrieval smoke -> future search/rerank better -> next Jianling has better context`。P0/P1 已验证单文件增量索引和检索回查；自动 nightly index wiring、全库策略、以及更强的 context-feedback planner 仍是后续门禁。
+4. **正反馈闭环（P0/P1 bounded path, P2 full-vault/planner gate）**
+   `raw session -> Jianling digest/reflection md -> automatic single-file orderk index feedback -> retrieval smoke -> future search/rerank better -> next Jianling has better context`。P0/P1 要求每个 non-dry generated Markdown run 自动执行 bounded `index --path` 并通过 retrieval smoke；全库策略和更强的 context-feedback planner 才是后续门禁。
 
 5. **主动但克制**
    只沉淀高价值经验；普通闲聊、一次性进度、状态废话、无复用价值材料不写入长期层。
@@ -1120,19 +1120,19 @@ write md -> update file metadata -> chunk -> embed -> update FTS/vector -> searc
 The new docs must become retrievable by OrderK. A run is not successful unless:
 
 - written files exist;
-- index update succeeds or is explicitly queued;
-- at least one smoke query can retrieve the daily digest by title/date/topic;
-- doctor marks generated files as indexed under the same embedding profile.
+- index update succeeds synchronously for the generated file;
+- at least one smoke query can retrieve the generated digest/reflection by run_id + title;
+- doctor/status surfaces expose degraded last-run state instead of hiding index failures.
 
 If indexing fails, generated Markdown remains a generated artifact on disk, but it is not considered searchable synthesis until reindex succeeds; run status is `degraded_index_failed`. Raw/human-authored evidence remains the truth layer.
 
 MVP index integration contract:
 
-- P0/P1 implements the safer bounded path `orderk index --path <vault-relative.md>` for generated Markdown; full-vault hash-based indexing remains available for maintenance/rebuilds but is not required for Jianling launch smoke.
+- P0/P1 implements the safer bounded path `orderk index --path <vault-relative.md>` for generated Markdown and wires that path into non-dry Jianling runs; full-vault hash-based indexing remains available for maintenance/rebuilds but is not required for Jianling launch smoke.
 - Scheduled runs must pass explicit `--vault` and `--db` from config; cwd must not decide the active vault.
-- Receipt records embedding profile fingerprint, chunk options, index command/method, files_seen, files_changed, chunks_changed, and index duration.
-- Future optimization may wire this bounded indexing step into the nightly worker, but it must preserve the same receipt schema and retrieval-smoke gate.
-- Smoke query: search for `{date + top topic + generated title}` and require the generated daily digest or reflection in top 5; otherwise mark `index_smoke_status=failed`.
+- Receipt records the bounded index method through `index_update`, `index_smoke_status`, and `index_summary` (`files`, `added`, `updated`, `chunks`, `embedded`, profile/backend, chunk options, and duration).
+- If indexing or retrieval smoke fails, generated Markdown remains on disk but the run is marked `degraded_index_failed` with warnings; it is not silently reported as full success.
+- Smoke query: search for `{run_id + generated title}` without external reranker and require the generated daily digest or reflection in top 5; otherwise mark `index_smoke_status=failed`.
 
 Feedback-to-second-brain contract:
 
@@ -1259,8 +1259,26 @@ Receipt schema:
   "budget_status": "within_budget|partial_source_file_limit|queued|failed",
   "pre_llm_guard_status": "passed|blocked|redacted|local_only",
   "pre_write_guard_status": "passed|blocked|redacted",
-  "index_update": "success|queued|failed",
-  "index_smoke_status": "passed|failed|skipped",
+  "index_update": "success|failed|pending|skipped_no_db|skipped_dry_run",
+  "index_smoke_status": "passed|failed|pending|skipped_no_db|skipped_dry_run|skipped_index_profile_failed|skipped_index_provider_failed|skipped_index_failed",
+  "index_summary": {
+    "path": "brain/daily/2026-06-10.md",
+    "files": 1,
+    "added": 1,
+    "updated": 0,
+    "unchanged": 0,
+    "deleted": 0,
+    "chunks": 7,
+    "embedded": 7,
+    "reused": 0,
+    "embedding_provider": "siliconflow|mock|openai|...",
+    "embedding_model": "Qwen/Qwen3-Embedding-4B",
+    "vector_backend": "sqlite_vec|exact",
+    "chunk_strategy": "heading|heading_overlap",
+    "chunk_max_chars": 1200,
+    "chunk_overlap_chars": 0,
+    "took_ms": 1234
+  },
   "fallback_used": false,
   "source_files": 18,
   "source_chars": 240000,
@@ -1303,13 +1321,12 @@ Receipt schema:
   "pii_findings": 0,
   "file_ops": [
     {
-      "op": "create|patch|delete|proposal_only",
-      "path": "brain/daily/2026-06-10.md",
+      "op": "create|replace|delete|proposal_only",
+      "target_path": "brain/daily/2026-06-10.md",
       "preimage_hash": null,
       "postimage_hash": "sha256:...",
-      "patch_id": null,
-      "bytes": 12345,
-      "index_required": true
+      "byte_count": 12345,
+      "index_update_required": true
     }
   ],
   "rollback_manifest": ".orderk/jianling/runs/2026-06-10T03-30-00.rollback.json",
@@ -1495,8 +1512,7 @@ Pass:
 - `jianling run` calls live LLM only when `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]` is true; otherwise it stays deterministic and records the explicit inactive status;
 - cloud consent and guard statuses;
 - bounded evidence bundle with fail-closed or explicit partial/chunk/foreman metadata;
-- write one daily digest with optional live reflection section; full structured card extraction, proposal apply/revert UX, and claim-level explain remain later gates;
-- reuse current whole-vault hash incremental index and run smoke query when that gate is enabled.
+- write one daily digest with optional live reflection section and automatic single-file index feedback + retrieval smoke; full structured card extraction, proposal apply/revert UX, full-vault strategy, and claim-level explain remain later gates;
 
 ### Phase 3 — Governance, proposals, rollback
 
