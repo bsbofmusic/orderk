@@ -52,6 +52,32 @@ fn seed_raw_dialogue(vault: &Path) {
     .unwrap();
 }
 
+fn seed_raw_dialogue_on(vault: &Path, date: &str, body: &str) {
+    let path = vault.join(format!(
+        "raw/transcripts/hermes-sessions/{}/{}/{}/dialogue.md",
+        &date[0..4],
+        &date[5..7],
+        &date[8..10]
+    ));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
+}
+
+fn read_topic_ledger(vault: &Path) -> serde_json::Value {
+    let path = vault.join(".orderk/jianling/topic_ledger.json");
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn seed_quality_review_source(vault: &Path, date: &str, extra: &str) {
+    seed_raw_dialogue_on(
+        vault,
+        date,
+        &format!(
+            "# Session {date}\n\n用户说：复杂任务要子代理 审计 复查 验收 gate，不能只靠单模型自证。{extra}\n",
+        ),
+    );
+}
+
 fn seed_mock_index_db(vault: &Path, db: &Path) {
     let provider = MockEmbeddingProvider::new(8);
     index_vault(
@@ -108,8 +134,13 @@ fn jianling_dry_run_reports_sources_without_writing_generated_memory() {
     assert_eq!(report.generated_source_tier, "generated_memory");
     assert_eq!(report.index_update, "skipped_dry_run");
     assert_eq!(report.index_smoke_status, "skipped_dry_run");
+    assert!(report.topic_ledger_path.is_none());
+    assert!(report.promotion_paths.is_empty());
+    assert_eq!(report.promotion_status, "not_applicable");
+    assert!(report.promotion_index_summaries.is_empty());
     assert!(report.success_predicate.pre_write_guard == "passed");
     assert!(!vault.join("brain/daily/2026-06-10.md").exists());
+    assert!(!vault.join(".orderk/jianling/topic_ledger.json").exists());
     assert!(!vault.join(".orderk/jianling/watermarks.json").exists());
 
     let _ = fs::remove_dir_all(vault);
@@ -292,6 +323,110 @@ fn jianling_index_feedback_reuses_existing_db_chunk_profile() {
     assert_eq!(summary.chunk_max_chars, 800);
     assert_eq!(summary.chunk_overlap_chars, 100);
     assert_eq!(summary.chunk_strategy, "heading_overlap");
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_daily_updates_topic_ledger_for_reflective_observations() {
+    let vault = temp_vault("ledger-create");
+    seed_quality_review_source(&vault, "2026-06-10", "第一次落账。");
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db),
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(report.ok, "daily run should succeed: {report:#?}");
+    let ledger = read_topic_ledger(&vault);
+    assert_eq!(ledger["schema_version"], "orderk.jianling.topic_ledger.v1");
+    assert_eq!(ledger["profile"], "default");
+    let topic = &ledger["topics"]["quality-review-preference"];
+    assert_eq!(topic["repeat_count"], 1);
+    assert_eq!(topic["seen_occurrences"].as_array().unwrap().len(), 1);
+    let ref0 = &topic["durable_evidence_refs"][0];
+    for key in [
+        "run_id",
+        "anchor_id",
+        "source_path",
+        "source_file_hash",
+        "quote_hash",
+    ] {
+        assert!(ref0.get(key).is_some(), "missing {key}: {ref0}");
+    }
+    assert!(report.topic_ledger_path.as_deref().is_some());
+    assert_eq!(report.promotion_status, "not_applicable");
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_topic_ledger_dedupes_same_occurrence_rerun() {
+    let vault = temp_vault("ledger-dedupe");
+    seed_quality_review_source(&vault, "2026-06-10", "重复同日。");
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    let options = JianlingRunOptions {
+        profile: "default".to_string(),
+        mode: JianlingRunMode::Daily,
+        dry_run: false,
+        scheduled: true,
+        db: Some(db.clone()),
+        date: Some("2026-06-10".to_string()),
+        max_source_files: 20,
+    };
+    let first = jianling_run(&vault, &options).unwrap();
+    let second = jianling_run(&vault, &options).unwrap();
+
+    assert!(first.ok && second.ok);
+    let ledger = read_topic_ledger(&vault);
+    let topic = &ledger["topics"]["quality-review-preference"];
+    assert_eq!(topic["repeat_count"], 1);
+    assert_eq!(topic["seen_occurrences"].as_array().unwrap().len(), 1);
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_topic_ledger_counts_distinct_daily_occurrences() {
+    let vault = temp_vault("ledger-distinct");
+    seed_quality_review_source(&vault, "2026-06-10", "第一天。");
+    seed_quality_review_source(&vault, "2026-06-11", "第二天。");
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    for date in ["2026-06-10", "2026-06-11"] {
+        let _ = jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: "default".to_string(),
+                mode: JianlingRunMode::Daily,
+                dry_run: false,
+                scheduled: true,
+                db: Some(db.clone()),
+                date: Some(date.to_string()),
+                max_source_files: 20,
+            },
+        )
+        .unwrap();
+    }
+
+    let ledger = read_topic_ledger(&vault);
+    let topic = &ledger["topics"]["quality-review-preference"];
+    assert_eq!(topic["repeat_count"], 2);
+    assert_eq!(topic["seen_occurrences"].as_array().unwrap().len(), 2);
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -764,6 +899,130 @@ fn jianling_weekly_and_monthly_write_prd_paths_not_reflections_bucket() {
 }
 
 #[test]
+fn jianling_weekly_promotes_repeated_high_confidence_topic_to_lesson_proposal() {
+    let vault = temp_vault("weekly-promote");
+    seed_quality_review_source(&vault, "2026-06-10", "第一次。");
+    seed_quality_review_source(&vault, "2026-06-11", "第二次。");
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    for date in ["2026-06-10", "2026-06-11"] {
+        let daily = jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: "default".to_string(),
+                mode: JianlingRunMode::Daily,
+                dry_run: false,
+                scheduled: true,
+                db: Some(db.clone()),
+                date: Some(date.to_string()),
+                max_source_files: 20,
+            },
+        )
+        .unwrap();
+        assert!(daily.ok, "daily seed should pass: {daily:#?}");
+    }
+
+    let weekly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Weekly,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db),
+            date: Some("2026-06-11".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(weekly.ok, "weekly promotion should succeed: {weekly:#?}");
+    assert_eq!(weekly.promotion_status, "proposed");
+    assert!(weekly
+        .promotion_paths
+        .contains(&"brain/lessons/quality-review-preference.md".to_string()));
+    assert_eq!(weekly.promotion_file_ops.len(), 1);
+    assert_eq!(
+        weekly.promotion_file_ops[0].target_path,
+        "brain/lessons/quality-review-preference.md"
+    );
+    assert!(weekly.promotion_file_ops[0].byte_count > 0);
+    assert!(weekly.promotion_file_ops[0].index_update_required);
+    assert_eq!(weekly.promotion_index_summaries.len(), 1);
+    assert_eq!(
+        weekly.promotion_index_summaries[0].path,
+        "brain/lessons/quality-review-preference.md"
+    );
+
+    let lesson =
+        fs::read_to_string(vault.join("brain/lessons/quality-review-preference.md")).unwrap();
+    assert!(lesson.contains("promotion_schema_version: orderk.jianling.promotion.v1"));
+    assert!(lesson.contains("status: proposed"));
+    assert!(lesson.contains("topic_key: quality-review-preference"));
+    assert!(lesson.contains("repeat_count: 2"));
+    assert!(lesson.contains("confidence: high"));
+    assert!(lesson.contains("run_id:"));
+    assert!(lesson.contains("anchor_id:"));
+    assert!(lesson.contains("source_path:"));
+    assert!(lesson.contains("source_file_hash:"));
+    assert!(lesson.contains("quote_hash:"));
+
+    let ledger = read_topic_ledger(&vault);
+    let topic = &ledger["topics"]["quality-review-preference"];
+    assert_eq!(topic["repeat_count"], 2);
+    assert_eq!(topic["promotion_status"], "proposed");
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_weekly_does_not_promote_single_occurrence() {
+    let vault = temp_vault("weekly-single-no-promote");
+    seed_quality_review_source(&vault, "2026-06-10", "单次不能沉淀成长课题。");
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    let daily = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db.clone()),
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert!(daily.ok);
+
+    let weekly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Weekly,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db),
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(weekly.ok);
+    assert_eq!(weekly.promotion_status, "no_candidates");
+    assert!(weekly.promotion_paths.is_empty());
+    assert!(!vault
+        .join("brain/lessons/quality-review-preference.md")
+        .exists());
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
 fn jianling_global_profile_lock_blocks_cross_mode_conflicts() {
     let vault = temp_vault("global-lock");
     seed_raw_dialogue(&vault);
@@ -793,6 +1052,210 @@ fn jianling_global_profile_lock_blocks_cross_mode_conflicts() {
         msg.contains("Jianling lock exists"),
         "unexpected error: {msg}"
     );
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_weekly_promotion_index_failure_is_fail_closed() {
+    let vault = temp_vault("weekly-fail-closed");
+    seed_quality_review_source(&vault, "2026-06-10", "第一次。");
+    seed_quality_review_source(&vault, "2026-06-11", "第二次。");
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    for date in ["2026-06-10", "2026-06-11"] {
+        let daily = jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: "default".to_string(),
+                mode: JianlingRunMode::Daily,
+                dry_run: false,
+                scheduled: true,
+                db: Some(db.clone()),
+                date: Some(date.to_string()),
+                max_source_files: 20,
+            },
+        )
+        .unwrap();
+        assert!(daily.ok, "daily seed should pass: {daily:#?}");
+    }
+
+    let weekly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Weekly,
+            dry_run: false,
+            scheduled: true,
+            db: None,
+            date: Some("2026-06-11".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(!weekly.ok);
+    assert_eq!(weekly.status, "degraded_promotion_index_failed");
+    assert_eq!(weekly.promotion_status, "degraded_index_failed");
+    assert!(weekly
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("promotion index feedback failed")));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_promotion_overwrite_rules_respect_existing_targets() {
+    let vault = temp_vault("promotion-overwrite");
+    seed_quality_review_source(&vault, "2026-06-10", "第一次。");
+    seed_quality_review_source(&vault, "2026-06-11", "第二次。");
+    let target = vault.join("brain/lessons/quality-review-preference.md");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "# Human note\n\nDo not overwrite me.\n").unwrap();
+
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    for date in ["2026-06-10", "2026-06-11"] {
+        let daily = jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: "default".to_string(),
+                mode: JianlingRunMode::Daily,
+                dry_run: false,
+                scheduled: true,
+                db: Some(db.clone()),
+                date: Some(date.to_string()),
+                max_source_files: 20,
+            },
+        )
+        .unwrap();
+        assert!(daily.ok, "daily seed should pass: {daily:#?}");
+    }
+
+    let weekly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Weekly,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db),
+            date: Some("2026-06-11".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(weekly.ok);
+    assert_eq!(weekly.promotion_status, "skipped");
+    assert!(weekly.promotion_paths.is_empty());
+    assert!(weekly
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("non-Jianling human content")));
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "# Human note\n\nDo not overwrite me.\n"
+    );
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_empty_source_does_not_update_topic_ledger() {
+    let vault = temp_vault("empty-source-ledger");
+    fs::create_dir_all(vault.join("raw/system-snapshots/2026/06/10")).unwrap();
+    fs::write(
+        vault.join("raw/system-snapshots/2026/06/10/noise.md"),
+        "# only noise\n",
+    )
+    .unwrap();
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: true,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(report.ok);
+    assert!(report.topic_ledger_path.is_none());
+    assert!(report.promotion_paths.is_empty());
+    assert!(!vault.join(".orderk/jianling/topic_ledger.json").exists());
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_empty_rollup_with_existing_ledger_does_not_promote_or_rewrite_ledger() {
+    let vault = temp_vault("empty-rollup-ledger");
+    seed_quality_review_source(&vault, "2026-06-10", "第一次。");
+    seed_quality_review_source(&vault, "2026-06-11", "第二次。");
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    for date in ["2026-06-10", "2026-06-11"] {
+        let daily = jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: "default".to_string(),
+                mode: JianlingRunMode::Daily,
+                dry_run: false,
+                scheduled: true,
+                db: Some(db.clone()),
+                date: Some(date.to_string()),
+                max_source_files: 20,
+            },
+        )
+        .unwrap();
+        assert!(daily.ok, "daily seed should pass: {daily:#?}");
+    }
+
+    let ledger_path = vault.join(".orderk/jianling/topic_ledger.json");
+    let before = fs::read_to_string(&ledger_path).unwrap();
+    fs::remove_dir_all(vault.join("raw/transcripts/hermes-sessions/2026/06")).unwrap();
+    fs::create_dir_all(vault.join("raw/system-snapshots/2026/06/11")).unwrap();
+    fs::write(
+        vault.join("raw/system-snapshots/2026/06/11/noise.md"),
+        "# only noise\n",
+    )
+    .unwrap();
+
+    let weekly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Weekly,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db),
+            date: Some("2026-06-11".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        weekly.ok,
+        "empty rollup should remain non-promoting: {weekly:#?}"
+    );
+    assert_eq!(weekly.source_files, 0);
+    assert!(weekly.topic_ledger_path.is_none());
+    assert!(weekly.promotion_paths.is_empty());
+    assert!(!vault
+        .join("brain/lessons/quality-review-preference.md")
+        .exists());
+    assert_eq!(fs::read_to_string(&ledger_path).unwrap(), before);
 
     let _ = fs::remove_dir_all(vault);
 }

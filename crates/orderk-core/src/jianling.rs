@@ -202,6 +202,53 @@ struct JianlingIndexProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct JianlingTopicLedger {
+    schema_version: String,
+    profile: String,
+    updated_at: String,
+    topics: BTreeMap<String, JianlingTopicEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct JianlingTopicEntry {
+    topic_key: String,
+    title: String,
+    first_seen: String,
+    last_seen: String,
+    repeat_count: usize,
+    confidence: String,
+    seen_occurrences: Vec<String>,
+    durable_evidence_refs: Vec<JianlingDurableEvidenceRef>,
+    source_paths: Vec<String>,
+    source_file_hashes: Vec<String>,
+    modes_seen: Vec<String>,
+    latest_next_action: String,
+    promotion_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct JianlingDurableEvidenceRef {
+    run_id: String,
+    anchor_id: String,
+    source_path: String,
+    source_file_hash: String,
+    quote_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct JianlingPromotionWrite {
+    rel_path: String,
+    body: String,
+    file_op: JianlingFileOp,
+    skipped: bool,
+    warning: Option<String>,
+}
+
+fn default_promotion_status() -> String {
+    "not_applicable".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JianlingRunReport {
     pub ok: bool,
     pub schema_version: String,
@@ -225,6 +272,16 @@ pub struct JianlingRunReport {
     pub index_smoke_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_summary: Option<JianlingIndexSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_ledger_path: Option<String>,
+    #[serde(default)]
+    pub promotion_paths: Vec<String>,
+    #[serde(default = "default_promotion_status")]
+    pub promotion_status: String,
+    #[serde(default)]
+    pub promotion_index_summaries: Vec<JianlingIndexSummary>,
+    #[serde(default)]
+    pub promotion_file_ops: Vec<JianlingFileOp>,
     pub fallback_used: bool,
     pub success_predicate: JianlingSuccessPredicate,
     pub source_files: usize,
@@ -559,7 +616,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         schema_version: "orderk.jianling.evidence.v1",
         run_id: &run_id,
         source_anchors: &source_anchors,
-        selected_sources: evidence_sources,
+        selected_sources: evidence_sources.clone(),
     };
     let evidence_json = serde_json::to_string_pretty(&evidence_pack)? + "\n";
     let evidence_hash = format!("sha256:{}", sha256_hex(evidence_json.as_bytes()));
@@ -614,6 +671,11 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         index_update: index_update.to_string(),
         index_smoke_status: index_smoke_status.to_string(),
         index_summary: None,
+        topic_ledger_path: None,
+        promotion_paths: Vec::new(),
+        promotion_status: default_promotion_status(),
+        promotion_index_summaries: Vec::new(),
+        promotion_file_ops: Vec::new(),
         fallback_used,
         success_predicate: JianlingSuccessPredicate {
             provider: provider_status.clone(),
@@ -733,6 +795,89 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             report.success_predicate.index_smoke = "failed".to_string();
         } else if report.index_smoke_status == "passed" {
             report.success_predicate.index_smoke = "passed".to_string();
+        }
+
+        let ledger_path = topic_ledger_path(&root);
+        if report.ok && !report.source_anchors.is_empty() {
+            let observations = derive_reflective_observations(
+                &report.source_anchors,
+                &evidence_sources,
+                &report.rejected_source_files,
+            );
+            let mut ledger = load_topic_ledger(&ledger_path, &profile)?;
+            let mut ledger_changed = update_topic_ledger_after_success(
+                &mut ledger,
+                &run_id,
+                &options.mode,
+                &date,
+                &observations,
+                &report.source_anchors,
+                &evidence_sources,
+            );
+            let promotion_writes =
+                write_promotion_proposals(&vault, &ledger, &options.mode, &run_id, &date)?;
+            for promotion in promotion_writes {
+                if let Some(warning) = promotion.warning {
+                    report.warnings.push(warning);
+                }
+                if promotion.skipped {
+                    if report.promotion_status == "not_applicable" {
+                        report.promotion_status = "skipped".to_string();
+                    }
+                    continue;
+                }
+                report.promotion_paths.push(promotion.rel_path.clone());
+                report.promotion_file_ops.push(promotion.file_op.clone());
+                let promotion_feedback = run_jianling_index_feedback(
+                    &vault,
+                    options.db.as_deref(),
+                    &promotion.rel_path,
+                    &run_id,
+                    &format!("Jianling Lesson Proposal {}", promotion.rel_path),
+                );
+                if let Some(summary) = promotion_feedback.index_summary {
+                    report.promotion_index_summaries.push(summary);
+                }
+                report.warnings.extend(promotion_feedback.warnings);
+                if promotion_feedback.degraded
+                    || promotion_feedback.index_smoke_status != "passed"
+                    || promotion_feedback.index_update == "skipped_no_db"
+                {
+                    report.ok = false;
+                    report.status = "degraded_promotion_index_failed".to_string();
+                    report.promotion_status = "degraded_index_failed".to_string();
+                    report.success_predicate.index_smoke = "failed".to_string();
+                    report.warnings.push(format!(
+                        "promotion index feedback failed for {}: update={}, smoke={}",
+                        promotion.rel_path,
+                        promotion_feedback.index_update,
+                        promotion_feedback.index_smoke_status
+                    ));
+                }
+            }
+            if !report.promotion_paths.is_empty() && report.ok {
+                mark_promoted_topics(&mut ledger, &report.promotion_paths);
+                ledger_changed = true;
+                report.promotion_status = "proposed".to_string();
+                report
+                    .generated_files
+                    .extend(report.promotion_paths.clone());
+            } else if report.promotion_paths.is_empty()
+                && report.promotion_status == "not_applicable"
+            {
+                report.promotion_status = if matches!(
+                    options.mode,
+                    JianlingRunMode::Daily | JianlingRunMode::Manual
+                ) {
+                    "not_applicable".to_string()
+                } else {
+                    "no_candidates".to_string()
+                };
+            }
+            if ledger_changed {
+                save_topic_ledger_atomic(&ledger_path, &ledger)?;
+                report.topic_ledger_path = Some(ledger_path.to_string_lossy().to_string());
+            }
         }
         ensure_plain_output_file(&evidence_path, "jianling evidence pack")?;
         fs::write(&evidence_path, evidence_json)?;
@@ -874,6 +1019,440 @@ fn run_jianling_index_feedback(
             warnings: vec![format!("index smoke failed: {err}")],
             degraded: true,
         },
+    }
+}
+
+fn topic_ledger_path(root: &Path) -> PathBuf {
+    root.join("topic_ledger.json")
+}
+
+fn load_topic_ledger(path: &Path, profile: &str) -> Result<JianlingTopicLedger> {
+    if !path.exists() {
+        return Ok(empty_topic_ledger(profile));
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read Jianling topic ledger: {}", path.display()))?;
+    let mut ledger: JianlingTopicLedger = serde_json::from_str(&raw)
+        .with_context(|| format!("parse Jianling topic ledger: {}", path.display()))?;
+    if ledger.schema_version != "orderk.jianling.topic_ledger.v1" {
+        return Err(anyhow!(
+            "unsupported Jianling topic ledger schema_version: {}",
+            ledger.schema_version
+        ));
+    }
+    if ledger.profile != profile {
+        return Err(anyhow!(
+            "Jianling topic ledger profile mismatch: expected {}, got {}",
+            profile,
+            ledger.profile
+        ));
+    }
+    for entry in ledger.topics.values_mut() {
+        entry.seen_occurrences.sort();
+        entry.seen_occurrences.dedup();
+        entry.source_paths.sort();
+        entry.source_paths.dedup();
+        entry.source_file_hashes.sort();
+        entry.source_file_hashes.dedup();
+        entry.modes_seen.sort();
+        entry.modes_seen.dedup();
+    }
+    Ok(ledger)
+}
+
+fn empty_topic_ledger(profile: &str) -> JianlingTopicLedger {
+    JianlingTopicLedger {
+        schema_version: "orderk.jianling.topic_ledger.v1".to_string(),
+        profile: profile.to_string(),
+        updated_at: Utc::now().to_rfc3339(),
+        topics: BTreeMap::new(),
+    }
+}
+
+fn save_topic_ledger_atomic(path: &Path, ledger: &JianlingTopicLedger) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        prepare_child_dir(parent, "jianling topic ledger")?;
+    }
+    ensure_plain_output_file(path, "jianling topic ledger")?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    ensure_plain_output_file(&tmp, "jianling topic ledger temp")?;
+    fs::write(&tmp, serde_json::to_string_pretty(ledger)? + "\n")?;
+    fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "atomically replace Jianling topic ledger: {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn topic_key_for_observation(title: &str) -> String {
+    match title {
+        "质量复查偏好" => "quality-review-preference".to_string(),
+        "底账不可丢" => "ledger-preservation".to_string(),
+        "反思要有判断" => "reflective-judgment".to_string(),
+        "覆盖不完整" => "partial-coverage-risk".to_string(),
+        "证据优先" => "evidence-first".to_string(),
+        other => slugify_topic_key(other),
+    }
+}
+
+fn slugify_topic_key(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | ' ' | '/' | ':') && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "observed-pattern".to_string()
+    } else {
+        out
+    }
+}
+
+fn observation_occurrence_id(
+    topic_key: &str,
+    mode: &JianlingRunMode,
+    date: &str,
+    sources: &[EvidenceSource],
+    anchors: &[JianlingSourceAnchor],
+) -> String {
+    let payload = json!({
+        "topic_key": topic_key,
+        "mode": mode.as_str(),
+        "date": date,
+        "source_paths": sources.iter().map(|source| source.path.clone()).collect::<Vec<_>>(),
+        "source_file_hashes": sources.iter().map(|source| source.hash.clone()).collect::<Vec<_>>(),
+        "quote_hashes": anchors.iter().map(|anchor| anchor.quote_hash.clone()).collect::<Vec<_>>(),
+    });
+    format!("occurrence:{}", sha256_hex(payload.to_string().as_bytes()))
+}
+
+fn durable_evidence_refs_for(
+    run_id: &str,
+    anchors: &[JianlingSourceAnchor],
+) -> Vec<JianlingDurableEvidenceRef> {
+    anchors
+        .iter()
+        .take(12)
+        .map(|anchor| JianlingDurableEvidenceRef {
+            run_id: run_id.to_string(),
+            anchor_id: anchor.id.clone(),
+            source_path: anchor.path.clone(),
+            source_file_hash: anchor.source_file_hash.clone(),
+            quote_hash: anchor.quote_hash.clone(),
+        })
+        .collect()
+}
+
+fn update_topic_ledger_after_success(
+    ledger: &mut JianlingTopicLedger,
+    run_id: &str,
+    mode: &JianlingRunMode,
+    date: &str,
+    observations: &[ReflectiveObservation],
+    anchors: &[JianlingSourceAnchor],
+    sources: &[EvidenceSource],
+) -> bool {
+    if !matches!(mode, JianlingRunMode::Daily | JianlingRunMode::Manual) {
+        return false;
+    }
+    if sources.is_empty() || anchors.is_empty() {
+        return false;
+    }
+    let now = Utc::now().to_rfc3339();
+    let source_paths = sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<Vec<_>>();
+    let source_hashes = sources
+        .iter()
+        .map(|source| source.hash.clone())
+        .collect::<Vec<_>>();
+    let durable_refs = durable_evidence_refs_for(run_id, anchors);
+    let mut changed = false;
+    for observation in observations {
+        let topic_key = topic_key_for_observation(observation.title);
+        let occurrence_id = observation_occurrence_id(&topic_key, mode, date, sources, anchors);
+        let entry = ledger
+            .topics
+            .entry(topic_key.clone())
+            .or_insert_with(|| JianlingTopicEntry {
+                topic_key: topic_key.clone(),
+                title: observation.title.to_string(),
+                first_seen: date.to_string(),
+                last_seen: date.to_string(),
+                repeat_count: 0,
+                confidence: observation.confidence.to_string(),
+                seen_occurrences: Vec::new(),
+                durable_evidence_refs: Vec::new(),
+                source_paths: Vec::new(),
+                source_file_hashes: Vec::new(),
+                modes_seen: Vec::new(),
+                latest_next_action: observation.next_action.to_string(),
+                promotion_status: "none".to_string(),
+            });
+        entry.title = observation.title.to_string();
+        entry.last_seen = date.to_string();
+        entry.confidence =
+            stronger_confidence(&entry.confidence, observation.confidence).to_string();
+        entry.latest_next_action = observation.next_action.to_string();
+        push_unique(&mut entry.modes_seen, mode.as_str().to_string());
+        for source_path in &source_paths {
+            push_unique(&mut entry.source_paths, source_path.clone());
+        }
+        for source_hash in &source_hashes {
+            push_unique(&mut entry.source_file_hashes, source_hash.clone());
+        }
+        for durable_ref in &durable_refs {
+            if !entry.durable_evidence_refs.contains(durable_ref) {
+                entry.durable_evidence_refs.push(durable_ref.clone());
+            }
+        }
+        if !entry.seen_occurrences.contains(&occurrence_id) {
+            entry.seen_occurrences.push(occurrence_id);
+            entry.repeat_count = entry.seen_occurrences.len();
+            changed = true;
+        }
+    }
+    if changed {
+        ledger.updated_at = now;
+    }
+    changed
+}
+
+fn stronger_confidence<'a>(current: &'a str, incoming: &'a str) -> &'a str {
+    if confidence_rank(incoming) > confidence_rank(current) {
+        incoming
+    } else {
+        current
+    }
+}
+
+fn confidence_rank(value: &str) -> u8 {
+    match value {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+        values.sort();
+    }
+}
+
+fn promotion_candidates_for_mode<'a>(
+    mode: &JianlingRunMode,
+    ledger: &'a JianlingTopicLedger,
+) -> Vec<&'a JianlingTopicEntry> {
+    if matches!(mode, JianlingRunMode::Daily | JianlingRunMode::Manual) {
+        return Vec::new();
+    }
+    ledger
+        .topics
+        .values()
+        .filter(|entry| {
+            entry.repeat_count >= 2
+                && entry.confidence == "high"
+                && entry.promotion_status != "accepted"
+                && entry.promotion_status != "superseded"
+        })
+        .collect()
+}
+
+fn promotion_rel_for_topic(topic_key: &str) -> String {
+    format!("brain/lessons/{}.md", slugify_topic_key(topic_key))
+}
+
+fn render_lesson_proposal(entry: &JianlingTopicEntry, run_id: &str, date: &str) -> String {
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str("generated_by: orderk-jianling\n");
+    out.push_str("promotion_schema_version: orderk.jianling.promotion.v1\n");
+    out.push_str(&format!("run_id: {run_id}\n"));
+    out.push_str("status: proposed\n");
+    out.push_str("type: lesson_proposal\n");
+    out.push_str(&format!("topic_key: {}\n", entry.topic_key));
+    out.push_str(&format!("title: {}\n", entry.title));
+    out.push_str(&format!("repeat_count: {}\n", entry.repeat_count));
+    out.push_str(&format!("confidence: {}\n", entry.confidence));
+    out.push_str(&format!("date: {date}\n"));
+    out.push_str("source_anchors:\n");
+    for evidence in entry.durable_evidence_refs.iter().take(12) {
+        out.push_str(&format!("  - run_id: {}\n", evidence.run_id));
+        out.push_str(&format!("    anchor_id: {}\n", evidence.anchor_id));
+        out.push_str(&format!("    source_path: {}\n", evidence.source_path));
+        out.push_str(&format!(
+            "    source_file_hash: {}\n",
+            evidence.source_file_hash
+        ));
+        out.push_str(&format!("    quote_hash: {}\n", evidence.quote_hash));
+    }
+    out.push_str("claim_refs:\n");
+    for evidence in entry.durable_evidence_refs.iter().take(12) {
+        out.push_str(&format!("  - {}#{}\n", evidence.run_id, evidence.anchor_id));
+    }
+    out.push_str("---\n\n");
+    out.push_str(&format!("# Lesson Proposal — {}\n\n", entry.title));
+    out.push_str("## 观察\n");
+    out.push_str(&format!(
+        "- topic_key: `{}`；repeat_count: `{}`；confidence: `{}`。\n",
+        entry.topic_key, entry.repeat_count, entry.confidence
+    ));
+    out.push_str(&format!(
+        "- latest_next_action: {}\n\n",
+        entry.latest_next_action
+    ));
+    out.push_str("## 证据索引\n");
+    for evidence in entry.durable_evidence_refs.iter().take(12) {
+        out.push_str(&format!(
+            "- `{}`#{} path=`{}` source_file_hash=`{}` quote_hash=`{}`\n",
+            evidence.run_id,
+            evidence.anchor_id,
+            evidence.source_path,
+            evidence.source_file_hash,
+            evidence.quote_hash
+        ));
+    }
+    out.push_str("\n## 候选落点\n");
+    out.push_str("- USER memory candidate: only after human approval.\n");
+    out.push_str("- owner skill candidate: only after human approval and independent audit.\n");
+    out.push_str("- PRD/test-gate candidate: only through explicit repo change, not automatic memory promotion.\n");
+    out
+}
+
+fn write_promotion_proposals(
+    vault: &Path,
+    ledger: &JianlingTopicLedger,
+    mode: &JianlingRunMode,
+    run_id: &str,
+    date: &str,
+) -> Result<Vec<JianlingPromotionWrite>> {
+    let mut writes = Vec::new();
+    for entry in promotion_candidates_for_mode(mode, ledger) {
+        let rel_path = promotion_rel_for_topic(&entry.topic_key);
+        let target = safe_vault_path(vault, Path::new(&rel_path))?;
+        ensure_vault_path_has_no_symlink_escape(vault, &target, "jianling lesson proposal")?;
+        if let Some(parent) = target.parent() {
+            prepare_child_dir(parent, "jianling lesson proposals")?;
+        }
+        let existing = if target.exists() {
+            Some(fs::read_to_string(&target).with_context(|| {
+                format!(
+                    "read existing Jianling lesson proposal: {}",
+                    target.display()
+                )
+            })?)
+        } else {
+            None
+        };
+        if let Some(existing_text) = existing.as_deref() {
+            if !existing_text.contains("generated_by: orderk-jianling") {
+                writes.push(JianlingPromotionWrite {
+                    rel_path,
+                    body: String::new(),
+                    file_op: JianlingFileOp {
+                        op: "skip".to_string(),
+                        target_path: String::new(),
+                        preimage_hash: None,
+                        postimage_hash: String::new(),
+                        byte_count: 0,
+                        index_update_required: false,
+                    },
+                    skipped: true,
+                    warning: Some(format!(
+                        "promotion target is non-Jianling human content; skipped without overwrite: {}",
+                        target.display()
+                    )),
+                });
+                continue;
+            }
+            if existing_text.contains("status: active_user_approved") {
+                writes.push(JianlingPromotionWrite {
+                    rel_path,
+                    body: String::new(),
+                    file_op: JianlingFileOp {
+                        op: "skip".to_string(),
+                        target_path: String::new(),
+                        preimage_hash: file_hash_if_exists(&target)?,
+                        postimage_hash: String::new(),
+                        byte_count: 0,
+                        index_update_required: false,
+                    },
+                    skipped: true,
+                    warning: Some(format!(
+                        "promotion target is active_user_approved; skipped without overwrite: {}",
+                        target.display()
+                    )),
+                });
+                continue;
+            }
+            if !existing_text.contains("status: proposed") {
+                writes.push(JianlingPromotionWrite {
+                    rel_path,
+                    body: String::new(),
+                    file_op: JianlingFileOp {
+                        op: "skip".to_string(),
+                        target_path: String::new(),
+                        preimage_hash: file_hash_if_exists(&target)?,
+                        postimage_hash: String::new(),
+                        byte_count: 0,
+                        index_update_required: false,
+                    },
+                    skipped: true,
+                    warning: Some(format!(
+                        "promotion target generated status is not proposed; skipped without overwrite: {}",
+                        target.display()
+                    )),
+                });
+                continue;
+            }
+        }
+        ensure_plain_output_file(&target, "jianling lesson proposal")?;
+        let body = render_lesson_proposal(entry, run_id, date);
+        let preimage_hash = file_hash_if_exists(&target)?;
+        let op = if target.exists() { "replace" } else { "create" }.to_string();
+        let postimage_hash = format!("sha256:{}", sha256_hex(body.as_bytes()));
+        fs::write(&target, &body)?;
+        writes.push(JianlingPromotionWrite {
+            rel_path: rel_path.clone(),
+            body,
+            file_op: JianlingFileOp {
+                op,
+                target_path: rel_path,
+                preimage_hash,
+                postimage_hash,
+                byte_count: writes.last().map(|_| 0).unwrap_or(0),
+                index_update_required: true,
+            },
+            skipped: false,
+            warning: None,
+        });
+        if let Some(write) = writes.last_mut() {
+            write.file_op.byte_count = write.body.len();
+        }
+    }
+    Ok(writes)
+}
+
+fn mark_promoted_topics(ledger: &mut JianlingTopicLedger, paths: &[String]) {
+    for path in paths {
+        if let Some(file_name) = Path::new(path).file_stem().and_then(|stem| stem.to_str()) {
+            if let Some(entry) = ledger.topics.get_mut(file_name) {
+                entry.promotion_status = "proposed".to_string();
+            }
+        }
+    }
+    if !paths.is_empty() {
+        ledger.updated_at = Utc::now().to_rfc3339();
     }
 }
 

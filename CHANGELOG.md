@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-06-13
+
+### Added
+- Add Jianling promotion ledger tracking for repeated reflective observations, including source-anchored topic entries, durable evidence refs, and weekly/monthly/yearly lesson proposal promotion under `brain/lessons/`.
+
+### Fixed
+- Fail closed when promotion lesson writes cannot be indexed or smoke-tested, reporting `degraded_promotion_index_failed` instead of success.
+- Skip ledger updates and lesson promotion for empty-source runs, even when an older topic ledger already contains eligible candidates.
+
+### Verification
+- `cargo fmt --all -- --check`, `cargo test -p orderk-core --test jianling_contract -- --nocapture` (32/32), `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo build --release --locked`, and `python3 scripts/release_gate.py` passed locally before release.
+- Independent read-only safety audit found the empty-source promotion blocker; the fix was covered by regression test and post-fix audit passed.
+
 ## [0.1.23] - 2026-06-12
 
 ### Changed
@@ -249,7 +262,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.23...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.24...HEAD
+[0.1.24]: https://github.com/bsbofmusic/orderk/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/bsbofmusic/orderk/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/bsbofmusic/orderk/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/bsbofmusic/orderk/compare/v0.1.20...v0.1.21
