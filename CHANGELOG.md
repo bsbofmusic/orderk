@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-06-12
+
+### Changed
+- Make Jianling generated Markdown use `orderk.jianling.digest.v2`: a seven-section daily/weekly/monthly/yearly reflection (`一句话结论`, factual ledger, reflective synthesis, user-system patterns, open risks, next actions, evidence appendix) that preserves objective evidence while adding confidence-tagged observations and concrete next actions.
+- Tighten the live MiniMax M3 reflection prompt so it must distinguish factual ledger from reflective synthesis instead of returning a raw evidence list.
+
+### Verification
+- `cargo fmt --all` and `cargo test -p orderk-core --test jianling_contract -- --nocapture` passed locally after adding contract assertions for ledger/observation sections and deterministic observations such as `质量复查偏好`.
+
 ## [0.1.22] - 2026-06-12
 
 ### Fixed
@@ -240,7 +249,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.22...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.23...HEAD
+[0.1.23]: https://github.com/bsbofmusic/orderk/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/bsbofmusic/orderk/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/bsbofmusic/orderk/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/bsbofmusic/orderk/compare/v0.1.19...v0.1.20

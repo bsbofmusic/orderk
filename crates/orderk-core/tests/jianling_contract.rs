@@ -34,7 +34,7 @@ fn seed_raw_dialogue(vault: &Path) {
 
 ### 2026-06-10T03:00:00+08:00 — user
 ```text
-以后 session 入库要保留去噪后的完整原文，不要压成关键词卡。
+以后 session 入库要保留去噪后的完整原文，不要压成关键词卡。复杂任务要子代理审计和复查，不能单模型自证。底账也要，观察也要；reflect 要像 Hindsight 一样沉淀精炼，形成有灵魂的日报。
 ```
 
 ### 2026-06-10T03:01:00+08:00 — assistant
@@ -148,6 +148,21 @@ fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
     assert!(daily_text.contains("status: active_generated"));
     assert!(daily_text.contains("source_tier: generated_memory"));
     assert!(daily_text.contains("source_anchors:"));
+    assert!(daily_text.contains("digest_schema_version: orderk.jianling.digest.v2"));
+    assert!(daily_text.contains("reflection_layers: [factual_ledger, reflective_synthesis]"));
+    assert!(daily_text.contains("## 一句话结论"));
+    assert!(daily_text.contains("## 客观底账 / Factual ledger"));
+    assert!(daily_text.contains("## 推断观察 / Reflective synthesis"));
+    assert!(daily_text.contains("## 用户/系统模式 / User-system patterns"));
+    assert!(daily_text.contains("## 未闭合风险 / Open risks"));
+    assert!(daily_text.contains("## 下次动作 / Next actions"));
+    assert!(daily_text.contains("## 证据附录 / Evidence appendix"));
+    assert!(daily_text.contains("质量复查偏好"));
+    assert!(daily_text.contains("底账不可丢"));
+    assert!(daily_text.contains("反思要有判断"));
+    assert!(daily_text.contains("confidence: high"));
+    assert!(daily_text.contains("next:"));
+    assert!(daily_text.contains("promotion rule:"));
     assert!(daily_text.contains("session 入库要保留去噪后的完整原文"));
 
     assert!(Path::new(&report.receipt_path).is_file());
@@ -997,16 +1012,18 @@ fn jianling_apply_configured_llm_without_hot_switch_does_not_call_provider() {
     );
     assert_eq!(server.request_count(), 0);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(!daily_text.contains("## LLM 反思（MiniMax M3）"));
+    assert!(!daily_text.contains("\n## LLM 反思（MiniMax M3）"));
 
     let _ = fs::remove_dir_all(vault);
 }
 
 #[test]
-fn jianling_apply_calls_configured_llm_and_writes_reflection() {
+fn jianling_apply_calls_configured_llm_and_writes_contract_valid_reflection() {
     let vault = temp_vault("live-llm-run");
     seed_raw_dialogue(&vault);
-    let server = FakeAnthropicServer::start("- LLM reflection from fake MiniMax [S1]\n");
+    let server = FakeAnthropicServer::start(
+        "### 观察\n- LLM reflection from fake MiniMax [S1] confidence: high; next: keep independent audit before release.\n### 风险/未闭合\n- no extra risk beyond source evidence [S1] confidence: medium.\n### 下次动作\n- verify receipt and index feedback [S1].\n",
+    );
     let _guard = ScopedEnv::set(&[
         ("ORDERK_JIANLING_LLM_ENABLED_LLMMODE", "1"),
         ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
@@ -1030,9 +1047,99 @@ fn jianling_apply_calls_configured_llm_and_writes_reflection() {
 
     assert_eq!(report.provider_status, "called_live");
     assert_eq!(report.success_predicate.provider, "called_live");
+    assert!(report.ok);
+    assert!(!report.fallback_used);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(daily_text.contains("## LLM 反思（MiniMax M3）"));
-    assert!(daily_text.contains("LLM reflection from fake MiniMax [S1]"));
+    assert!(daily_text.contains("### LLM 反思（MiniMax M3）"));
+    assert!(!daily_text.contains("\n## LLM 反思（MiniMax M3）"));
+    assert!(daily_text.contains("LLM reflection from fake MiniMax [S1] confidence: high"));
+    assert!(daily_text.contains("next: keep independent audit before release"));
+    assert_eq!(server.request_count(), 1);
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_apply_rejects_contract_invalid_llm_reflection() {
+    let vault = temp_vault("live-llm-invalid");
+    seed_raw_dialogue(&vault);
+    let server = FakeAnthropicServer::start("- LLM reflection from fake MiniMax [S1]\n");
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_LLMMODEINVALID", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "llmmodeinvalid".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(!report.ok);
+    assert_eq!(report.status, "degraded_llm_schema_invalid");
+    assert_eq!(report.provider_status, "called_live_schema_invalid");
+    assert_eq!(
+        report.success_predicate.provider,
+        "called_live_schema_invalid"
+    );
+    assert!(report.fallback_used);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("live LLM reflection rejected")));
+    let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
+    assert!(!daily_text.contains("### LLM 反思（MiniMax M3）"));
+    assert!(!daily_text.contains("LLM reflection from fake MiniMax"));
+    assert_eq!(server.request_count(), 1);
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_apply_rejects_llm_reflection_with_extra_top_level_heading() {
+    let vault = temp_vault("live-llm-extra-heading");
+    seed_raw_dialogue(&vault);
+    let server = FakeAnthropicServer::start(
+        "## Extra top-level heading\n### 观察\n- looks grounded [S1] confidence: high; next: do not publish invalid structure.\n### 风险/未闭合\n- top-level heading would break seven-section digest [S1] confidence: high.\n### 下次动作\n- reject this response [S1].\n",
+    );
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_LLMHEADING", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "llmheading".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(!report.ok);
+    assert_eq!(report.status, "degraded_llm_schema_invalid");
+    assert_eq!(report.provider_status, "called_live_schema_invalid");
+    assert!(report.fallback_used);
+    let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
+    assert!(!daily_text.contains("Extra top-level heading"));
+    assert!(!daily_text.contains("\n## Extra top-level heading"));
     assert_eq!(server.request_count(), 1);
 
     let _ = fs::remove_dir_all(vault);

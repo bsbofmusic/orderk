@@ -502,6 +502,8 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
     }
 
     let mut provider_status = jianling_provider_status_for_dry_run(options.dry_run, &profile);
+    let mut fallback_used = false;
+    let mut llm_contract_degraded = false;
     let mut generated_body = render_jianling_digest(
         &options.mode,
         &date,
@@ -522,10 +524,22 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             source_total_files: selection.total_files,
             rejected_source_files: &selection.rejected_paths,
         })? {
-            provider_status = "called_live".to_string();
-            generated_body.push_str("\n## LLM 反思（MiniMax M3）\n");
-            generated_body.push_str(&reflection);
-            generated_body.push('\n');
+            match validate_live_llm_reflection_contract(&reflection, &source_anchors) {
+                Ok(()) => {
+                    provider_status = "called_live".to_string();
+                    generated_body.push_str("\n### LLM 反思（MiniMax M3）\n");
+                    generated_body.push_str(reflection.trim());
+                    generated_body.push('\n');
+                }
+                Err(err) => {
+                    provider_status = "called_live_schema_invalid".to_string();
+                    fallback_used = true;
+                    llm_contract_degraded = true;
+                    warnings.push(format!(
+                        "live LLM reflection rejected by digest.v2 contract: {err}"
+                    ));
+                }
+            }
         }
     }
     let postimage_hash = format!("sha256:{}", sha256_hex(generated_body.as_bytes()));
@@ -560,12 +574,14 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
     };
 
     let mut report = JianlingRunReport {
-        ok: true,
+        ok: !llm_contract_degraded,
         schema_version: "orderk.jianling.run.v1".to_string(),
         run_id: run_id.clone(),
         mode: options.mode.as_str().to_string(),
         status: if options.dry_run {
             "dry_run"
+        } else if llm_contract_degraded {
+            "degraded_llm_schema_invalid"
         } else {
             "success"
         }
@@ -598,7 +614,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         index_update: index_update.to_string(),
         index_smoke_status: index_smoke_status.to_string(),
         index_summary: None,
-        fallback_used: false,
+        fallback_used,
         success_predicate: JianlingSuccessPredicate {
             provider: provider_status.clone(),
             schema_validation: "passed".to_string(),
@@ -672,7 +688,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             );
             generated_body.push_str(
                 "
-## Kanban 精炼 Harness
+### Kanban 精炼 Harness（证据附录）
 ",
             );
             generated_body.push_str(&format!(
@@ -1429,6 +1445,64 @@ pub fn jianling_validate_file(
     if !has_claim_refs {
         error_codes.push("missing_claim_refs".to_string());
     }
+
+    let has_digest_v2 = text.contains("digest_schema_version: orderk.jianling.digest.v2")
+        && text.contains("reflection_layers: [factual_ledger, reflective_synthesis]");
+    checks.push(check(
+        "digest_v2_schema",
+        has_digest_v2,
+        if has_digest_v2 { "present" } else { "missing" },
+        serde_json::json!({
+            "digest_schema_version": "orderk.jianling.digest.v2",
+            "reflection_layers": "[factual_ledger, reflective_synthesis]"
+        }),
+    ));
+    if !has_digest_v2 {
+        error_codes.push("missing_digest_v2_schema".to_string());
+    }
+
+    let required_sections = [
+        "## 一句话结论",
+        "## 客观底账 / Factual ledger",
+        "## 推断观察 / Reflective synthesis",
+        "## 用户/系统模式 / User-system patterns",
+        "## 未闭合风险 / Open risks",
+        "## 下次动作 / Next actions",
+        "## 证据附录 / Evidence appendix",
+    ];
+    let missing_sections = required_sections
+        .iter()
+        .copied()
+        .filter(|section| !text.contains(section))
+        .collect::<Vec<_>>();
+    let sections_ok = missing_sections.is_empty();
+    checks.push(check(
+        "digest_v2_sections",
+        sections_ok,
+        if sections_ok { "present" } else { "missing" },
+        serde_json::json!({"missing_sections": missing_sections}),
+    ));
+    if !sections_ok {
+        error_codes.push("missing_digest_v2_sections".to_string());
+    }
+
+    let observation_contract_ok = text.contains("## 推断观察 / Reflective synthesis")
+        && text.contains("confidence:")
+        && text.contains("evidence:")
+        && text.contains("next:");
+    checks.push(check(
+        "digest_v2_observation_contract",
+        observation_contract_ok,
+        if observation_contract_ok {
+            "present"
+        } else {
+            "missing"
+        },
+        serde_json::json!({"requires": ["confidence:", "evidence:", "next:"]}),
+    ));
+    if !observation_contract_ok {
+        error_codes.push("missing_digest_v2_observation_contract".to_string());
+    }
     Ok(JianlingValidationResponse {
         ok: error_codes.is_empty(),
         schema_version: "orderk.jianling.validate_file.v1".to_string(),
@@ -1865,33 +1939,23 @@ fn render_jianling_digest(
     source_total_files: usize,
     rejected_source_files: &[String],
 ) -> String {
-    let (kind, title, main_heading) = match mode {
+    let (kind, title) = match mode {
         JianlingRunMode::Daily | JianlingRunMode::Manual => {
-            ("daily_digest", "Jianling Daily Digest", "今日主线")
+            ("daily_digest", "Jianling Daily Digest")
         }
-        JianlingRunMode::Weekly => (
-            "weekly_reflection",
-            "Jianling Weekly Reflection",
-            "本周主线",
-        ),
-        JianlingRunMode::Monthly => (
-            "monthly_reflection",
-            "Jianling Monthly Reflection",
-            "本月主线",
-        ),
-        JianlingRunMode::Yearly => (
-            "yearly_reflection",
-            "Jianling Yearly Reflection",
-            "年度主线",
-        ),
+        JianlingRunMode::Weekly => ("weekly_reflection", "Jianling Weekly Reflection"),
+        JianlingRunMode::Monthly => ("monthly_reflection", "Jianling Monthly Reflection"),
+        JianlingRunMode::Yearly => ("yearly_reflection", "Jianling Yearly Reflection"),
     };
     let mut out = String::new();
     out.push_str("---\n");
     out.push_str("generated_by: orderk-jianling\n");
     out.push_str(&format!("jianling_version: {JIANLING_VERSION}\n"));
+    out.push_str("digest_schema_version: orderk.jianling.digest.v2\n");
     out.push_str(&format!("run_id: {run_id}\n"));
     out.push_str("status: active_generated\n");
     out.push_str("source_tier: generated_memory\n");
+    out.push_str("reflection_layers: [factual_ledger, reflective_synthesis]\n");
     out.push_str(&format!("type: {kind}\n"));
     out.push_str(&format!("date: {date}\n"));
     out.push_str(&format!("source_total_files: {source_total_files}\n"));
@@ -1917,13 +1981,37 @@ fn render_jianling_digest(
     }
     out.push_str("---\n\n");
     out.push_str(&format!("# {title} — {date}\n\n"));
-    out.push_str(&format!("## {main_heading}\n"));
+    out.push_str("## 一句话结论\n");
     if sources.is_empty() {
-        out.push_str("- No primary raw source changed in this window.\n\n");
+        out.push_str("- 本窗口没有选中新的 primary raw source；本次运行只留下 receipt/底账，不做无证据推断。\n\n");
     } else {
+        out.push_str(&format!(
+            "- 本次 {title} 同时保留底账和观察：选中 {} / {} 个 source，所有推断必须回链到 source anchor。\n\n",
+            sources.len(), source_total_files
+        ));
+    }
+
+    out.push_str("## 客观底账 / Factual ledger\n");
+    out.push_str(&format!("- run_id: `{run_id}`\n"));
+    out.push_str(&format!("- mode/date: `{}` / `{date}`\n", mode.as_str()));
+    out.push_str(&format!(
+        "- source coverage: selected {} of {}; rejected {}.\n",
+        sources.len(),
+        source_total_files,
+        rejected_source_files.len()
+    ));
+    if rejected_source_files.is_empty() {
+        out.push_str("- coverage status: full — source budget covered every primary source file in this run.\n");
+    } else {
+        out.push_str("- coverage status: partial — rejected sources are listed in the receipt/evidence pack and should not be silently ignored.\n");
+    }
+    if sources.is_empty() {
+        out.push_str("- evidence: no primary raw source changed in this window.\n\n");
+    } else {
+        out.push_str("- evidence heads:\n");
         for (idx, source) in sources.iter().enumerate().take(5) {
             out.push_str(&format!(
-                "- [{}] {} — {}\n",
+                "  - [{}] `{}` — {}\n",
                 anchors[idx].id,
                 source.path,
                 first_meaningful_line(&source.excerpt)
@@ -1931,31 +2019,256 @@ fn render_jianling_digest(
         }
         out.push('\n');
     }
-    out.push_str("## 事实变化\n");
+
+    out.push_str("## 推断观察 / Reflective synthesis\n");
+    let observations = derive_reflective_observations(anchors, sources, rejected_source_files);
+    for observation in &observations {
+        out.push_str(&format!(
+            "- **{}**（confidence: {}；evidence: {}）— {}\n  - next: {}\n",
+            observation.title,
+            observation.confidence,
+            observation.evidence_refs,
+            observation.detail,
+            observation.next_action
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("## 用户/系统模式 / User-system patterns\n");
+    for observation in &observations {
+        out.push_str(&format!(
+            "- pattern: **{}** → {}（evidence: {}；confidence: {}）\n",
+            observation.title,
+            observation.detail,
+            observation.evidence_refs,
+            observation.confidence
+        ));
+    }
+    out.push_str("- promotion rule: repeated high-confidence patterns should be promoted from daily digest into USER memory, owner skill, PRD acceptance, or a mechanical test gate.\n\n");
+
+    out.push_str("## 未闭合风险 / Open risks\n");
+    if sources.is_empty() {
+        out.push_str("- risk: no selected source means there is no basis for new reflective synthesis; keep only the receipt ledger.\n");
+    }
     if rejected_source_files.is_empty() {
-        out.push_str("- Source budget covered every primary source file in this run.\n\n");
+        out.push_str("- risk: no source-budget rejection in this run, but future runs can still become partial if primary source volume exceeds max_source_files.\n");
     } else {
+        out.push_str("- risk: partial source coverage; do not upgrade observations into global memory until rejected files are inspected or the run is repeated with a larger source budget.\n");
+    }
+    out.push_str("- risk: deterministic observations are conservative heuristics; live LLM reflection can enrich them, but must still cite source anchors and avoid credential leakage.\n\n");
+
+    out.push_str("## 下次动作 / Next actions\n");
+    for observation in &observations {
         out.push_str(&format!(
-            "- Partial coverage: selected {} of {} primary source files; {} rejected because max_source_files was reached.\n\n",
-            sources.len(),
-            source_total_files,
-            rejected_source_files.len()
+            "- {} → {}（evidence: {}）\n",
+            observation.title, observation.next_action, observation.evidence_refs
         ));
     }
-    out.push_str("## 经验 / 反思\n");
-    for (idx, source) in sources.iter().enumerate().take(3) {
-        out.push_str(&format!(
-            "- Evidence [{}] preserves raw/human-authored context for future synthesis.\n  > {}\n",
-            anchors[idx].id,
-            compact_one_line(&source.excerpt)
-        ));
-    }
-    out.push_str("\n## Open loops\n");
+    out.push_str("- Verify generated Markdown through receipt validation plus bounded index/search feedback before calling it second-brain memory.\n");
     out.push_str("- LLM reflection slot is tracked through the Sword LLM profile; run receipts must state whether live LLM work was called, skipped, or blocked.\n");
     if !rejected_source_files.is_empty() {
-        out.push_str("- This run is partial; rerun with a higher --max-source-files or inspect Kanban writer/auditor/foreman harness cards before treating it as complete.\n");
+        out.push_str("- Rerun with a higher --max-source-files or inspect Kanban writer/auditor/foreman harness cards before treating this reflection as complete.\n");
+    }
+
+    out.push_str("\n## 证据附录 / Evidence appendix\n");
+    if sources.is_empty() {
+        out.push_str("- No evidence excerpts captured.\n");
+    } else {
+        for (idx, source) in sources.iter().enumerate().take(12) {
+            out.push_str(&format!(
+                "- [{}] `{}` hash={} chars={}\n  > {}\n",
+                anchors[idx].id,
+                source.path,
+                source.hash,
+                source.chars,
+                compact_one_line(&source.excerpt)
+            ));
+        }
     }
     out
+}
+
+struct ReflectiveObservation {
+    title: &'static str,
+    confidence: &'static str,
+    evidence_refs: String,
+    detail: &'static str,
+    next_action: &'static str,
+}
+
+fn derive_reflective_observations(
+    anchors: &[JianlingSourceAnchor],
+    sources: &[EvidenceSource],
+    rejected_source_files: &[String],
+) -> Vec<ReflectiveObservation> {
+    let mut observations = Vec::new();
+    let joined = sources
+        .iter()
+        .map(|source| source.excerpt.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    let all_refs = evidence_refs_for(anchors, sources.len());
+
+    if contains_any(
+        &joined,
+        &[
+            "子代理",
+            "subagent",
+            "审计",
+            "audit",
+            "复查",
+            "review",
+            "验收",
+            "gate",
+        ],
+    ) {
+        observations.push(ReflectiveObservation {
+            title: "质量复查偏好",
+            confidence: "high",
+            evidence_refs: all_refs.clone(),
+            detail: "用户/流程信号反复指向独立复核：复杂交付不能只靠单次自证，需要子代理审计、机械证据、真实运行和最终验收共同闭环。",
+            next_action: "复杂代码或发布任务必须生成审计包并跑独立子代理复核，复核后再发布。",
+        });
+    }
+
+    if contains_any(
+        &joined,
+        &[
+            "完整原文",
+            "raw",
+            "底账",
+            "source anchor",
+            "hash",
+            "证据",
+            "receipt",
+        ],
+    ) {
+        observations.push(ReflectiveObservation {
+            title: "底账不可丢",
+            confidence: "high",
+            evidence_refs: all_refs.clone(),
+            detail: "反思不是替代底账；raw truth、source anchors、hash、receipt 和 DB/index 证据必须保留，方便日/月维度追溯。",
+            next_action: "每次反思写入后都要验证 receipt、source anchors、文件 hash 与索引 DB freshness。",
+        });
+    }
+
+    if contains_any(
+        &joined,
+        &[
+            "观察",
+            "沉淀",
+            "精炼",
+            "reflect",
+            "hindsight",
+            "灵魂",
+            "日报",
+        ],
+    ) {
+        observations.push(ReflectiveObservation {
+            title: "反思要有判断",
+            confidence: "high",
+            evidence_refs: all_refs.clone(),
+            detail: "只压缩事实不够；Jianling V4 需要把事实炼成可回忆、可判断、可行动的观察，回答哪天/月发生了什么以及模式是什么。",
+            next_action: "日报/月报必须先写人话观察，再把 raw evidence 下沉到证据附录。",
+        });
+    }
+
+    if !rejected_source_files.is_empty() {
+        observations.push(ReflectiveObservation {
+            title: "覆盖不完整",
+            confidence: "medium",
+            evidence_refs: all_refs.clone(),
+            detail: "本次 source budget 未覆盖全部 primary source，因此观察只能视为局部结论，不能升级成全局判断。",
+            next_action: "提高 max_source_files 或补跑被拒 source 后，再决定是否把观察升级为长期记忆。",
+        });
+    }
+
+    if observations.is_empty() {
+        observations.push(ReflectiveObservation {
+            title: "证据优先",
+            confidence: if sources.is_empty() { "low" } else { "medium" },
+            evidence_refs: if all_refs.is_empty() {
+                "none".to_string()
+            } else {
+                all_refs
+            },
+            detail: "没有命中稳定模式词时，只做保守观察：保留事实、明确覆盖范围，等待后续运行形成重复模式后再升级沉淀。",
+            next_action: "保留本次底账并等待更多重复证据，不把单次弱信号写成长期偏好。",
+        });
+    }
+    observations
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| {
+        let needle = needle.to_ascii_lowercase();
+        haystack.contains(&needle)
+    })
+}
+
+fn evidence_refs_for(anchors: &[JianlingSourceAnchor], count: usize) -> String {
+    anchors
+        .iter()
+        .take(count.min(12))
+        .map(|anchor| format!("[{}]", anchor.id))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn validate_live_llm_reflection_contract(
+    text: &str,
+    anchors: &[JianlingSourceAnchor],
+) -> Result<()> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("empty reflection"));
+    }
+    for required in ["### 观察", "### 风险/未闭合", "### 下次动作"] {
+        if !trimmed.contains(required) {
+            return Err(anyhow!("missing required LLM section {required}"));
+        }
+    }
+    if !trimmed.contains("confidence:") {
+        return Err(anyhow!("missing confidence marker"));
+    }
+    let has_known_anchor = anchors.iter().any(|anchor| {
+        let marker = format!("[{}]", anchor.id);
+        trimmed.contains(&marker)
+    });
+    if !has_known_anchor {
+        return Err(anyhow!("missing known source anchor citation"));
+    }
+    let observation_body = trimmed
+        .split("### 观察")
+        .nth(1)
+        .and_then(|tail| tail.split("### 风险/未闭合").next())
+        .unwrap_or("");
+    let has_observation_next = observation_body
+        .lines()
+        .any(|line| line.to_ascii_lowercase().contains("next:") || line.contains("下次"));
+    if !has_observation_next {
+        return Err(anyhow!("missing next action in observation section"));
+    }
+    let allowed_headings = ["### 观察", "### 风险/未闭合", "### 下次动作"];
+    for line in trimmed.lines().map(str::trim_start) {
+        if line.starts_with("# ") || line.starts_with("## ") {
+            return Err(anyhow!(
+                "top-level headings are not allowed in LLM reflection"
+            ));
+        }
+        if line.starts_with("### ")
+            && !allowed_headings
+                .iter()
+                .any(|heading| line.starts_with(heading))
+        {
+            return Err(anyhow!("unexpected LLM reflection heading: {line}"));
+        }
+    }
+    if trimmed.contains("```") {
+        return Err(anyhow!("code fences are not allowed in reflection"));
+    }
+    Ok(())
 }
 
 fn write_generated_file(vault: &Path, rel: &str, body: &str) -> Result<()> {
@@ -2714,6 +3027,9 @@ fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option
     if !jianling_live_llm_enabled(input.profile) {
         return Ok(None);
     }
+    if input.sources.is_empty() || input.anchors.is_empty() {
+        return Ok(None);
+    }
     let slot = resolve_sword_model_profile_from_env()?.llm;
     if slot.provider == "disabled" || !slot.api_key_configured {
         return Ok(None);
@@ -2736,7 +3052,7 @@ fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
-        "你是 OrderK Jianling V4 睡后反思者。只根据证据写一段可落入 Obsidian 的中文反思。\n\n约束：\n- 不要编造证据外事实。\n- 每条结论尽量引用 [S1] 这种 source anchor。\n- 识别今日/本周/本月的主线、风险、下一步。\n- 返回 Markdown 列表，不要代码块，不要泄露凭证。\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\n证据：\n{evidence}",
+        "你是 OrderK Jianling V4 睡后反思者。只根据证据写可落入 Obsidian 的中文反思。\n\n核心目标：同时保留底账和观察。底账是客观事实/source anchors/hash/run evidence；观察是从重复行为、用户纠正、流程变化里萃取出来的可回忆判断。不要把 raw evidence 列表当成反思。\n\n约束：\n- 不要编造证据外事实。\n- 每条观察必须引用 [S1] 这种 source anchor，并标注 confidence: high/medium/low。\n- 输出且只输出三段三级 Markdown 标题：`### 观察`、`### 风险/未闭合`、`### 下次动作`；不要输出 `##` 或 `#`。\n- `### 观察` 下每条观察必须同时包含 source anchor、`confidence: ...`、`next: ...`。\n- 优先识别用户/流程模式，例如多次要求子代理审计=强质量复查偏好；多次要求文件/索引/hash=不接受假闭环。\n- 不要代码块，不要泄露凭证。\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\n证据：\n{evidence}",
         input.run_id,
         input.mode.as_str(),
         input.date,
@@ -2797,10 +3113,10 @@ impl AnthropicCompatibleChatClient {
             .build();
         let body = json!({
             "model": self.model,
-            "max_tokens": 80,
+            "max_tokens": 700,
             "temperature": 0.0,
             "thinking": {"type": "disabled"},
-            "system": "Return only the requested text. Do not include markdown or explanation.",
+            "system": "Return only the requested Markdown text. Do not include thinking, code fences, or extra explanation.",
             "messages": [{"role": "user", "content": prompt}]
         })
         .to_string();
