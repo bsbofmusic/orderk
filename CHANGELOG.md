@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-06-13
+
+### Fixed
+- Retry live Jianling LLM reflection once with a stricter repair prompt when the first MiniMax response is source-grounded but misses a required `### Open risks` / `### Next actions` section, instead of immediately marking the whole run `degraded_llm_schema_invalid`.
+- Strengthen the primary live reflection prompt to require the three level-3 headings in exact order and to always include `### Open risks` even when risk is low.
+
+### Verification
+- `cargo test -p orderk-core --test jianling_contract` passed 36/36, including the new repair-path regression.
+- `cargo test -p orderk-core` passed all orderk-core unit and integration tests.
+
 ## [0.1.26] - 2026-06-13
 
 ### Changed
@@ -285,7 +295,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.26...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.27...HEAD
+[0.1.27]: https://github.com/bsbofmusic/orderk/compare/v0.1.26...v0.1.27
 [0.1.26]: https://github.com/bsbofmusic/orderk/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/bsbofmusic/orderk/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/bsbofmusic/orderk/compare/v0.1.23...v0.1.24

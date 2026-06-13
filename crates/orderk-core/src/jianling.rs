@@ -598,12 +598,61 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
                     generated_body.push('\n');
                 }
                 Err(err) => {
-                    provider_status = "called_live_schema_invalid".to_string();
-                    fallback_used = true;
-                    llm_contract_degraded = true;
-                    warnings.push(format!(
-                        "live LLM reflection rejected by digest.v2 contract: {err}"
-                    ));
+                    let validation_error = err.to_string();
+                    let repair = repair_live_llm_reflection(
+                        LiveReflectionInput {
+                            profile: &profile,
+                            mode: &options.mode,
+                            date: &date,
+                            run_id: &run_id,
+                            anchors: &source_anchors,
+                            sources: &evidence_sources,
+                            source_total_files: selection.total_files,
+                            rejected_source_files: &selection.rejected_paths,
+                        },
+                        &reflection,
+                        &validation_error,
+                    );
+                    match repair {
+                        Ok(Some(repaired)) => {
+                            match validate_live_llm_reflection_contract(&repaired, &source_anchors)
+                            {
+                                Ok(()) => {
+                                    provider_status = "called_live".to_string();
+                                    warnings.push(format!(
+                                        "live LLM reflection repaired after initial contract rejection: {validation_error}"
+                                    ));
+                                    generated_body.push_str("\n### LLM reflection (MiniMax M3)\n");
+                                    generated_body.push_str(repaired.trim());
+                                    generated_body.push('\n');
+                                }
+                                Err(repair_err) => {
+                                    provider_status = "called_live_schema_invalid".to_string();
+                                    fallback_used = true;
+                                    llm_contract_degraded = true;
+                                    warnings.push(format!(
+                                        "live LLM reflection rejected by digest.v2 contract: {validation_error}; repair also failed: {repair_err}"
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            provider_status = "called_live_schema_invalid".to_string();
+                            fallback_used = true;
+                            llm_contract_degraded = true;
+                            warnings.push(format!(
+                                "live LLM reflection rejected by digest.v2 contract: {validation_error}; repair unavailable"
+                            ));
+                        }
+                        Err(repair_err) => {
+                            provider_status = "called_live_schema_invalid".to_string();
+                            fallback_used = true;
+                            llm_contract_degraded = true;
+                            warnings.push(format!(
+                                "live LLM reflection rejected by digest.v2 contract: {validation_error}; repair call failed: {repair_err}"
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -3842,10 +3891,60 @@ fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option
         return Ok(None);
     }
     let mut client = AnthropicCompatibleChatClient::from_slot(&slot)?;
-    let evidence = input
-        .sources
+    let evidence = render_live_reflection_evidence(input.sources, input.anchors);
+    let prompt = format!(
+        "You are the OrderK Jianling V4 sleep-reflection writer. Write a pure-English Obsidian reflection using only the supplied evidence.\n\nCore goal: keep both the factual ledger and the judgment. The ledger is objective source anchors, hashes, and run evidence; the reflection is a memorable judgment distilled from repeated behavior, user corrections, and workflow changes. Do not turn the raw evidence list into the reflection.\n\nConstraints:\n- Do not invent facts beyond the evidence.\n- Every observation must cite a [S1]-style source anchor and include confidence: high/medium/low.\n- Output exactly three level-3 Markdown headings, in this exact order: `### Observations`, `### Open risks`, and `### Next actions`; do not output `##` or `#`.\n- The `### Open risks` heading is mandatory even if there are no new risks; include one evidence-cited bullet when risk is low.\n- Each item under `### Observations` must include a source anchor, `confidence: ...`, and `next: ...`.\n- Prefer durable user/process patterns: repeated requests for subagent audit = strong independent-review preference; repeated file/index/hash failures = the user does not accept fake closure.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\nevidence:\n{evidence}",
+        input.run_id,
+        input.mode.as_str(),
+        input.date,
+        input.source_total_files,
+        input.sources.len(),
+        input.rejected_source_files.len()
+    );
+    let text = client.send_prompt(&prompt)?;
+    Ok(Some(text.trim().to_string()))
+}
+
+fn repair_live_llm_reflection(
+    input: LiveReflectionInput<'_>,
+    invalid_text: &str,
+    validation_error: &str,
+) -> Result<Option<String>> {
+    if !jianling_live_llm_enabled(input.profile) {
+        return Ok(None);
+    }
+    if input.sources.is_empty() || input.anchors.is_empty() {
+        return Ok(None);
+    }
+    let slot = resolve_sword_model_profile_from_env()?.llm;
+    if slot.provider == "disabled" || !slot.api_key_configured {
+        return Ok(None);
+    }
+    let mut client = AnthropicCompatibleChatClient::from_slot(&slot)?;
+    let evidence = render_live_reflection_evidence(input.sources, input.anchors);
+    let invalid_preview = invalid_text.chars().take(4000).collect::<String>();
+    let prompt = format!(
+        "Your previous OrderK Jianling reflection failed digest.v2 validation: {validation_error}. Rewrite it from scratch using only the supplied evidence.\n\nReturn only Markdown with exactly these three level-3 headings, in this exact order and spelling:\n### Observations\n### Open risks\n### Next actions\n\nRules:\n- No `#` or `##` headings.\n- No other `###` headings.\n- Every observation must cite a [S1]-style source anchor, include `confidence: high/medium/low`, and include `next: ...`.\n- The `### Open risks` heading is mandatory even if risk is low.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\nevidence:\n{}\n\ninvalid_previous_output:\n{}",
+        input.run_id,
+        input.mode.as_str(),
+        input.date,
+        input.source_total_files,
+        input.sources.len(),
+        input.rejected_source_files.len(),
+        evidence,
+        invalid_preview
+    );
+    let text = client.send_prompt(&prompt)?;
+    Ok(Some(text.trim().to_string()))
+}
+
+fn render_live_reflection_evidence(
+    sources: &[EvidenceSource],
+    anchors: &[JianlingSourceAnchor],
+) -> String {
+    sources
         .iter()
-        .zip(input.anchors.iter())
+        .zip(anchors.iter())
         .take(12)
         .map(|(source, anchor)| {
             format!(
@@ -3857,18 +3956,7 @@ fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option
             )
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    let prompt = format!(
-        "You are the OrderK Jianling V4 sleep-reflection writer. Write a pure-English Obsidian reflection using only the supplied evidence.\n\nCore goal: keep both the factual ledger and the judgment. The ledger is objective source anchors, hashes, and run evidence; the reflection is a memorable judgment distilled from repeated behavior, user corrections, and workflow changes. Do not turn the raw evidence list into the reflection.\n\nConstraints:\n- Do not invent facts beyond the evidence.\n- Every observation must cite a [S1]-style source anchor and include confidence: high/medium/low.\n- Output exactly three level-3 Markdown headings: `### Observations`, `### Open risks`, and `### Next actions`; do not output `##` or `#`.\n- Each item under `### Observations` must include a source anchor, `confidence: ...`, and `next: ...`.\n- Prefer durable user/process patterns: repeated requests for subagent audit = strong independent-review preference; repeated file/index/hash failures = the user does not accept fake closure.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\nevidence:\n{evidence}",
-        input.run_id,
-        input.mode.as_str(),
-        input.date,
-        input.source_total_files,
-        input.sources.len(),
-        input.rejected_source_files.len()
-    );
-    let text = client.send_prompt(&prompt)?;
-    Ok(Some(text.trim().to_string()))
+        .join("\n")
 }
 
 struct AnthropicCompatibleChatClient {

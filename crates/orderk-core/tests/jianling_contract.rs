@@ -1776,6 +1776,54 @@ fn jianling_apply_calls_configured_llm_and_writes_contract_valid_reflection() {
 }
 
 #[test]
+fn jianling_apply_repairs_llm_reflection_missing_required_section_once() {
+    let vault = temp_vault("live-llm-repair");
+    seed_raw_dialogue(&vault);
+    let server = FakeAnthropicServer::start_sequence(vec![
+        "### Observations\n- First draft is grounded but incomplete [S1] confidence: high; next: repair the missing section.\n### Next actions\n- validate the repaired response [S1].\n",
+        "### Observations\n- Repaired LLM reflection keeps exact headings [S1] confidence: high; next: keep contract repair before degrading.\n### Open risks\n- no extra risk beyond source evidence [S1] confidence: medium.\n### Next actions\n- verify receipt and index feedback [S1].\n",
+    ]);
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_LLMREPAIR", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "llmrepair".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(report.ok, "repaired LLM response should keep run healthy");
+    assert_eq!(report.provider_status, "called_live");
+    assert_eq!(report.success_predicate.provider, "called_live");
+    assert!(!report.fallback_used);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("repaired after initial contract rejection")));
+    let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
+    assert!(daily_text.contains("### LLM reflection (MiniMax M3)"));
+    assert!(
+        daily_text.contains("Repaired LLM reflection keeps exact headings [S1] confidence: high")
+    );
+    assert!(!daily_text.contains("First draft is grounded but incomplete"));
+    assert_eq!(server.request_count(), 2);
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
 fn jianling_apply_rejects_contract_invalid_llm_reflection() {
     let vault = temp_vault("live-llm-invalid");
     seed_raw_dialogue(&vault);
@@ -1816,7 +1864,7 @@ fn jianling_apply_rejects_contract_invalid_llm_reflection() {
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
     assert!(!daily_text.contains("### LLM reflection (MiniMax M3)"));
     assert!(!daily_text.contains("LLM reflection from fake MiniMax"));
-    assert_eq!(server.request_count(), 1);
+    assert_eq!(server.request_count(), 2);
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -1856,7 +1904,7 @@ fn jianling_apply_rejects_llm_reflection_with_extra_top_level_heading() {
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
     assert!(!daily_text.contains("Extra top-level heading"));
     assert!(!daily_text.contains("\n## Extra top-level heading"));
-    assert_eq!(server.request_count(), 1);
+    assert_eq!(server.request_count(), 2);
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -1869,6 +1917,10 @@ struct FakeAnthropicServer {
 
 impl FakeAnthropicServer {
     fn start(text: &'static str) -> Self {
+        Self::start_sequence(vec![text])
+    }
+
+    fn start_sequence(texts: Vec<&'static str>) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1882,7 +1934,13 @@ impl FakeAnthropicServer {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         use std::io::{Read, Write};
-                        count_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let request_idx =
+                            count_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let text = texts
+                            .get(request_idx)
+                            .copied()
+                            .or_else(|| texts.last().copied())
+                            .unwrap_or("");
                         let mut buf = [0_u8; 8192];
                         let _ = stream.read(&mut buf);
                         let body = serde_json::json!({
