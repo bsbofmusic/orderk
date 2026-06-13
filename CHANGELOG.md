@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-06-13
+
+### Changed
+- Make Jianling generated reflections pure English by default, including deterministic digest sections, live LLM reflection contract, validation, and Kanban harness headings.
+- Let weekly, monthly, and yearly Jianling rollups read lower-level generated reflections (`brain/daily`, `brain/weekly`, `brain/monthly`) in addition to raw sources, with generated sources marked as `generated_memory`.
+
+### Fixed
+- Harden Jianling index feedback against stale catalogue cards by verifying the SQLite `files` row size/hash matches the generated file postimage after each write.
+- Make systemd-user Jianling services persistently load `%h/.config/orderk/<profile>.secrets.env` and `%h/.hermes/.env`, and import embedding/reranker API key names into the user manager so scheduled runs inherit the same index credentials as manual runs.
+
+### Verification
+- `cargo test -p orderk-core --test jianling_contract -- --nocapture` passed 34/34, including regression coverage for hierarchical rollups and same-path digest replacement refreshing the index row hash.
+- `cargo test -p orderk-core` passed all orderk-core unit and integration tests.
+
 ## [0.1.25] - 2026-06-13
 
 ### Fixed
@@ -271,7 +285,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ship orderk npm packages and release flow
 
 [Keep a Changelog]: https://keepachangelog.com/
-[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.25...HEAD
+[Unreleased]: https://github.com/bsbofmusic/orderk/compare/v0.1.26...HEAD
+[0.1.26]: https://github.com/bsbofmusic/orderk/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/bsbofmusic/orderk/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/bsbofmusic/orderk/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/bsbofmusic/orderk/compare/v0.1.22...v0.1.23

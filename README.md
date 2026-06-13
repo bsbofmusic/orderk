@@ -1,6 +1,6 @@
 # orderk
 
-orderk is a tiny, local retrieval blade for Obsidian Markdown vaults, with an optional built-in Markdown memory compiler called Jianling. Current release target: `v0.1.25`.
+orderk is a tiny, local retrieval blade for Obsidian Markdown vaults, with an optional built-in Markdown memory compiler called Jianling. Current release target: `v0.1.26`.
 
 By default it turns your vault into fast, structured read-only evidence for humans, scripts, and AI agents. When explicitly enabled, `orderk jianling` can also write generated Markdown digests only under `brain/`, with receipts and source anchors under `.orderk/jianling/`. Raw notes and raw transcripts remain human-owned source of truth.
 

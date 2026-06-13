@@ -299,6 +299,12 @@ pub struct JianlingRunReport {
     #[serde(default)]
     pub source_total_files: usize,
     #[serde(default)]
+    pub source_raw_truth_files: usize,
+    #[serde(default)]
+    pub source_generated_memory_files: usize,
+    #[serde(default)]
+    pub source_selection_policy: String,
+    #[serde(default)]
     pub rejected_source_files: Vec<String>,
     #[serde(default)]
     pub chunking_status: String,
@@ -548,7 +554,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             path: file.path.clone(),
             quote_hash: sha256_hex(excerpt.as_bytes()),
             source_file_hash: format!("sha256:{}", file.hash),
-            source_tier: "raw_truth".to_string(),
+            source_tier: source_tier_for_path(&file.path).to_string(),
         });
         evidence_sources.push(EvidenceSource {
             path: file.path.clone(),
@@ -557,6 +563,9 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             excerpt,
         });
     }
+    let (source_raw_truth_files, source_generated_memory_files) =
+        source_tier_counts(&source_anchors);
+    let source_selection_policy = source_selection_policy_for_mode(&options.mode).to_string();
 
     let mut provider_status = jianling_provider_status_for_dry_run(options.dry_run, &profile);
     let mut fallback_used = false;
@@ -584,7 +593,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             match validate_live_llm_reflection_contract(&reflection, &source_anchors) {
                 Ok(()) => {
                     provider_status = "called_live".to_string();
-                    generated_body.push_str("\n### LLM 反思（MiniMax M3）\n");
+                    generated_body.push_str("\n### LLM reflection (MiniMax M3)\n");
                     generated_body.push_str(reflection.trim());
                     generated_body.push('\n');
                 }
@@ -699,6 +708,9 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         source_anchors,
         warnings,
         source_total_files: selection.total_files,
+        source_raw_truth_files,
+        source_generated_memory_files,
+        source_selection_policy,
         rejected_source_files: selection.rejected_paths,
         chunking_status: if selected.is_empty() {
             "not_needed".to_string()
@@ -750,7 +762,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             );
             generated_body.push_str(
                 "
-### Kanban 精炼 Harness（证据附录）
+### Kanban refinement harness (evidence appendix)
 ",
             );
             generated_body.push_str(&format!(
@@ -773,7 +785,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             },
             target_path: target_rel.clone(),
             preimage_hash: target_preimage_hash.clone(),
-            postimage_hash: final_postimage_hash,
+            postimage_hash: final_postimage_hash.clone(),
             byte_count: generated_body.len(),
             index_update_required: true,
         }];
@@ -784,6 +796,8 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             &target_rel,
             &run_id,
             generated_title_for_mode(&options.mode),
+            Some(&final_postimage_hash),
+            Some(generated_body.len()),
         );
         report.index_update = index_feedback.index_update;
         report.index_smoke_status = index_feedback.index_smoke_status;
@@ -834,6 +848,8 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
                     &promotion.rel_path,
                     &run_id,
                     &format!("Jianling Lesson Proposal {}", promotion.rel_path),
+                    Some(&promotion.file_op.postimage_hash),
+                    Some(promotion.file_op.byte_count),
                 );
                 if let Some(summary) = promotion_feedback.index_summary {
                     report.promotion_index_summaries.push(summary);
@@ -910,6 +926,8 @@ fn run_jianling_index_feedback(
     target_rel: &str,
     run_id: &str,
     smoke_title: &str,
+    expected_postimage_hash: Option<&str>,
+    expected_byte_count: Option<usize>,
 ) -> JianlingIndexFeedbackOutcome {
     let Some(db) = db else {
         return JianlingIndexFeedbackOutcome {
@@ -974,6 +992,20 @@ fn run_jianling_index_feedback(
         }
     };
     let compact_summary = JianlingIndexSummary::from_index_summary(target_rel, index_summary);
+    if let Err(err) = verify_index_feedback_freshness(
+        db,
+        target_rel,
+        expected_postimage_hash,
+        expected_byte_count,
+    ) {
+        return JianlingIndexFeedbackOutcome {
+            index_update: "failed_stale_db_freshness".to_string(),
+            index_smoke_status: "failed_stale_db_freshness".to_string(),
+            index_summary: Some(compact_summary),
+            warnings: vec![format!("index freshness failed: {err}")],
+            degraded: true,
+        };
+    }
 
     let mut smoke_options = QueryOptions::new(5);
     smoke_options.rerank = false;
@@ -1020,6 +1052,43 @@ fn run_jianling_index_feedback(
             degraded: true,
         },
     }
+}
+
+fn verify_index_feedback_freshness(
+    db: &Path,
+    target_rel: &str,
+    expected_postimage_hash: Option<&str>,
+    expected_byte_count: Option<usize>,
+) -> Result<()> {
+    let Some(expected_hash) = expected_postimage_hash else {
+        return Ok(());
+    };
+    let expected_hash = expected_hash
+        .strip_prefix("sha256:")
+        .unwrap_or(expected_hash);
+    let expected_size = expected_byte_count
+        .ok_or_else(|| anyhow!("missing expected byte count for {target_rel}"))?;
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open index db for freshness check: {}", db.display()))?;
+    let row: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT size, hash FROM files WHERE path = ?1",
+            [target_rel],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .with_context(|| format!("read indexed file row for {target_rel}"))?;
+    let Some((actual_size, actual_hash)) = row else {
+        return Err(anyhow!(
+            "generated path is absent from index files table: {target_rel}"
+        ));
+    };
+    if actual_size as usize != expected_size || actual_hash != expected_hash {
+        return Err(anyhow!(
+            "indexed row is stale for {target_rel}: expected size/hash {expected_size}/sha256:{expected_hash}, got {actual_size}/sha256:{actual_hash}"
+        ));
+    }
+    Ok(())
 }
 
 fn topic_ledger_path(root: &Path) -> PathBuf {
@@ -1088,6 +1157,11 @@ fn save_topic_ledger_atomic(path: &Path, ledger: &JianlingTopicLedger) -> Result
 
 fn topic_key_for_observation(title: &str) -> String {
     match title {
+        "Independent review preference" => "quality-review-preference".to_string(),
+        "Preserve the factual ledger" => "ledger-preservation".to_string(),
+        "Reflection must make a judgment" => "reflective-judgment".to_string(),
+        "Coverage is incomplete" => "partial-coverage-risk".to_string(),
+        "Evidence first" => "evidence-first".to_string(),
         "质量复查偏好" => "quality-review-preference".to_string(),
         "底账不可丢" => "ledger-preservation".to_string(),
         "反思要有判断" => "reflective-judgment".to_string(),
@@ -1834,7 +1908,7 @@ pub fn jianling_enable(
         .db
         .clone()
         .unwrap_or_else(|| vault.join(".obsidian/orderk/orderk.sqlite"));
-    let service = render_systemd_service(&options.orderk_bin, &profile, &vault, &db);
+    let service = render_systemd_service(&options.orderk_bin, &profile, &vault, &db, &env_path);
     let timer = render_systemd_timer(&profile, &options.schedule, &options.timezone);
     let env_file = render_orderk_profile_env(&profile)?;
     let written_files = vec![
@@ -2041,13 +2115,13 @@ pub fn jianling_validate_file(
     }
 
     let required_sections = [
-        "## 一句话结论",
-        "## 客观底账 / Factual ledger",
-        "## 推断观察 / Reflective synthesis",
-        "## 用户/系统模式 / User-system patterns",
-        "## 未闭合风险 / Open risks",
-        "## 下次动作 / Next actions",
-        "## 证据附录 / Evidence appendix",
+        "## Executive summary",
+        "## Factual ledger",
+        "## Reflective synthesis",
+        "## User/system patterns",
+        "## Open risks",
+        "## Next actions",
+        "## Evidence appendix",
     ];
     let missing_sections = required_sections
         .iter()
@@ -2065,7 +2139,7 @@ pub fn jianling_validate_file(
         error_codes.push("missing_digest_v2_sections".to_string());
     }
 
-    let observation_contract_ok = text.contains("## 推断观察 / Reflective synthesis")
+    let observation_contract_ok = text.contains("## Reflective synthesis")
         && text.contains("confidence:")
         && text.contains("evidence:")
         && text.contains("next:");
@@ -2411,13 +2485,24 @@ fn select_source_files(
 ) -> Result<JianlingSourceSelection> {
     let limit = max_source_files.max(1);
     let (window_start, window_end) = source_window_for_mode(mode, date)?;
-    let primary: Vec<crate::models::ScannedFile> = scan_vault(vault)?
-        .into_iter()
-        .filter(|file| {
-            is_primary_jianling_source(&file.path)
-                && source_file_in_window(file, &window_start, &window_end)
-        })
-        .collect();
+    let mut generated = Vec::new();
+    let mut raw = Vec::new();
+    for file in scan_vault(vault)? {
+        if is_primary_jianling_source(&file.path)
+            && source_file_in_window(&file, &window_start, &window_end)
+        {
+            raw.push(file);
+        } else if is_hierarchical_rollup_source(&file.path, mode)
+            && source_file_in_window(&file, &window_start, &window_end)
+            && is_managed_jianling_generated_source(&file.abs_path)?
+        {
+            generated.push(file);
+        }
+    }
+    generated.sort_by(|a, b| a.path.cmp(&b.path));
+    raw.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut primary = generated;
+    primary.extend(raw);
     let total_files = primary.len();
     let mut selected = Vec::new();
     let mut rejected_paths = Vec::new();
@@ -2438,6 +2523,69 @@ fn select_source_files(
 fn is_primary_jianling_source(path: &str) -> bool {
     (path.starts_with("raw/transcripts/") || path.starts_with("raw/articles/"))
         && !path.starts_with("raw/system-snapshots/")
+}
+
+fn source_tier_for_path(path: &str) -> &'static str {
+    if path.starts_with("brain/daily/")
+        || path.starts_with("brain/weekly/")
+        || path.starts_with("brain/monthly/")
+        || path.starts_with("brain/yearly/")
+    {
+        "generated_memory"
+    } else {
+        "raw_truth"
+    }
+}
+
+fn source_tier_counts(anchors: &[JianlingSourceAnchor]) -> (usize, usize) {
+    let generated_memory = anchors
+        .iter()
+        .filter(|anchor| anchor.source_tier == "generated_memory")
+        .count();
+    let raw_truth = anchors.len().saturating_sub(generated_memory);
+    (raw_truth, generated_memory)
+}
+
+fn source_selection_policy_for_mode(mode: &JianlingRunMode) -> &'static str {
+    match mode {
+        JianlingRunMode::Daily | JianlingRunMode::Manual => {
+            "daily/manual selects raw transcript sources only; no prior generated reflections are used before writing"
+        }
+        JianlingRunMode::Weekly => {
+            "weekly selects managed brain/daily reflections first, then raw sources in the same window"
+        }
+        JianlingRunMode::Monthly => {
+            "monthly selects managed brain/daily and brain/weekly reflections first, then raw sources in the same window"
+        }
+        JianlingRunMode::Yearly => {
+            "yearly selects managed brain/daily, brain/weekly, and brain/monthly reflections first, then raw sources in the same window"
+        }
+    }
+}
+
+fn is_hierarchical_rollup_source(path: &str, mode: &JianlingRunMode) -> bool {
+    match mode {
+        JianlingRunMode::Daily | JianlingRunMode::Manual => false,
+        JianlingRunMode::Weekly => path.starts_with("brain/daily/"),
+        JianlingRunMode::Monthly => {
+            path.starts_with("brain/daily/") || path.starts_with("brain/weekly/")
+        }
+        JianlingRunMode::Yearly => {
+            path.starts_with("brain/daily/")
+                || path.starts_with("brain/weekly/")
+                || path.starts_with("brain/monthly/")
+        }
+    }
+}
+
+fn is_managed_jianling_generated_source(path: &Path) -> Result<bool> {
+    let raw = fs::read_to_string(path).with_context(|| {
+        format!(
+            "read generated Jianling source candidate: {}",
+            path.display()
+        )
+    })?;
+    Ok(raw.contains("generated_by: orderk-jianling"))
 }
 
 fn source_window_for_mode(mode: &JianlingRunMode, date: &str) -> Result<(NaiveDate, NaiveDate)> {
@@ -2461,7 +2609,9 @@ fn source_file_in_window(
     window_start: &NaiveDate,
     window_end: &NaiveDate,
 ) -> bool {
-    let Some(source_date) = transcript_path_date(&file.path).or_else(|| mtime_date(file.mtime))
+    let Some(source_date) = transcript_path_date(&file.path)
+        .or_else(|| generated_reflection_path_date(&file.path))
+        .or_else(|| mtime_date(file.mtime))
     else {
         return false;
     };
@@ -2475,6 +2625,21 @@ fn transcript_path_date(path: &str) -> Option<NaiveDate> {
     let month: u32 = parts.next()?.parse().ok()?;
     let day: u32 = parts.next()?.parse().ok()?;
     NaiveDate::from_ymd_opt(year, month, day)
+}
+
+fn generated_reflection_path_date(path: &str) -> Option<NaiveDate> {
+    for prefix in [
+        "brain/daily/",
+        "brain/weekly/",
+        "brain/monthly/",
+        "brain/yearly/",
+    ] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            let stem = rest.strip_suffix(".md").unwrap_or(rest);
+            return NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok();
+        }
+    }
+    None
 }
 
 fn mtime_date(mtime: i64) -> Option<NaiveDate> {
@@ -2526,6 +2691,8 @@ fn render_jianling_digest(
         JianlingRunMode::Monthly => ("monthly_reflection", "Jianling Monthly Reflection"),
         JianlingRunMode::Yearly => ("yearly_reflection", "Jianling Yearly Reflection"),
     };
+    let (source_raw_truth_files, source_generated_memory_files) = source_tier_counts(anchors);
+    let source_selection_policy = source_selection_policy_for_mode(mode);
     let mut out = String::new();
     out.push_str("---\n");
     out.push_str("generated_by: orderk-jianling\n");
@@ -2539,6 +2706,16 @@ fn render_jianling_digest(
     out.push_str(&format!("date: {date}\n"));
     out.push_str(&format!("source_total_files: {source_total_files}\n"));
     out.push_str(&format!("selected_source_files: {}\n", sources.len()));
+    out.push_str(&format!(
+        "source_raw_truth_files: {source_raw_truth_files}\n"
+    ));
+    out.push_str(&format!(
+        "source_generated_memory_files: {source_generated_memory_files}\n"
+    ));
+    out.push_str(&format!(
+        "source_selection_policy: '{}'\n",
+        source_selection_policy
+    ));
     out.push_str(&format!(
         "rejected_source_files: {}\n",
         rejected_source_files.len()
@@ -2560,17 +2737,17 @@ fn render_jianling_digest(
     }
     out.push_str("---\n\n");
     out.push_str(&format!("# {title} — {date}\n\n"));
-    out.push_str("## 一句话结论\n");
+    out.push_str("## Executive summary\n");
     if sources.is_empty() {
-        out.push_str("- 本窗口没有选中新的 primary raw source；本次运行只留下 receipt/底账，不做无证据推断。\n\n");
+        out.push_str("- No primary source was selected for this window; this run preserves the receipt and ledger only, without unsupported inference.\n\n");
     } else {
         out.push_str(&format!(
-            "- 本次 {title} 同时保留底账和观察：选中 {} / {} 个 source，所有推断必须回链到 source anchor。\n\n",
+            "- This {title} keeps both ledger and judgment: selected {} / {} sources, and every inference must cite a source anchor.\n\n",
             sources.len(), source_total_files
         ));
     }
 
-    out.push_str("## 客观底账 / Factual ledger\n");
+    out.push_str("## Factual ledger\n");
     out.push_str(&format!("- run_id: `{run_id}`\n"));
     out.push_str(&format!("- mode/date: `{}` / `{date}`\n", mode.as_str()));
     out.push_str(&format!(
@@ -2579,13 +2756,20 @@ fn render_jianling_digest(
         source_total_files,
         rejected_source_files.len()
     ));
+    out.push_str(&format!(
+        "- source selection policy: {}.\n",
+        source_selection_policy
+    ));
+    out.push_str(&format!(
+        "- source mix before writing: raw_truth={source_raw_truth_files}; generated_memory={source_generated_memory_files}.\n"
+    ));
     if rejected_source_files.is_empty() {
         out.push_str("- coverage status: full — source budget covered every primary source file in this run.\n");
     } else {
         out.push_str("- coverage status: partial — rejected sources are listed in the receipt/evidence pack and should not be silently ignored.\n");
     }
     if sources.is_empty() {
-        out.push_str("- evidence: no primary raw source changed in this window.\n\n");
+        out.push_str("- evidence: no primary source changed in this window.\n\n");
     } else {
         out.push_str("- evidence heads:\n");
         for (idx, source) in sources.iter().enumerate().take(5) {
@@ -2599,11 +2783,11 @@ fn render_jianling_digest(
         out.push('\n');
     }
 
-    out.push_str("## 推断观察 / Reflective synthesis\n");
+    out.push_str("## Reflective synthesis\n");
     let observations = derive_reflective_observations(anchors, sources, rejected_source_files);
     for observation in &observations {
         out.push_str(&format!(
-            "- **{}**（confidence: {}；evidence: {}）— {}\n  - next: {}\n",
+            "- **{}** (confidence: {}; evidence: {}) — {}\n  - next: {}\n",
             observation.title,
             observation.confidence,
             observation.evidence_refs,
@@ -2613,10 +2797,10 @@ fn render_jianling_digest(
     }
     out.push('\n');
 
-    out.push_str("## 用户/系统模式 / User-system patterns\n");
+    out.push_str("## User/system patterns\n");
     for observation in &observations {
         out.push_str(&format!(
-            "- pattern: **{}** → {}（evidence: {}；confidence: {}）\n",
+            "- pattern: **{}** -> {} (evidence: {}; confidence: {})\n",
             observation.title,
             observation.detail,
             observation.evidence_refs,
@@ -2625,7 +2809,7 @@ fn render_jianling_digest(
     }
     out.push_str("- promotion rule: repeated high-confidence patterns should be promoted from daily digest into USER memory, owner skill, PRD acceptance, or a mechanical test gate.\n\n");
 
-    out.push_str("## 未闭合风险 / Open risks\n");
+    out.push_str("## Open risks\n");
     if sources.is_empty() {
         out.push_str("- risk: no selected source means there is no basis for new reflective synthesis; keep only the receipt ledger.\n");
     }
@@ -2636,10 +2820,10 @@ fn render_jianling_digest(
     }
     out.push_str("- risk: deterministic observations are conservative heuristics; live LLM reflection can enrich them, but must still cite source anchors and avoid credential leakage.\n\n");
 
-    out.push_str("## 下次动作 / Next actions\n");
+    out.push_str("## Next actions\n");
     for observation in &observations {
         out.push_str(&format!(
-            "- {} → {}（evidence: {}）\n",
+            "- {} -> {} (evidence: {})\n",
             observation.title, observation.next_action, observation.evidence_refs
         ));
     }
@@ -2649,7 +2833,7 @@ fn render_jianling_digest(
         out.push_str("- Rerun with a higher --max-source-files or inspect Kanban writer/auditor/foreman harness cards before treating this reflection as complete.\n");
     }
 
-    out.push_str("\n## 证据附录 / Evidence appendix\n");
+    out.push_str("\n## Evidence appendix\n");
     if sources.is_empty() {
         out.push_str("- No evidence excerpts captured.\n");
     } else {
@@ -2703,11 +2887,11 @@ fn derive_reflective_observations(
         ],
     ) {
         observations.push(ReflectiveObservation {
-            title: "质量复查偏好",
+            title: "Independent review preference",
             confidence: "high",
             evidence_refs: all_refs.clone(),
-            detail: "用户/流程信号反复指向独立复核：复杂交付不能只靠单次自证，需要子代理审计、机械证据、真实运行和最终验收共同闭环。",
-            next_action: "复杂代码或发布任务必须生成审计包并跑独立子代理复核，复核后再发布。",
+            detail: "The repeated user/process signal is independent verification: complex delivery cannot rely on one self-attestation pass; it needs subagent audit, mechanical evidence, real execution, and final acceptance together.",
+            next_action: "For complex code or release work, produce an evidence pack, run an independent subagent review, and publish only after review findings are closed.",
         });
     }
 
@@ -2724,11 +2908,11 @@ fn derive_reflective_observations(
         ],
     ) {
         observations.push(ReflectiveObservation {
-            title: "底账不可丢",
+            title: "Preserve the factual ledger",
             confidence: "high",
             evidence_refs: all_refs.clone(),
-            detail: "反思不是替代底账；raw truth、source anchors、hash、receipt 和 DB/index 证据必须保留，方便日/月维度追溯。",
-            next_action: "每次反思写入后都要验证 receipt、source anchors、文件 hash 与索引 DB freshness。",
+            detail: "Reflection must not replace the ledger; raw truth, source anchors, hashes, receipts, and DB/index evidence must remain auditable across daily/monthly rollups.",
+            next_action: "After every reflection write, verify the receipt, source anchors, file hash, and index DB freshness before calling it second-brain memory.",
         });
     }
 
@@ -2745,35 +2929,35 @@ fn derive_reflective_observations(
         ],
     ) {
         observations.push(ReflectiveObservation {
-            title: "反思要有判断",
+            title: "Reflection must make a judgment",
             confidence: "high",
             evidence_refs: all_refs.clone(),
-            detail: "只压缩事实不够；Jianling V4 需要把事实炼成可回忆、可判断、可行动的观察，回答哪天/月发生了什么以及模式是什么。",
-            next_action: "日报/月报必须先写人话观察，再把 raw evidence 下沉到证据附录。",
+            detail: "Compressing facts is not enough; Jianling V4 must turn evidence into memorable, actionable judgments about what happened and what pattern is emerging.",
+            next_action: "Daily/monthly reflections must lead with human-readable judgment and push raw evidence down into the evidence appendix.",
         });
     }
 
     if !rejected_source_files.is_empty() {
         observations.push(ReflectiveObservation {
-            title: "覆盖不完整",
+            title: "Coverage is incomplete",
             confidence: "medium",
             evidence_refs: all_refs.clone(),
-            detail: "本次 source budget 未覆盖全部 primary source，因此观察只能视为局部结论，不能升级成全局判断。",
-            next_action: "提高 max_source_files 或补跑被拒 source 后，再决定是否把观察升级为长期记忆。",
+            detail: "The source budget did not cover every primary source, so the reflection is only a partial conclusion and must not be promoted into global memory yet.",
+            next_action: "Increase max_source_files or inspect rejected sources before promoting the observation into durable memory.",
         });
     }
 
     if observations.is_empty() {
         observations.push(ReflectiveObservation {
-            title: "证据优先",
+            title: "Evidence first",
             confidence: if sources.is_empty() { "low" } else { "medium" },
             evidence_refs: if all_refs.is_empty() {
                 "none".to_string()
             } else {
                 all_refs
             },
-            detail: "没有命中稳定模式词时，只做保守观察：保留事实、明确覆盖范围，等待后续运行形成重复模式后再升级沉淀。",
-            next_action: "保留本次底账并等待更多重复证据，不把单次弱信号写成长期偏好。",
+            detail: "When no stable pattern is detected, keep the conclusion conservative: preserve facts, state coverage, and wait for repeated evidence before upgrading the insight.",
+            next_action: "Keep the ledger and wait for more repeated evidence instead of turning one weak signal into a durable preference.",
         });
     }
     observations
@@ -2803,7 +2987,7 @@ fn validate_live_llm_reflection_contract(
     if trimmed.is_empty() {
         return Err(anyhow!("empty reflection"));
     }
-    for required in ["### 观察", "### 风险/未闭合", "### 下次动作"] {
+    for required in ["### Observations", "### Open risks", "### Next actions"] {
         if !trimmed.contains(required) {
             return Err(anyhow!("missing required LLM section {required}"));
         }
@@ -2819,17 +3003,17 @@ fn validate_live_llm_reflection_contract(
         return Err(anyhow!("missing known source anchor citation"));
     }
     let observation_body = trimmed
-        .split("### 观察")
+        .split("### Observations")
         .nth(1)
-        .and_then(|tail| tail.split("### 风险/未闭合").next())
+        .and_then(|tail| tail.split("### Open risks").next())
         .unwrap_or("");
     let has_observation_next = observation_body
         .lines()
-        .any(|line| line.to_ascii_lowercase().contains("next:") || line.contains("下次"));
+        .any(|line| line.to_ascii_lowercase().contains("next:"));
     if !has_observation_next {
         return Err(anyhow!("missing next action in observation section"));
     }
-    let allowed_headings = ["### 观察", "### 风险/未闭合", "### 下次动作"];
+    let allowed_headings = ["### Observations", "### Open risks", "### Next actions"];
     for line in trimmed.lines().map(str::trim_start) {
         if line.starts_with("# ") || line.starts_with("## ") {
             return Err(anyhow!(
@@ -2885,7 +3069,7 @@ fn ensure_existing_generated_target_is_managed(path: &Path) -> Result<bool> {
 
 fn render_run_log(report: &JianlingRunReport) -> String {
     format!(
-        "run_id={}\nmode={}\nstatus={}\nscheduled={}\nscheduler_backend={}\nstarted_at={}\nfinished_at={}\nprovider_status={}\nbudget_status={}\nsource_files={}\nsource_total_files={}\nrejected_source_files={}\ngenerated_files={}\nreceipt_path={}\nevidence_pack_path={}\n",
+        "run_id={}\nmode={}\nstatus={}\nscheduled={}\nscheduler_backend={}\nstarted_at={}\nfinished_at={}\nprovider_status={}\nbudget_status={}\nsource_files={}\nsource_total_files={}\nsource_raw_truth_files={}\nsource_generated_memory_files={}\nsource_selection_policy={}\nrejected_source_files={}\ngenerated_files={}\nreceipt_path={}\nevidence_pack_path={}\n",
         report.run_id,
         report.mode,
         report.status,
@@ -2897,6 +3081,9 @@ fn render_run_log(report: &JianlingRunReport) -> String {
         report.budget_status,
         report.source_files,
         report.source_total_files,
+        report.source_raw_truth_files,
+        report.source_generated_memory_files,
+        report.source_selection_policy,
         report.rejected_source_files.len(),
         report.generated_files.join(","),
         report.receipt_path,
@@ -2972,10 +3159,17 @@ fn read_scheduler_state(root: &Path, profile: &str) -> Result<Option<JianlingSch
     }
 }
 
-fn render_systemd_service(orderk_bin: &Path, profile: &str, vault: &Path, db: &Path) -> String {
+fn render_systemd_service(
+    orderk_bin: &Path,
+    profile: &str,
+    vault: &Path,
+    db: &Path,
+    env_path: &Path,
+) -> String {
     format!(
-        "# Managed by orderk jianling; do not hand-edit\n[Unit]\nDescription=OrderK Jianling nightly Markdown memory compiler (%i)\n\n[Service]\nType=oneshot\nWorkingDirectory={}\nEnvironmentFile=-%h/.config/orderk/{}.env\nExecStart={} jianling worker --once --profile {} --vault {} --db {}\n",
+        "# Managed by orderk jianling; do not hand-edit\n[Unit]\nDescription=OrderK Jianling nightly Markdown memory compiler (%i)\n\n[Service]\nType=oneshot\nWorkingDirectory={}\nEnvironmentFile=-{}\nEnvironmentFile=-%h/.config/orderk/{}.secrets.env\nEnvironmentFile=-%h/.hermes/.env\nExecStart={} jianling worker --once --profile {} --vault {} --db {}\n",
         systemd_path(vault),
+        systemd_path(env_path),
         profile,
         systemd_quote(orderk_bin),
         profile,
@@ -3034,6 +3228,25 @@ fn render_orderk_profile_env(profile: &str) -> Result<String> {
             "ORDERK_SWORD_LLM_API_KEY_ENV={}",
             shell_env_value(&api_key_env)
         ));
+    }
+    for key in [
+        "ORDERK_SWORD_EMBEDDING_PROVIDER",
+        "ORDERK_SWORD_EMBEDDING_MODEL",
+        "ORDERK_SWORD_EMBEDDING_DIM",
+        "ORDERK_SWORD_EMBEDDING_BASE_URL",
+        "ORDERK_SWORD_VECTOR_BACKEND",
+        "ORDERK_SWORD_RERANKER_PROVIDER",
+        "ORDERK_SWORD_RERANKER_MODEL",
+        "ORDERK_SWORD_RERANKER_BASE_URL",
+        "ORDERK_SEARCH_RERANKER_PROVIDER",
+        "ORDERK_SEARCH_RERANKER_MODEL",
+        "ORDERK_SEARCH_RERANKER_BASE_URL",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() {
+                lines.push(format!("{key}={}", shell_env_value(&value)));
+            }
+        }
     }
     for key in [
         "ORDERK_JIANLING_LLM_ENABLED",
@@ -3139,6 +3352,21 @@ fn inspect_systemd_timer(profile: &str) -> JianlingSystemdRuntime {
 }
 
 fn import_systemd_user_environment(profile: &str) -> Result<()> {
+    let present: Vec<String> = systemd_user_environment_names(profile)
+        .into_iter()
+        .filter(|name| std::env::var(name).is_ok())
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["import-environment"];
+    for name in &present {
+        args.push(name.as_str());
+    }
+    run_systemctl_user(&args).map(|_| ())
+}
+
+fn systemd_user_environment_names(profile: &str) -> Vec<String> {
     let mut names = vec![
         "ORDERK_SWORD_LLM_PROVIDER".to_string(),
         "ORDERK_SWORD_LLM_MODEL".to_string(),
@@ -3153,21 +3381,21 @@ fn import_systemd_user_environment(profile: &str) -> Result<()> {
         "ORDERK_SWORD_LLM_MINIMAX_API_KEY".to_string(),
         "ORDERK_SWORD_LLM_API_KEY".to_string(),
         "ORDERK_SWORD_LLM_ANTHROPIC_API_KEY".to_string(),
+        "ORDERK_SILICONFLOW_API_KEY".to_string(),
+        "ORDERK_SWORD_EMBEDDING_API_KEY".to_string(),
+        "ORDERK_SWORD_EMBEDDING_SILICONFLOW_API_KEY".to_string(),
+        "ORDERK_EMBEDDING_API_KEY".to_string(),
+        "ORDERK_EMBEDDING_SILICONFLOW_API_KEY".to_string(),
+        "ORDERK_SEARCH_RERANKER_SILICONFLOW_API_KEY".to_string(),
+        "ORDERK_SEARCH_RERANKER_API_KEY".to_string(),
+        "ORDERK_RERANKER_SILICONFLOW_API_KEY".to_string(),
+        "ORDERK_RERANKER_API_KEY".to_string(),
+        "ORDERK_SWORD_RERANKER_SILICONFLOW_API_KEY".to_string(),
+        "ORDERK_SWORD_RERANKER_API_KEY".to_string(),
     ];
     names.sort();
     names.dedup();
-    let present: Vec<String> = names
-        .into_iter()
-        .filter(|name| std::env::var(name).is_ok())
-        .collect();
-    if present.is_empty() {
-        return Ok(());
-    }
-    let mut args = vec!["import-environment"];
-    for name in &present {
-        args.push(name.as_str());
-    }
-    run_systemctl_user(&args).map(|_| ())
+    names
 }
 
 fn run_systemctl_user(args: &[&str]) -> Result<String> {
@@ -3631,7 +3859,7 @@ fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
-        "你是 OrderK Jianling V4 睡后反思者。只根据证据写可落入 Obsidian 的中文反思。\n\n核心目标：同时保留底账和观察。底账是客观事实/source anchors/hash/run evidence；观察是从重复行为、用户纠正、流程变化里萃取出来的可回忆判断。不要把 raw evidence 列表当成反思。\n\n约束：\n- 不要编造证据外事实。\n- 每条观察必须引用 [S1] 这种 source anchor，并标注 confidence: high/medium/low。\n- 输出且只输出三段三级 Markdown 标题：`### 观察`、`### 风险/未闭合`、`### 下次动作`；不要输出 `##` 或 `#`。\n- `### 观察` 下每条观察必须同时包含 source anchor、`confidence: ...`、`next: ...`。\n- 优先识别用户/流程模式，例如多次要求子代理审计=强质量复查偏好；多次要求文件/索引/hash=不接受假闭环。\n- 不要代码块，不要泄露凭证。\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\n证据：\n{evidence}",
+        "You are the OrderK Jianling V4 sleep-reflection writer. Write a pure-English Obsidian reflection using only the supplied evidence.\n\nCore goal: keep both the factual ledger and the judgment. The ledger is objective source anchors, hashes, and run evidence; the reflection is a memorable judgment distilled from repeated behavior, user corrections, and workflow changes. Do not turn the raw evidence list into the reflection.\n\nConstraints:\n- Do not invent facts beyond the evidence.\n- Every observation must cite a [S1]-style source anchor and include confidence: high/medium/low.\n- Output exactly three level-3 Markdown headings: `### Observations`, `### Open risks`, and `### Next actions`; do not output `##` or `#`.\n- Each item under `### Observations` must include a source anchor, `confidence: ...`, and `next: ...`.\n- Prefer durable user/process patterns: repeated requests for subagent audit = strong independent-review preference; repeated file/index/hash failures = the user does not accept fake closure.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\nevidence:\n{evidence}",
         input.run_id,
         input.mode.as_str(),
         input.date,
@@ -4089,5 +4317,82 @@ fn check(
         ok,
         status: status.to_string(),
         detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "orderk-jianling-unit-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root.join("orderk.sqlite")
+    }
+
+    #[test]
+    fn index_feedback_freshness_rejects_missing_and_stale_rows() {
+        let db = temp_db_path("freshness-stale");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE files (path TEXT PRIMARY KEY, size INTEGER NOT NULL, hash TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        assert!(verify_index_feedback_freshness(
+            &db,
+            "brain/daily/2026-06-10.md",
+            Some("sha256:fresh"),
+            Some(10),
+        )
+        .is_err());
+        conn.execute(
+            "INSERT INTO files (path, size, hash) VALUES (?1, ?2, ?3)",
+            ("brain/daily/2026-06-10.md", 1_i64, "stale"),
+        )
+        .unwrap();
+        assert!(verify_index_feedback_freshness(
+            &db,
+            "brain/daily/2026-06-10.md",
+            Some("sha256:fresh"),
+            Some(10),
+        )
+        .is_err());
+        conn.execute(
+            "UPDATE files SET size = ?2, hash = ?3 WHERE path = ?1",
+            ("brain/daily/2026-06-10.md", 10_i64, "fresh"),
+        )
+        .unwrap();
+        verify_index_feedback_freshness(
+            &db,
+            "brain/daily/2026-06-10.md",
+            Some("sha256:fresh"),
+            Some(10),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn systemd_user_environment_names_cover_index_and_llm_keys_without_values() {
+        let names = systemd_user_environment_names("default");
+        for expected in [
+            "HERMES_MINIMAX_API_KEY",
+            "ORDERK_SILICONFLOW_API_KEY",
+            "ORDERK_SWORD_EMBEDDING_API_KEY",
+            "ORDERK_SWORD_EMBEDDING_SILICONFLOW_API_KEY",
+            "ORDERK_SWORD_RERANKER_API_KEY",
+            "ORDERK_SWORD_RERANKER_SILICONFLOW_API_KEY",
+            "ORDERK_SEARCH_RERANKER_API_KEY",
+            "ORDERK_SWORD_LLM_API_KEY_ENV",
+            "ORDERK_JIANLING_LLM_ENABLED_DEFAULT",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
+        assert!(names.iter().all(|name| !name.contains("secret-value")));
     }
 }

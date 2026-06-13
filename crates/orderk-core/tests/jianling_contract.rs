@@ -6,7 +6,8 @@ use orderk_core::{
     index_vault, index_vault_with_options, jianling_chat_smoke, jianling_doctor, jianling_enable,
     jianling_run, jianling_status, jianling_validate_file, jianling_validate_run, jianling_worker,
     EmbeddingProvider, IndexOptions, JianlingEnableOptions, JianlingRunMode, JianlingRunOptions,
-    JianlingValidateFileOptions, JianlingWorkerOptions, MockEmbeddingProvider, VectorBackend,
+    JianlingRunReport, JianlingValidateFileOptions, JianlingWorkerOptions, MockEmbeddingProvider,
+    VectorBackend,
 };
 use rusqlite::Connection;
 
@@ -139,6 +140,23 @@ fn jianling_dry_run_reports_sources_without_writing_generated_memory() {
     assert_eq!(report.promotion_status, "not_applicable");
     assert!(report.promotion_index_summaries.is_empty());
     assert!(report.success_predicate.pre_write_guard == "passed");
+    let mut old_receipt = serde_json::to_value(&report).unwrap();
+    old_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("source_raw_truth_files");
+    old_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("source_generated_memory_files");
+    old_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("source_selection_policy");
+    let decoded: JianlingRunReport = serde_json::from_value(old_receipt).unwrap();
+    assert_eq!(decoded.source_raw_truth_files, 0);
+    assert_eq!(decoded.source_generated_memory_files, 0);
+    assert_eq!(decoded.source_selection_policy, "");
     assert!(!vault.join("brain/daily/2026-06-10.md").exists());
     assert!(!vault.join(".orderk/jianling/topic_ledger.json").exists());
     assert!(!vault.join(".orderk/jianling/watermarks.json").exists());
@@ -178,19 +196,24 @@ fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
     assert!(daily_text.contains("generated_by: orderk-jianling"));
     assert!(daily_text.contains("status: active_generated"));
     assert!(daily_text.contains("source_tier: generated_memory"));
+    assert!(daily_text.contains("source_raw_truth_files:"));
+    assert!(daily_text.contains("source_generated_memory_files: 0"));
+    assert!(daily_text.contains("source_selection_policy: 'daily/manual selects raw transcript sources only; no prior generated reflections are used before writing'"));
     assert!(daily_text.contains("source_anchors:"));
     assert!(daily_text.contains("digest_schema_version: orderk.jianling.digest.v2"));
     assert!(daily_text.contains("reflection_layers: [factual_ledger, reflective_synthesis]"));
-    assert!(daily_text.contains("## 一句话结论"));
-    assert!(daily_text.contains("## 客观底账 / Factual ledger"));
-    assert!(daily_text.contains("## 推断观察 / Reflective synthesis"));
-    assert!(daily_text.contains("## 用户/系统模式 / User-system patterns"));
-    assert!(daily_text.contains("## 未闭合风险 / Open risks"));
-    assert!(daily_text.contains("## 下次动作 / Next actions"));
-    assert!(daily_text.contains("## 证据附录 / Evidence appendix"));
-    assert!(daily_text.contains("质量复查偏好"));
-    assert!(daily_text.contains("底账不可丢"));
-    assert!(daily_text.contains("反思要有判断"));
+    assert!(daily_text.contains("## Executive summary"));
+    assert!(daily_text.contains("## Factual ledger"));
+    assert!(daily_text.contains("## Reflective synthesis"));
+    assert!(daily_text.contains("## User/system patterns"));
+    assert!(daily_text.contains("## Open risks"));
+    assert!(daily_text.contains("## Next actions"));
+    assert!(daily_text.contains("## Evidence appendix"));
+    assert!(daily_text.contains("Independent review preference"));
+    assert!(daily_text.contains("Preserve the factual ledger"));
+    assert!(daily_text.contains("Reflection must make a judgment"));
+    assert!(!daily_text.contains("## 一句话结论"));
+    assert!(!daily_text.contains("## 推断观察"));
     assert!(daily_text.contains("confidence: high"));
     assert!(daily_text.contains("next:"));
     assert!(daily_text.contains("promotion rule:"));
@@ -246,6 +269,148 @@ fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
     )
     .unwrap();
     assert!(validation.ok, "validation should pass: {validation:#?}");
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_replaces_existing_digest_and_refreshes_index_row_hash() {
+    let vault = temp_vault("replace-refresh-index");
+    let _env = ScopedEnv::set(&[
+        ("ORDERK_SWORD_EMBEDDING_PROVIDER", "mock"),
+        ("ORDERK_SWORD_EMBEDDING_MODEL", "mock-8"),
+        ("ORDERK_SWORD_EMBEDDING_DIM", "8"),
+        ("ORDERK_SWORD_VECTOR_BACKEND", "exact"),
+    ]);
+    seed_raw_dialogue_on(
+        &vault,
+        "2026-06-10",
+        "# first source\n\n用户说：复杂任务要子代理 审计 复查 验收 gate。\n",
+    );
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    let first = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db.clone()),
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert!(first.ok, "first run should pass: {first:#?}");
+    let conn = Connection::open(&db).unwrap();
+    let first_indexed_hash: String = conn
+        .query_row(
+            "SELECT hash FROM files WHERE path = ?1",
+            ["brain/daily/2026-06-10.md"],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    seed_raw_dialogue_on(
+        &vault,
+        "2026-06-10",
+        "# second source\n\n用户说：第二次强调不能接受假闭环，写入 Obsidian 后索引卡片必须刷新 hash 和 size。\n",
+    );
+    let second = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db.clone()),
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert!(second.ok, "replacement run should pass: {second:#?}");
+    assert_eq!(second.index_update, "success");
+    assert_eq!(second.index_smoke_status, "passed");
+
+    let indexed: (i64, String) = conn
+        .query_row(
+            "SELECT size, hash FROM files WHERE path = ?1",
+            ["brain/daily/2026-06-10.md"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_ne!(
+        indexed.1, first_indexed_hash,
+        "index row must not stay stale after replacement"
+    );
+    assert_eq!(indexed.0 as usize, second.file_ops[0].byte_count);
+    assert_eq!(
+        format!("sha256:{}", indexed.1),
+        second.file_ops[0].postimage_hash
+    );
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_index_freshness_mismatch_fails_closed_without_success_label() {
+    let vault = temp_vault("stale-index-row");
+    let _env = ScopedEnv::set(&[
+        ("ORDERK_SWORD_EMBEDDING_PROVIDER", "mock"),
+        ("ORDERK_SWORD_EMBEDDING_MODEL", "mock-8"),
+        ("ORDERK_SWORD_EMBEDDING_DIM", "8"),
+        ("ORDERK_SWORD_VECTOR_BACKEND", "exact"),
+    ]);
+    seed_raw_dialogue(&vault);
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER stale_jianling_file_after_insert
+        AFTER INSERT ON files
+        WHEN NEW.path = 'brain/daily/2026-06-10.md'
+        BEGIN
+            UPDATE files SET size = 1, hash = 'stale' WHERE path = NEW.path;
+        END;
+        CREATE TRIGGER stale_jianling_file_after_update
+        AFTER UPDATE OF size, hash ON files
+        WHEN NEW.path = 'brain/daily/2026-06-10.md' AND NEW.hash != 'stale'
+        BEGIN
+            UPDATE files SET size = 1, hash = 'stale' WHERE path = NEW.path;
+        END;
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: true,
+            db: Some(db),
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert!(
+        !report.ok,
+        "stale index freshness must fail closed: {report:#?}"
+    );
+    assert_eq!(report.status, "degraded_index_failed");
+    assert_eq!(report.index_update, "failed_stale_db_freshness");
+    assert_eq!(report.index_smoke_status, "failed_stale_db_freshness");
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("index freshness failed")));
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -628,7 +793,12 @@ fn jianling_enable_writes_orderk_managed_systemd_units() {
     let service = fs::read_to_string(systemd_dir.join("orderk-jianling@default.service")).unwrap();
     assert!(service.contains("# Managed by orderk jianling; do not hand-edit"));
     assert!(service.contains("jianling worker --once --profile default"));
-    assert!(service.contains("EnvironmentFile=-%h/.config/orderk/default.env"));
+    let env_path = report.env_path.as_ref().unwrap();
+    assert!(Path::new(env_path).is_file());
+    assert!(service.contains(&format!("EnvironmentFile=-{env_path}")));
+    assert!(!service.contains("EnvironmentFile=-%h/.config/orderk/default.env"));
+    assert!(service.contains("EnvironmentFile=-%h/.config/orderk/default.secrets.env"));
+    assert!(service.contains("EnvironmentFile=-%h/.hermes/.env"));
     assert!(service.contains("WorkingDirectory="));
     assert!(service.contains("--vault"));
     assert!(service.contains("--db"));
@@ -779,6 +949,86 @@ fn jianling_weekly_monthly_yearly_select_expected_date_windows() {
         .source_anchors
         .iter()
         .any(|anchor| anchor.path.contains("2026/06/11")));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_rollups_include_lower_level_generated_reflections() {
+    let vault = temp_vault("hierarchical-rollup-sources");
+    seed_raw_dialogue_on(&vault, "2026-06-01", "# day one\n\nRaw day one source.\n");
+    seed_raw_dialogue_on(&vault, "2026-06-07", "# sunday\n\nRaw sunday source.\n");
+    fs::create_dir_all(vault.join("brain/daily")).unwrap();
+    fs::write(
+        vault.join("brain/daily/2026-06-01.md"),
+        "---\ngenerated_by: orderk-jianling\n---\n# Jianling Daily Digest — 2026-06-01\nDaily reflection source.\n",
+    )
+    .unwrap();
+    fs::write(
+        vault.join("brain/daily/2026-06-07.md"),
+        "---\ngenerated_by: orderk-jianling\n---\n# Jianling Daily Digest — 2026-06-07\nDaily reflection source.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(vault.join("brain/weekly")).unwrap();
+    fs::write(
+        vault.join("brain/weekly/2026-06-07.md"),
+        "---\ngenerated_by: orderk-jianling\n---\n# Jianling Weekly Reflection — 2026-06-07\nWeekly reflection source.\n",
+    )
+    .unwrap();
+
+    let weekly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Weekly,
+            dry_run: true,
+            scheduled: true,
+            db: None,
+            date: Some("2026-06-07".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert!(weekly
+        .source_anchors
+        .iter()
+        .any(|anchor| anchor.path == "brain/daily/2026-06-01.md"));
+    assert!(weekly
+        .source_anchors
+        .iter()
+        .any(|anchor| anchor.path == "brain/daily/2026-06-07.md"));
+    assert!(weekly
+        .source_anchors
+        .iter()
+        .filter(|anchor| anchor.path.starts_with("brain/daily/"))
+        .all(|anchor| anchor.source_tier == "generated_memory"));
+    assert_eq!(weekly.source_generated_memory_files, 2);
+    assert_eq!(weekly.source_raw_truth_files, 2);
+    assert!(weekly
+        .source_selection_policy
+        .contains("weekly selects managed brain/daily reflections first"));
+
+    let monthly = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "default".to_string(),
+            mode: JianlingRunMode::Monthly,
+            dry_run: true,
+            scheduled: true,
+            db: None,
+            date: Some("2026-06-07".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+    assert!(monthly
+        .source_anchors
+        .iter()
+        .any(|anchor| anchor.path == "brain/daily/2026-06-01.md"));
+    assert!(monthly
+        .source_anchors
+        .iter()
+        .any(|anchor| anchor.path == "brain/weekly/2026-06-07.md"));
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -1197,7 +1447,7 @@ fn jianling_empty_source_does_not_update_topic_ledger() {
 }
 
 #[test]
-fn jianling_empty_rollup_with_existing_ledger_does_not_promote_or_rewrite_ledger() {
+fn jianling_rollup_uses_existing_daily_reflections_after_raw_sources_are_removed() {
     let vault = temp_vault("empty-rollup-ledger");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
@@ -1221,8 +1471,6 @@ fn jianling_empty_rollup_with_existing_ledger_does_not_promote_or_rewrite_ledger
         assert!(daily.ok, "daily seed should pass: {daily:#?}");
     }
 
-    let ledger_path = vault.join(".orderk/jianling/topic_ledger.json");
-    let before = fs::read_to_string(&ledger_path).unwrap();
     fs::remove_dir_all(vault.join("raw/transcripts/hermes-sessions/2026/06")).unwrap();
     fs::create_dir_all(vault.join("raw/system-snapshots/2026/06/11")).unwrap();
     fs::write(
@@ -1249,13 +1497,18 @@ fn jianling_empty_rollup_with_existing_ledger_does_not_promote_or_rewrite_ledger
         weekly.ok,
         "empty rollup should remain non-promoting: {weekly:#?}"
     );
-    assert_eq!(weekly.source_files, 0);
-    assert!(weekly.topic_ledger_path.is_none());
-    assert!(weekly.promotion_paths.is_empty());
-    assert!(!vault
-        .join("brain/lessons/quality-review-preference.md")
-        .exists());
-    assert_eq!(fs::read_to_string(&ledger_path).unwrap(), before);
+    assert_eq!(weekly.source_files, 2);
+    assert_eq!(weekly.source_generated_memory_files, 2);
+    assert_eq!(weekly.source_raw_truth_files, 0);
+    assert!(weekly
+        .source_selection_policy
+        .contains("weekly selects managed brain/daily reflections first"));
+    assert!(weekly
+        .source_anchors
+        .iter()
+        .all(|anchor| anchor.path.starts_with("brain/daily/")
+            && anchor.source_tier == "generated_memory"));
+    assert!(weekly.topic_ledger_path.is_some());
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -1343,7 +1596,7 @@ fn jianling_partial_large_run_writes_kanban_chunk_and_foreman_receipts() {
     assert_eq!(foreman["acceptance"]["traceable"], true);
     assert_eq!(foreman["acceptance"]["controls_final_write"], true);
     let generated_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(generated_text.contains("## Kanban 精炼 Harness"));
+    assert!(generated_text.contains("### Kanban refinement harness"));
     assert!(generated_text.contains("final Markdown is written only after foreman acceptance"));
 
     let validation = jianling_validate_run(&vault, &report.run_id).unwrap();
@@ -1475,7 +1728,7 @@ fn jianling_apply_configured_llm_without_hot_switch_does_not_call_provider() {
     );
     assert_eq!(server.request_count(), 0);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(!daily_text.contains("\n## LLM 反思（MiniMax M3）"));
+    assert!(!daily_text.contains("\n## LLM reflection (MiniMax M3)"));
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -1485,7 +1738,7 @@ fn jianling_apply_calls_configured_llm_and_writes_contract_valid_reflection() {
     let vault = temp_vault("live-llm-run");
     seed_raw_dialogue(&vault);
     let server = FakeAnthropicServer::start(
-        "### 观察\n- LLM reflection from fake MiniMax [S1] confidence: high; next: keep independent audit before release.\n### 风险/未闭合\n- no extra risk beyond source evidence [S1] confidence: medium.\n### 下次动作\n- verify receipt and index feedback [S1].\n",
+        "### Observations\n- LLM reflection from fake MiniMax [S1] confidence: high; next: keep independent audit before release.\n### Open risks\n- no extra risk beyond source evidence [S1] confidence: medium.\n### Next actions\n- verify receipt and index feedback [S1].\n",
     );
     let _guard = ScopedEnv::set(&[
         ("ORDERK_JIANLING_LLM_ENABLED_LLMMODE", "1"),
@@ -1513,8 +1766,8 @@ fn jianling_apply_calls_configured_llm_and_writes_contract_valid_reflection() {
     assert!(report.ok);
     assert!(!report.fallback_used);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(daily_text.contains("### LLM 反思（MiniMax M3）"));
-    assert!(!daily_text.contains("\n## LLM 反思（MiniMax M3）"));
+    assert!(daily_text.contains("### LLM reflection (MiniMax M3)"));
+    assert!(!daily_text.contains("\n## LLM reflection (MiniMax M3)"));
     assert!(daily_text.contains("LLM reflection from fake MiniMax [S1] confidence: high"));
     assert!(daily_text.contains("next: keep independent audit before release"));
     assert_eq!(server.request_count(), 1);
@@ -1561,7 +1814,7 @@ fn jianling_apply_rejects_contract_invalid_llm_reflection() {
         .iter()
         .any(|warning| warning.contains("live LLM reflection rejected")));
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(!daily_text.contains("### LLM 反思（MiniMax M3）"));
+    assert!(!daily_text.contains("### LLM reflection (MiniMax M3)"));
     assert!(!daily_text.contains("LLM reflection from fake MiniMax"));
     assert_eq!(server.request_count(), 1);
 
@@ -1573,7 +1826,7 @@ fn jianling_apply_rejects_llm_reflection_with_extra_top_level_heading() {
     let vault = temp_vault("live-llm-extra-heading");
     seed_raw_dialogue(&vault);
     let server = FakeAnthropicServer::start(
-        "## Extra top-level heading\n### 观察\n- looks grounded [S1] confidence: high; next: do not publish invalid structure.\n### 风险/未闭合\n- top-level heading would break seven-section digest [S1] confidence: high.\n### 下次动作\n- reject this response [S1].\n",
+        "## Extra top-level heading\n### Observations\n- looks grounded [S1] confidence: high; next: do not publish invalid structure.\n### Open risks\n- top-level heading would break seven-section digest [S1] confidence: high.\n### Next actions\n- reject this response [S1].\n",
     );
     let _guard = ScopedEnv::set(&[
         ("ORDERK_JIANLING_LLM_ENABLED_LLMHEADING", "1"),
