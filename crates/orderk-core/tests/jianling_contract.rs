@@ -1799,20 +1799,18 @@ fn jianling_chat_smoke_receipts_unconfigured_llm_without_secret_leak() {
 }
 
 #[test]
-fn jianling_apply_configured_llm_without_hot_switch_does_not_call_provider() {
+fn jianling_apply_configured_llm_profile_switch_off_does_not_call_provider() {
     let vault = temp_vault("live-llm-switch-off");
     seed_raw_dialogue(&vault);
     let server = FakeAnthropicServer::start("- should not be called\n");
     let _guard = ScopedEnv::set_with_clear(
         &[
+            ("ORDERK_JIANLING_LLM_ENABLED_SWITCHOFF", "0"),
             ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
             ("ORDERK_TEST_LLM_KEY", "test-secret"),
             ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
         ],
-        &[
-            "ORDERK_JIANLING_LLM_ENABLED",
-            "ORDERK_JIANLING_LLM_ENABLED_SWITCHOFF",
-        ],
+        &["ORDERK_JIANLING_LLM_ENABLED"],
     );
 
     let report = jianling_run(
@@ -1836,6 +1834,47 @@ fn jianling_apply_configured_llm_without_hot_switch_does_not_call_provider() {
     assert_eq!(server.request_count(), 0);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
     assert!(!daily_text.contains("\n## LLM reflection (MiniMax M3)"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_apply_configured_llm_defaults_on_when_key_is_configured() {
+    let vault = temp_vault("live-llm-default-on");
+    seed_raw_dialogue(&vault);
+    let server = FakeAnthropicServer::start(
+        "### Observations\n- Default-on LLM reflection from fake MiniMax [S1] confidence: high; next: keep the key-configured path live.\n### Open risks\n- no extra risk beyond source evidence [S1] confidence: medium.\n### Next actions\n- verify default-on receipt [S1].\n",
+    );
+    let _guard = ScopedEnv::set_with_clear(
+        &[
+            ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+            ("ORDERK_TEST_LLM_KEY", "test-secret"),
+            ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+        ],
+        &[
+            "ORDERK_JIANLING_LLM_ENABLED",
+            "ORDERK_JIANLING_LLM_ENABLED_DEFAULTON",
+        ],
+    );
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "defaulton".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.provider_status, "called_live");
+    assert_eq!(server.request_count(), 1);
+    let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
+    assert!(daily_text.contains("Default-on LLM reflection from fake MiniMax [S1]"));
 
     let _ = fs::remove_dir_all(vault);
 }

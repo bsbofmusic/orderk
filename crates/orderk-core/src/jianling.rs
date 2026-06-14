@@ -16,14 +16,17 @@ use crate::api::{
     index_paths_with_options, provider_from_name, query_with_options, status as orderk_status,
 };
 use crate::models::{IndexOptions, IndexPathOptions, IndexSummary, QueryOptions, VectorBackend};
-use crate::profiles::{resolve_sword_model_profile_from_env, SwordModelSlot};
+use crate::profiles::{resolve_llm_chain, resolve_sword_model_profile_from_env, SwordModelSlot};
 use crate::scanner::scan_vault;
 
 const CONTROL_ROOT: &str = ".orderk/jianling";
 const JIANLING_VERSION: &str = "0.1";
 const JIANLING_CHUNK_SIZE: usize = 40;
 const DEFAULT_ANTHROPIC_MINIMAX_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
+const DEFAULT_OPENAI_COMPAT_BASE_URL: &str = "https://api.openai.com";
 const JIANLING_LLM_MAX_TOKENS: u32 = 2000;
+const JIANLING_CHAT_SYSTEM_PROMPT: &str =
+    "Return only the requested Markdown text. Do not include thinking, code fences, or extra explanation.";
 const JIANLING_DAILY_BACKGROUND_DAYS: i64 = 7;
 /// Per-source body cap (chars, after one-line compaction) when feeding evidence
 /// to the LLM. theme_excerpt can be ~8000 chars; we trim each source so a single
@@ -655,19 +658,22 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         &selection.rejected_paths,
     );
     if !options.dry_run && jianling_live_llm_enabled(&profile) {
-        match generate_live_llm_reflection(LiveReflectionInput {
-            profile: &profile,
-            mode: &options.mode,
-            date: &date,
-            run_id: &run_id,
-            anchors: &source_anchors,
-            sources: &evidence_sources,
-            background_anchors: &background_anchors,
-            background_sources: &background_sources,
-            source_total_files: selection.total_files,
-            rejected_source_files: &selection.rejected_paths,
-            vault: &vault,
-        }) {
+        match generate_live_llm_reflection(
+            LiveReflectionInput {
+                profile: &profile,
+                mode: &options.mode,
+                date: &date,
+                run_id: &run_id,
+                anchors: &source_anchors,
+                sources: &evidence_sources,
+                background_anchors: &background_anchors,
+                background_sources: &background_sources,
+                source_total_files: selection.total_files,
+                rejected_source_files: &selection.rejected_paths,
+                vault: &vault,
+            },
+            &mut warnings,
+        ) {
             Ok(Some(reflection)) => {
                 match validate_live_llm_reflection_contract(&reflection, &source_anchors) {
                     Ok(()) => {
@@ -4432,26 +4438,63 @@ fn jianling_llm_profile_label() -> String {
 }
 
 fn jianling_provider_status_for_dry_run(dry_run: bool, profile: &str) -> String {
-    match resolve_sword_model_profile_from_env() {
-        Ok(profile) if profile.llm.provider == "disabled" => "disabled".to_string(),
-        Ok(profile) if profile.llm.api_key_configured && dry_run => {
-            "configured_not_called_dry_run".to_string()
-        }
-        Ok(model_profile)
-            if model_profile.llm.api_key_configured && !jianling_live_llm_enabled(profile) =>
-        {
+    match resolve_llm_chain() {
+        Ok(chain) if chain.is_empty() => match resolve_sword_model_profile_from_env() {
+            Ok(profile) if profile.llm.provider == "disabled" => "disabled".to_string(),
+            Ok(_) => "llm_unconfigured_skipped".to_string(),
+            Err(err) => format!("profile_error:{err}"),
+        },
+        Ok(_) if dry_run => "configured_not_called_dry_run".to_string(),
+        Ok(chain) if !jianling_live_llm_enabled_with_chain(profile, !chain.is_empty()) => {
             "configured_inactive_explicit_switch_off".to_string()
         }
-        Ok(model_profile) if model_profile.llm.api_key_configured => {
-            "configured_pending_live_call".to_string()
-        }
-        Ok(_) => "llm_unconfigured_skipped".to_string(),
+        Ok(_) => "configured_pending_live_call".to_string(),
         Err(err) => format!("profile_error:{err}"),
     }
 }
 
 fn jianling_live_llm_enabled(profile: &str) -> bool {
-    let suffix = profile
+    let chain_has_valid_slot = resolve_llm_chain()
+        .map(|chain| !chain.is_empty())
+        .unwrap_or(false);
+    jianling_live_llm_enabled_with_chain(profile, chain_has_valid_slot)
+}
+
+fn jianling_live_llm_enabled_with_chain(profile: &str, chain_has_valid_slot: bool) -> bool {
+    let suffix = jianling_profile_env_suffix(profile);
+    let per_profile_name = format!("ORDERK_JIANLING_LLM_ENABLED_{suffix}");
+    let per_profile = std::env::var(&per_profile_name).ok();
+    let global = std::env::var("ORDERK_JIANLING_LLM_ENABLED").ok();
+    jianling_live_llm_enabled_from_values(
+        per_profile.as_deref(),
+        global.as_deref(),
+        chain_has_valid_slot,
+    )
+}
+
+fn jianling_live_llm_enabled_from_values(
+    per_profile: Option<&str>,
+    global: Option<&str>,
+    chain_has_valid_slot: bool,
+) -> bool {
+    if let Some(value) = per_profile {
+        return parse_jianling_bool_flag(value);
+    }
+    if let Some(value) = global {
+        return parse_jianling_bool_flag(value);
+    }
+    chain_has_valid_slot
+}
+
+fn parse_jianling_bool_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn jianling_profile_env_suffix(profile: &str) -> String {
+    profile
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -4460,22 +4503,7 @@ fn jianling_live_llm_enabled(profile: &str) -> bool {
                 '_'
             }
         })
-        .collect::<String>();
-    let names = [
-        format!("ORDERK_JIANLING_LLM_ENABLED_{suffix}"),
-        "ORDERK_JIANLING_LLM_ENABLED".to_string(),
-    ];
-    names.iter().any(|name| {
-        std::env::var(name)
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
-    })
+        .collect::<String>()
 }
 
 struct LiveReflectionInput<'a> {
@@ -4538,18 +4566,20 @@ fn build_historian_prompt(input: &LiveReflectionInput<'_>, evidence: &str) -> St
     )
 }
 
-fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option<String>> {
-    if !jianling_live_llm_enabled(input.profile) {
-        return Ok(None);
-    }
+fn generate_live_llm_reflection(
+    input: LiveReflectionInput<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<String>> {
     if input.sources.is_empty() || input.anchors.is_empty() {
         return Ok(None);
     }
-    let slot = resolve_sword_model_profile_from_env()?.llm;
-    if slot.provider == "disabled" || !slot.api_key_configured {
+    let chain = resolve_llm_chain()?;
+    if !jianling_live_llm_enabled_with_chain(input.profile, !chain.is_empty()) {
         return Ok(None);
     }
-    let mut client = AnthropicCompatibleChatClient::from_slot(&slot)?;
+    if chain.is_empty() {
+        return Ok(None);
+    }
     let evidence = render_live_reflection_evidence(
         input.sources,
         input.anchors,
@@ -4557,8 +4587,40 @@ fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option
         input.background_anchors,
     );
     let prompt = build_historian_prompt(&input, &evidence);
-    let text = client.send_prompt(&prompt)?;
-    Ok(Some(text.trim().to_string()))
+    let mut failures = Vec::new();
+    for slot in chain {
+        let mut client = match AnthropicCompatibleChatClient::from_slot(&slot) {
+            Ok(client) => client,
+            Err(err) => {
+                let warning = format!(
+                    "live LLM provider {} model {} setup failed in fallback chain: {err}",
+                    slot.provider, slot.model
+                );
+                warnings.push(warning);
+                failures.push(format!("{}:{} setup: {err}", slot.provider, slot.model));
+                continue;
+            }
+        };
+        match client.send_prompt(&prompt) {
+            Ok(text) => return Ok(Some(text.trim().to_string())),
+            Err(err) => {
+                let warning = format!(
+                    "live LLM provider {} model {} failed in fallback chain: {err}",
+                    slot.provider, slot.model
+                );
+                warnings.push(warning);
+                failures.push(format!("{}:{} call: {err}", slot.provider, slot.model));
+            }
+        }
+    }
+    Err(anyhow!(
+        "Jianling LLM fallback chain exhausted: {}",
+        if failures.is_empty() {
+            "unknown error".to_string()
+        } else {
+            failures.join(" | ")
+        }
+    ))
 }
 
 fn repair_live_llm_reflection(
@@ -4566,17 +4628,17 @@ fn repair_live_llm_reflection(
     invalid_text: &str,
     validation_error: &str,
 ) -> Result<Option<String>> {
-    if !jianling_live_llm_enabled(input.profile) {
-        return Ok(None);
-    }
     if input.sources.is_empty() || input.anchors.is_empty() {
         return Ok(None);
     }
-    let slot = resolve_sword_model_profile_from_env()?.llm;
-    if slot.provider == "disabled" || !slot.api_key_configured {
+    let chain = resolve_llm_chain()?;
+    if !jianling_live_llm_enabled_with_chain(input.profile, !chain.is_empty()) {
         return Ok(None);
     }
-    let mut client = AnthropicCompatibleChatClient::from_slot(&slot)?;
+    let Some(slot) = chain.first() else {
+        return Ok(None);
+    };
+    let mut client = AnthropicCompatibleChatClient::from_slot(slot)?;
     let evidence = render_live_reflection_evidence(
         input.sources,
         input.anchors,
@@ -4651,20 +4713,57 @@ fn render_live_reflection_evidence(
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JianlingChatProtocol {
+    Anthropic,
+    OpenAi,
+    Codex,
+}
+
+impl JianlingChatProtocol {
+    fn endpoint_suffix(self) -> &'static str {
+        match self {
+            Self::Anthropic => "/v1/messages",
+            Self::OpenAi => "/v1/chat/completions",
+            Self::Codex => "/v1/responses",
+        }
+    }
+
+    fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Anthropic => DEFAULT_ANTHROPIC_MINIMAX_BASE_URL,
+            Self::OpenAi | Self::Codex => DEFAULT_OPENAI_COMPAT_BASE_URL,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Codex => "codex",
+        }
+    }
+}
+
 struct AnthropicCompatibleChatClient {
     api_key: String,
     model: String,
     base_url: String,
+    protocol: JianlingChatProtocol,
 }
 
 impl AnthropicCompatibleChatClient {
     fn from_slot(slot: &SwordModelSlot) -> Result<Self> {
-        if slot.provider != "anthropic" {
-            return Err(anyhow!(
-                "Jianling chat smoke currently supports Anthropic-compatible provider only; got {}",
-                slot.provider
-            ));
-        }
+        let protocol = match slot.provider.as_str() {
+            "anthropic" => JianlingChatProtocol::Anthropic,
+            "openai" => JianlingChatProtocol::OpenAi,
+            "codex" => JianlingChatProtocol::Codex,
+            other => {
+                return Err(anyhow!(
+                "Jianling chat client supports anthropic, openai, and codex providers; got {other}"
+            ))
+            }
+        };
         let api_key_env = slot
             .api_key_env
             .as_deref()
@@ -4680,16 +4779,56 @@ impl AnthropicCompatibleChatClient {
             base_url: slot
                 .base_url
                 .clone()
-                .unwrap_or_else(|| DEFAULT_ANTHROPIC_MINIMAX_BASE_URL.to_string()),
+                .unwrap_or_else(|| protocol.default_base_url().to_string()),
+            protocol,
         })
     }
 
     fn endpoint(&self) -> String {
         let trimmed = self.base_url.trim_end_matches('/');
-        if trimmed.ends_with("/v1/messages") {
+        let suffix = self.protocol.endpoint_suffix();
+        if trimmed.ends_with(suffix) {
             trimmed.to_string()
         } else {
-            format!("{trimmed}/v1/messages")
+            format!("{trimmed}{suffix}")
+        }
+    }
+
+    fn request_body(&self, prompt: &str) -> String {
+        match self.protocol {
+            JianlingChatProtocol::Anthropic => json!({
+                "model": self.model,
+                "max_tokens": JIANLING_LLM_MAX_TOKENS,
+                "temperature": 0.0,
+                "thinking": {"type": "disabled"},
+                "system": JIANLING_CHAT_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": prompt}]
+            }),
+            JianlingChatProtocol::OpenAi => json!({
+                "model": self.model,
+                "max_tokens": JIANLING_LLM_MAX_TOKENS,
+                "temperature": 0.0,
+                "messages": [
+                    {"role": "system", "content": JIANLING_CHAT_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ]
+            }),
+            // field-spec only, not live-regressed
+            JianlingChatProtocol::Codex => json!({
+                "model": self.model,
+                "instructions": JIANLING_CHAT_SYSTEM_PROMPT,
+                "input": prompt,
+                "max_output_tokens": JIANLING_LLM_MAX_TOKENS
+            }),
+        }
+        .to_string()
+    }
+
+    fn extract_response_text(&self, body: &str) -> Result<String> {
+        match self.protocol {
+            JianlingChatProtocol::Anthropic => extract_anthropic_text(body),
+            JianlingChatProtocol::OpenAi => extract_openai_text(body),
+            JianlingChatProtocol::Codex => extract_codex_responses_text(body),
         }
     }
 
@@ -4698,27 +4837,27 @@ impl AnthropicCompatibleChatClient {
             .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build();
-        let body = json!({
-            "model": self.model,
-            "max_tokens": JIANLING_LLM_MAX_TOKENS,
-            "temperature": 0.0,
-            "thinking": {"type": "disabled"},
-            "system": "Return only the requested Markdown text. Do not include thinking, code fences, or extra explanation.",
-            "messages": [{"role": "user", "content": prompt}]
-        })
-        .to_string();
+        let body = self.request_body(prompt);
+        let endpoint = self.endpoint();
+        let authorization = format!("Bearer {}", self.api_key);
         let mut last_error = String::new();
         for attempt in 1..=3 {
-            match agent
-                .post(&self.endpoint())
-                .set("Content-Type", "application/json")
-                .set("x-api-key", &self.api_key)
-                .set("anthropic-version", "2023-06-01")
-                .send_string(&body)
-            {
+            let request = agent
+                .post(&endpoint)
+                .set("Content-Type", "application/json");
+            let result = match self.protocol {
+                JianlingChatProtocol::Anthropic => request
+                    .set("x-api-key", &self.api_key)
+                    .set("anthropic-version", "2023-06-01")
+                    .send_string(&body),
+                JianlingChatProtocol::OpenAi | JianlingChatProtocol::Codex => request
+                    .set("Authorization", &authorization)
+                    .send_string(&body),
+            };
+            match result {
                 Ok(response) => {
                     let response_body = response.into_string().context("read LLM response")?;
-                    return extract_anthropic_text(&response_body);
+                    return self.extract_response_text(&response_body);
                 }
                 Err(ureq::Error::Status(code, response)) => {
                     let body = response.into_string().unwrap_or_default();
@@ -4728,7 +4867,10 @@ impl AnthropicCompatibleChatClient {
                         thread::sleep(Duration::from_millis(retry_backoff_ms(attempt)));
                         continue;
                     }
-                    return Err(anyhow!("Jianling MiniMax M3 smoke failed: {message}"));
+                    return Err(anyhow!(
+                        "Jianling {} LLM call failed: {message}",
+                        self.protocol.label()
+                    ));
                 }
                 Err(ureq::Error::Transport(err)) => {
                     let message = err.to_string();
@@ -4738,13 +4880,15 @@ impl AnthropicCompatibleChatClient {
                         continue;
                     }
                     return Err(anyhow!(
-                        "Jianling MiniMax M3 smoke failed after 3 attempts: {message}"
+                        "Jianling {} LLM call failed after 3 attempts: {message}",
+                        self.protocol.label()
                     ));
                 }
             }
         }
         Err(anyhow!(
-            "Jianling MiniMax M3 smoke failed after 3 attempts: {}",
+            "Jianling {} LLM call failed after 3 attempts: {}",
+            self.protocol.label(),
             if last_error.is_empty() {
                 "unknown error"
             } else {
@@ -4765,6 +4909,56 @@ fn extract_anthropic_text(body: &str) -> Result<String> {
                         out.push('\n');
                     }
                     out.push_str(text);
+                }
+            }
+        }
+    }
+    if out.trim().is_empty() {
+        return Err(anyhow!(
+            "LLM response had no text content; response preview: {}",
+            body.chars().take(300).collect::<String>()
+        ));
+    }
+    Ok(out)
+}
+
+fn extract_openai_text(body: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(body).context("parse LLM response JSON")?;
+    let text = value
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(anyhow!(
+            "LLM response had no text content; response preview: {}",
+            body.chars().take(300).collect::<String>()
+        ));
+    }
+    Ok(text.to_string())
+}
+
+fn extract_codex_responses_text(body: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(body).context("parse LLM response JSON")?;
+    let mut out = String::new();
+    if let Some(items) = value.get("output").and_then(|v| v.as_array()) {
+        for item in items {
+            if let Some(blocks) = item.get("content").and_then(|v| v.as_array()) {
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                            if text.trim().is_empty() {
+                                continue;
+                            }
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(text);
+                        }
+                    }
                 }
             }
         }
@@ -5112,6 +5306,95 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root.join("orderk.sqlite")
+    }
+
+    #[test]
+    fn openai_chat_completion_text_extractor_reads_first_choice_message() {
+        let body = r#"{
+            "choices": [
+                {"message": {"role": "assistant", "content": "hello from openai"}}
+            ]
+        }"#;
+        assert_eq!(extract_openai_text(body).unwrap(), "hello from openai");
+
+        let err = extract_openai_text(r#"{"choices":[{"message":{"content":""}}]}"#).unwrap_err();
+        assert!(err.to_string().contains("no text content"), "{err:#}");
+    }
+
+    #[test]
+    fn codex_responses_text_extractor_concatenates_output_text_blocks() {
+        let body = r#"{
+            "output": [
+                {"content": [
+                    {"type": "output_text", "text": "first"},
+                    {"type": "other", "text": "ignored"}
+                ]},
+                {"content": [{"type": "output_text", "text": "second"}]}
+            ]
+        }"#;
+        assert_eq!(extract_codex_responses_text(body).unwrap(), "first\nsecond");
+
+        let err = extract_codex_responses_text(r#"{"output":[{"content":[]}]}"#).unwrap_err();
+        assert!(err.to_string().contains("no text content"), "{err:#}");
+    }
+
+    #[test]
+    fn chat_protocol_endpoints_append_expected_suffix_once() {
+        for (protocol, bare, suffixed) in [
+            (
+                JianlingChatProtocol::Anthropic,
+                "https://anthropic.example",
+                "https://anthropic.example/v1/messages",
+            ),
+            (
+                JianlingChatProtocol::OpenAi,
+                "https://openai.example",
+                "https://openai.example/v1/chat/completions",
+            ),
+            // field-spec only, not live-regressed
+            (
+                JianlingChatProtocol::Codex,
+                "https://codex.example",
+                "https://codex.example/v1/responses",
+            ),
+        ] {
+            let client = AnthropicCompatibleChatClient {
+                api_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                base_url: bare.to_string(),
+                protocol,
+            };
+            assert_eq!(client.endpoint(), suffixed);
+
+            let already_suffixed = AnthropicCompatibleChatClient {
+                api_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                base_url: suffixed.to_string(),
+                protocol,
+            };
+            assert_eq!(already_suffixed.endpoint(), suffixed);
+        }
+    }
+
+    #[test]
+    fn live_llm_enabled_prefers_profile_then_global_then_valid_chain_default() {
+        assert!(!jianling_live_llm_enabled_from_values(
+            Some("off"),
+            None,
+            true
+        ));
+        assert!(!jianling_live_llm_enabled_from_values(
+            None,
+            Some("false"),
+            true
+        ));
+        assert!(jianling_live_llm_enabled_from_values(None, None, true));
+        assert!(!jianling_live_llm_enabled_from_values(None, None, false));
+        assert!(!jianling_live_llm_enabled_from_values(
+            Some("0"),
+            Some("on"),
+            true
+        ));
     }
 
     #[test]
