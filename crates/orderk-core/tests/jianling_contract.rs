@@ -74,7 +74,7 @@ fn seed_quality_review_source(vault: &Path, date: &str, extra: &str) {
         vault,
         date,
         &format!(
-            "# Session {date}\n\n用户说：复杂任务要子代理 审计 复查 验收 gate，不能只靠单模型自证。{extra}\n",
+            "# Session {date}\n\n用户说：复杂任务要子代理 审计 复查 验收 gate，不能只靠单模型自证。audit audit audit。{extra}\n",
         ),
     );
 }
@@ -218,12 +218,12 @@ fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
     assert!(daily_text.contains("## Open risks"));
     assert!(daily_text.contains("## Next actions"));
     assert!(daily_text.contains("## Evidence appendix"));
-    assert!(daily_text.contains("Independent review preference"));
-    assert!(daily_text.contains("Preserve the factual ledger"));
-    assert!(daily_text.contains("Reflection must make a judgment"));
+    assert!(!daily_text.contains("Independent review preference"));
+    assert!(!daily_text.contains("Preserve the factual ledger"));
+    assert!(!daily_text.contains("Reflection must make a judgment"));
     assert!(!daily_text.contains("## 一句话结论"));
     assert!(!daily_text.contains("## 推断观察"));
-    assert!(daily_text.contains("confidence: high"));
+    assert!(daily_text.contains("confidence:"));
     assert!(daily_text.contains("next:"));
     assert!(daily_text.contains("promotion rule:"));
     assert!(daily_text.contains("session 入库要保留去噪后的完整原文"));
@@ -526,7 +526,7 @@ fn jianling_daily_updates_topic_ledger_for_reflective_observations() {
     let ledger = read_topic_ledger(&vault);
     assert_eq!(ledger["schema_version"], "orderk.jianling.topic_ledger.v1");
     assert_eq!(ledger["profile"], "default");
-    let topic = &ledger["topics"]["quality-review-preference"];
+    let topic = &ledger["topics"]["audit"];
     assert_eq!(topic["repeat_count"], 1);
     assert_eq!(topic["seen_occurrences"].as_array().unwrap().len(), 1);
     let ref0 = &topic["durable_evidence_refs"][0];
@@ -566,7 +566,7 @@ fn jianling_topic_ledger_dedupes_same_occurrence_rerun() {
 
     assert!(first.ok && second.ok);
     let ledger = read_topic_ledger(&vault);
-    let topic = &ledger["topics"]["quality-review-preference"];
+    let topic = &ledger["topics"]["audit"];
     assert_eq!(topic["repeat_count"], 1);
     assert_eq!(topic["seen_occurrences"].as_array().unwrap().len(), 1);
 
@@ -598,7 +598,7 @@ fn jianling_topic_ledger_counts_distinct_daily_occurrences() {
     }
 
     let ledger = read_topic_ledger(&vault);
-    let topic = &ledger["topics"]["quality-review-preference"];
+    let topic = &ledger["topics"]["audit"];
     assert_eq!(topic["repeat_count"], 2);
     assert_eq!(topic["seen_occurrences"].as_array().unwrap().len(), 2);
 
@@ -1158,8 +1158,8 @@ fn jianling_weekly_and_monthly_write_prd_paths_not_reflections_bucket() {
 }
 
 #[test]
-fn jianling_weekly_promotes_repeated_high_confidence_topic_to_lesson_proposal() {
-    let vault = temp_vault("weekly-promote");
+fn jianling_weekly_does_not_promote_deleted_hardcoded_review_template() {
+    let vault = temp_vault("weekly-no-hardcoded-review-promote");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -1180,6 +1180,8 @@ fn jianling_weekly_promotes_repeated_high_confidence_topic_to_lesson_proposal() 
         )
         .unwrap();
         assert!(daily.ok, "daily seed should pass: {daily:#?}");
+        let daily_text = fs::read_to_string(vault.join(format!("brain/daily/{date}.md"))).unwrap();
+        assert!(!daily_text.contains("Independent review preference"));
     }
 
     let weekly = jianling_run(
@@ -1196,41 +1198,17 @@ fn jianling_weekly_promotes_repeated_high_confidence_topic_to_lesson_proposal() 
     )
     .unwrap();
 
-    assert!(weekly.ok, "weekly promotion should succeed: {weekly:#?}");
-    assert_eq!(weekly.promotion_status, "proposed");
-    assert!(weekly
+    assert!(
+        weekly.ok,
+        "weekly run should succeed without fake template: {weekly:#?}"
+    );
+    assert!(!weekly
         .promotion_paths
         .contains(&"brain/lessons/quality-review-preference.md".to_string()));
-    assert_eq!(weekly.promotion_file_ops.len(), 1);
-    assert_eq!(
-        weekly.promotion_file_ops[0].target_path,
-        "brain/lessons/quality-review-preference.md"
-    );
-    assert!(weekly.promotion_file_ops[0].byte_count > 0);
-    assert!(weekly.promotion_file_ops[0].index_update_required);
-    assert_eq!(weekly.promotion_index_summaries.len(), 1);
-    assert_eq!(
-        weekly.promotion_index_summaries[0].path,
-        "brain/lessons/quality-review-preference.md"
-    );
-
-    let lesson =
-        fs::read_to_string(vault.join("brain/lessons/quality-review-preference.md")).unwrap();
-    assert!(lesson.contains("promotion_schema_version: orderk.jianling.promotion.v1"));
-    assert!(lesson.contains("status: proposed"));
-    assert!(lesson.contains("topic_key: quality-review-preference"));
-    assert!(lesson.contains("repeat_count: 2"));
-    assert!(lesson.contains("confidence: high"));
-    assert!(lesson.contains("run_id:"));
-    assert!(lesson.contains("anchor_id:"));
-    assert!(lesson.contains("source_path:"));
-    assert!(lesson.contains("source_file_hash:"));
-    assert!(lesson.contains("quote_hash:"));
+    assert!(!vault.join("brain/lessons/audit.md").exists());
 
     let ledger = read_topic_ledger(&vault);
-    let topic = &ledger["topics"]["quality-review-preference"];
-    assert_eq!(topic["repeat_count"], 2);
-    assert_eq!(topic["promotion_status"], "proposed");
+    assert!(ledger["topics"].get("quality-review-preference").is_none());
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -1391,9 +1369,7 @@ fn jianling_weekly_does_not_promote_single_occurrence() {
     assert!(weekly.ok);
     assert_eq!(weekly.promotion_status, "no_candidates");
     assert!(weekly.promotion_paths.is_empty());
-    assert!(!vault
-        .join("brain/lessons/quality-review-preference.md")
-        .exists());
+    assert!(!vault.join("brain/lessons/audit.md").exists());
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -1433,10 +1409,11 @@ fn jianling_global_profile_lock_blocks_cross_mode_conflicts() {
 }
 
 #[test]
-fn jianling_weekly_promotion_index_failure_is_fail_closed() {
-    let vault = temp_vault("weekly-fail-closed");
+fn jianling_daily_promotion_index_failure_is_fail_closed() {
+    let vault = temp_vault("daily-fail-closed");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
+    seed_quality_review_source(&vault, "2026-06-12", "第三次。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
     seed_mock_index_db(&vault, &db);
 
@@ -1457,24 +1434,27 @@ fn jianling_weekly_promotion_index_failure_is_fail_closed() {
         assert!(daily.ok, "daily seed should pass: {daily:#?}");
     }
 
-    let weekly = jianling_run(
+    let daily = jianling_run(
         &vault,
         &JianlingRunOptions {
             profile: "default".to_string(),
-            mode: JianlingRunMode::Weekly,
+            mode: JianlingRunMode::Daily,
             dry_run: false,
             scheduled: true,
             db: None,
-            date: Some("2026-06-11".to_string()),
+            date: Some("2026-06-12".to_string()),
             max_source_files: 20,
         },
     )
     .unwrap();
 
-    assert!(!weekly.ok);
-    assert_eq!(weekly.status, "degraded_promotion_index_failed");
-    assert_eq!(weekly.promotion_status, "degraded_index_failed");
-    assert!(weekly
+    assert!(!daily.ok);
+    assert_eq!(daily.status, "degraded_promotion_index_failed");
+    assert_eq!(daily.promotion_status, "degraded_index_failed");
+    assert!(daily
+        .promotion_paths
+        .contains(&"brain/lessons/audit.md".to_string()));
+    assert!(daily
         .warnings
         .iter()
         .any(|warning| warning.contains("promotion index feedback failed")));
@@ -1487,14 +1467,15 @@ fn jianling_promotion_overwrite_rules_respect_existing_targets() {
     let vault = temp_vault("promotion-overwrite");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
-    let target = vault.join("brain/lessons/quality-review-preference.md");
+    seed_quality_review_source(&vault, "2026-06-12", "第三次。");
+    let target = vault.join("brain/lessons/audit.md");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(&target, "# Human note\n\nDo not overwrite me.\n").unwrap();
 
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
     seed_mock_index_db(&vault, &db);
 
-    for date in ["2026-06-10", "2026-06-11"] {
+    for date in ["2026-06-10", "2026-06-11", "2026-06-12"] {
         let daily = jianling_run(
             &vault,
             &JianlingRunOptions {
@@ -1519,7 +1500,7 @@ fn jianling_promotion_overwrite_rules_respect_existing_targets() {
             dry_run: false,
             scheduled: true,
             db: Some(db),
-            date: Some("2026-06-11".to_string()),
+            date: Some("2026-06-12".to_string()),
             max_source_files: 20,
         },
     )
@@ -1634,7 +1615,7 @@ fn jianling_rollup_uses_existing_daily_reflections_after_raw_sources_are_removed
         .iter()
         .all(|anchor| anchor.path.starts_with("brain/daily/")
             && anchor.source_tier == "generated_memory"));
-    assert!(weekly.topic_ledger_path.is_some());
+    assert!(weekly.topic_ledger_path.is_none());
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -1892,10 +1873,30 @@ fn jianling_apply_calls_configured_llm_and_writes_contract_valid_reflection() {
     assert!(report.ok);
     assert!(!report.fallback_used);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(daily_text.contains("### LLM reflection (MiniMax M3)"));
-    assert!(!daily_text.contains("\n## LLM reflection (MiniMax M3)"));
+    assert!(!daily_text.contains("LLM reflection (MiniMax M3)"));
+    assert!(daily_text.contains("## 证据附录（Evidence appendix）"));
     assert!(daily_text.contains("LLM reflection from fake MiniMax [S1] confidence: high"));
     assert!(daily_text.contains("next: keep independent audit before release"));
+    let frontmatter_end = daily_text.find("\n---\n\n").unwrap();
+    let reflection_pos = daily_text
+        .find("LLM reflection from fake MiniMax [S1]")
+        .unwrap();
+    let appendix_pos = daily_text.find("## 证据附录（Evidence appendix）").unwrap();
+    let deterministic_pos = daily_text.find("# Jianling Daily Digest").unwrap();
+    assert!(frontmatter_end < reflection_pos);
+    assert!(reflection_pos < appendix_pos);
+    assert!(appendix_pos < deterministic_pos);
+    let validation = jianling_validate_file(
+        &vault,
+        &JianlingValidateFileOptions {
+            path: PathBuf::from("brain/daily/2026-06-10.md"),
+        },
+    )
+    .unwrap();
+    assert!(
+        validation.ok,
+        "LLM-primary digest should still validate: {validation:#?}"
+    );
     assert_eq!(server.request_count(), 1);
 
     let _ = fs::remove_dir_all(vault);
@@ -1941,7 +1942,8 @@ fn jianling_apply_repairs_llm_reflection_missing_required_section_once() {
         .iter()
         .any(|warning| warning.contains("repaired after initial contract rejection")));
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(daily_text.contains("### LLM reflection (MiniMax M3)"));
+    assert!(!daily_text.contains("LLM reflection (MiniMax M3)"));
+    assert!(daily_text.contains("## 证据附录（Evidence appendix）"));
     assert!(daily_text.contains("这次是真把判断放前面了"));
     // The fenced first draft must not survive into the written note.
     assert!(!daily_text.contains("fn oops()"));
@@ -1999,6 +2001,51 @@ fn jianling_apply_rejects_contract_invalid_llm_reflection() {
 }
 
 #[test]
+fn jianling_apply_downgrades_llm_transport_error_to_deterministic_write() {
+    let vault = temp_vault("live-llm-transport-error");
+    seed_raw_dialogue(&vault);
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_LLMERR", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", "http://127.0.0.1:9"),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "llmerr".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        report.ok,
+        "LLM transport failure should not fail the deterministic run"
+    );
+    assert_eq!(report.status, "success");
+    assert_eq!(report.provider_status, "called_live_error");
+    assert!(report.fallback_used);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("live LLM reflection call failed")));
+    let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
+    assert!(daily_text.contains("digest_schema_version: orderk.jianling.digest.v2"));
+    assert!(daily_text.contains("## Executive summary"));
+    assert!(!daily_text.contains("LLM reflection (MiniMax M3)"));
+    assert!(!daily_text.contains("## 证据附录（Evidence appendix）"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
 fn jianling_apply_accepts_llm_reflection_with_chinese_h2_headings() {
     // The soft historian contract intentionally ALLOWS `##` headings so K can
     // write `## 今日主线 / ## 我的看法 ...`. This used to be rejected by the old
@@ -2033,8 +2080,14 @@ fn jianling_apply_accepts_llm_reflection_with_chinese_h2_headings() {
     assert_eq!(report.provider_status, "called_live");
     assert!(!report.fallback_used);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(daily_text.contains("### LLM reflection (MiniMax M3)"));
+    assert!(!daily_text.contains("LLM reflection (MiniMax M3)"));
+    assert!(daily_text.contains("## 证据附录（Evidence appendix）"));
     assert!(daily_text.contains("把剑灵从记账员改回史学家"));
+    let reflection_pos = daily_text.find("## 今日主线").unwrap();
+    let appendix_pos = daily_text.find("## 证据附录（Evidence appendix）").unwrap();
+    let deterministic_pos = daily_text.find("# Jianling Daily Digest").unwrap();
+    assert!(reflection_pos < appendix_pos);
+    assert!(appendix_pos < deterministic_pos);
     // No repair needed: a single valid call.
     assert_eq!(server.request_count(), 1);
 

@@ -655,7 +655,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         &selection.rejected_paths,
     );
     if !options.dry_run && jianling_live_llm_enabled(&profile) {
-        if let Some(reflection) = generate_live_llm_reflection(LiveReflectionInput {
+        match generate_live_llm_reflection(LiveReflectionInput {
             profile: &profile,
             mode: &options.mode,
             date: &date,
@@ -667,74 +667,83 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             source_total_files: selection.total_files,
             rejected_source_files: &selection.rejected_paths,
             vault: &vault,
-        })? {
-            match validate_live_llm_reflection_contract(&reflection, &source_anchors) {
-                Ok(()) => {
-                    provider_status = "called_live".to_string();
-                    generated_body.push_str("\n### LLM reflection (MiniMax M3)\n");
-                    generated_body.push_str(reflection.trim());
-                    generated_body.push('\n');
-                }
-                Err(err) => {
-                    let validation_error = err.to_string();
-                    let repair = repair_live_llm_reflection(
-                        LiveReflectionInput {
-                            profile: &profile,
-                            mode: &options.mode,
-                            date: &date,
-                            run_id: &run_id,
-                            anchors: &source_anchors,
-                            sources: &evidence_sources,
-                            background_anchors: &background_anchors,
-                            background_sources: &background_sources,
-                            source_total_files: selection.total_files,
-                            rejected_source_files: &selection.rejected_paths,
-                            vault: &vault,
-                        },
-                        &reflection,
-                        &validation_error,
-                    );
-                    match repair {
-                        Ok(Some(repaired)) => {
-                            match validate_live_llm_reflection_contract(&repaired, &source_anchors)
-                            {
-                                Ok(()) => {
-                                    provider_status = "called_live".to_string();
-                                    warnings.push(format!(
+        }) {
+            Ok(Some(reflection)) => {
+                match validate_live_llm_reflection_contract(&reflection, &source_anchors) {
+                    Ok(()) => {
+                        provider_status = "called_live".to_string();
+                        generated_body = render_llm_primary_digest(&generated_body, &reflection);
+                    }
+                    Err(err) => {
+                        let validation_error = err.to_string();
+                        let repair = repair_live_llm_reflection(
+                            LiveReflectionInput {
+                                profile: &profile,
+                                mode: &options.mode,
+                                date: &date,
+                                run_id: &run_id,
+                                anchors: &source_anchors,
+                                sources: &evidence_sources,
+                                background_anchors: &background_anchors,
+                                background_sources: &background_sources,
+                                source_total_files: selection.total_files,
+                                rejected_source_files: &selection.rejected_paths,
+                                vault: &vault,
+                            },
+                            &reflection,
+                            &validation_error,
+                        );
+                        match repair {
+                            Ok(Some(repaired)) => {
+                                match validate_live_llm_reflection_contract(
+                                    &repaired,
+                                    &source_anchors,
+                                ) {
+                                    Ok(()) => {
+                                        provider_status = "called_live".to_string();
+                                        warnings.push(format!(
                                         "live LLM reflection repaired after initial contract rejection: {validation_error}"
                                     ));
-                                    generated_body.push_str("\n### LLM reflection (MiniMax M3)\n");
-                                    generated_body.push_str(repaired.trim());
-                                    generated_body.push('\n');
-                                }
-                                Err(repair_err) => {
-                                    provider_status = "called_live_schema_invalid".to_string();
-                                    fallback_used = true;
-                                    llm_contract_degraded = true;
-                                    warnings.push(format!(
+                                        generated_body =
+                                            render_llm_primary_digest(&generated_body, &repaired);
+                                    }
+                                    Err(repair_err) => {
+                                        provider_status = "called_live_schema_invalid".to_string();
+                                        fallback_used = true;
+                                        llm_contract_degraded = true;
+                                        warnings.push(format!(
                                         "live LLM reflection rejected by digest.v2 contract: {validation_error}; repair also failed: {repair_err}"
                                     ));
+                                    }
                                 }
                             }
-                        }
-                        Ok(None) => {
-                            provider_status = "called_live_schema_invalid".to_string();
-                            fallback_used = true;
-                            llm_contract_degraded = true;
-                            warnings.push(format!(
+                            Ok(None) => {
+                                provider_status = "called_live_schema_invalid".to_string();
+                                fallback_used = true;
+                                llm_contract_degraded = true;
+                                warnings.push(format!(
                                 "live LLM reflection rejected by digest.v2 contract: {validation_error}; repair unavailable"
                             ));
-                        }
-                        Err(repair_err) => {
-                            provider_status = "called_live_schema_invalid".to_string();
-                            fallback_used = true;
-                            llm_contract_degraded = true;
-                            warnings.push(format!(
+                            }
+                            Err(repair_err) => {
+                                provider_status = "called_live_schema_invalid".to_string();
+                                fallback_used = true;
+                                llm_contract_degraded = true;
+                                warnings.push(format!(
                                 "live LLM reflection rejected by digest.v2 contract: {validation_error}; repair call failed: {repair_err}"
                             ));
+                            }
                         }
                     }
                 }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                provider_status = "called_live_error".to_string();
+                fallback_used = true;
+                warnings.push(format!(
+                    "live LLM reflection call failed; deterministic digest written instead: {err}"
+                ));
             }
         }
     }
@@ -1299,9 +1308,6 @@ fn save_topic_ledger_atomic(path: &Path, ledger: &JianlingTopicLedger) -> Result
 
 fn topic_key_for_observation(title: &str) -> String {
     match title {
-        "Independent review preference" => "quality-review-preference".to_string(),
-        "Preserve the factual ledger" => "ledger-preservation".to_string(),
-        "Reflection must make a judgment" => "reflective-judgment".to_string(),
         "Coverage is incomplete" => "partial-coverage-risk".to_string(),
         "Evidence first" => "evidence-first".to_string(),
         "质量复查偏好" => "quality-review-preference".to_string(),
@@ -2937,6 +2943,40 @@ fn chunk_count_for(source_count: usize) -> usize {
     }
 }
 
+const JIANLING_EVIDENCE_APPENDIX_HEADING: &str = "## 证据附录（Evidence appendix）";
+
+fn split_digest_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let body = text.strip_prefix("---\n")?;
+    let closing = body.find("\n---\n")?;
+    let frontmatter_end = "---\n".len() + closing + "\n---\n".len();
+    Some((&text[..frontmatter_end], &text[frontmatter_end..]))
+}
+
+fn render_llm_primary_digest(deterministic_digest: &str, reflection: &str) -> String {
+    let reflection = reflection.trim();
+    let mut out = String::new();
+    if let Some((frontmatter, deterministic_body)) = split_digest_frontmatter(deterministic_digest)
+    {
+        out.push_str(frontmatter);
+        out.push('\n');
+        out.push_str(reflection);
+        out.push_str("\n\n");
+        out.push_str(JIANLING_EVIDENCE_APPENDIX_HEADING);
+        out.push('\n');
+        out.push_str(deterministic_body.trim_start());
+    } else {
+        out.push_str(reflection);
+        out.push_str("\n\n");
+        out.push_str(JIANLING_EVIDENCE_APPENDIX_HEADING);
+        out.push('\n');
+        out.push_str(deterministic_digest.trim_start());
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 fn render_jianling_digest(
     mode: &JianlingRunMode,
     date: &str,
@@ -3121,7 +3161,7 @@ struct ReflectiveObservation {
     detail: String,
     next_action: String,
     /// Explicit ledger topic key. Content-derived observations carry their
-    /// extracted + synonym-normalized key here; the hardcoded process-invariant
+    /// extracted + synonym-normalized key here; deterministic fallback/coverage
     /// observations leave it `None` and fall back to the title match table.
     topic_key: Option<String>,
 }
@@ -3132,80 +3172,7 @@ fn derive_reflective_observations(
     rejected_source_files: &[String],
 ) -> Vec<ReflectiveObservation> {
     let mut observations = Vec::new();
-    let joined = sources
-        .iter()
-        .map(|source| source.excerpt.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_ascii_lowercase();
     let all_refs = evidence_refs_for(anchors, sources.len());
-
-    if contains_any(
-        &joined,
-        &[
-            "子代理",
-            "subagent",
-            "审计",
-            "audit",
-            "复查",
-            "review",
-            "验收",
-            "gate",
-        ],
-    ) {
-        observations.push(ReflectiveObservation {
-            title: "Independent review preference".to_string(),
-            confidence: "high".to_string(),
-            evidence_refs: all_refs.clone(),
-            detail: "The repeated user/process signal is independent verification: complex delivery cannot rely on one self-attestation pass; it needs subagent audit, mechanical evidence, real execution, and final acceptance together.".to_string(),
-            next_action: "For complex code or release work, produce an evidence pack, run an independent subagent review, and publish only after review findings are closed.".to_string(),
-            topic_key: None,
-        });
-    }
-
-    if contains_any(
-        &joined,
-        &[
-            "完整原文",
-            "raw",
-            "底账",
-            "source anchor",
-            "hash",
-            "证据",
-            "receipt",
-        ],
-    ) {
-        observations.push(ReflectiveObservation {
-            title: "Preserve the factual ledger".to_string(),
-            confidence: "high".to_string(),
-            evidence_refs: all_refs.clone(),
-            detail: "Reflection must not replace the ledger; raw truth, source anchors, hashes, receipts, and DB/index evidence must remain auditable across daily/monthly rollups.".to_string(),
-            next_action: "After every reflection write, verify the receipt, source anchors, file hash, and index DB freshness before calling it second-brain memory.".to_string(),
-            topic_key: None,
-        });
-    }
-
-    if contains_any(
-        &joined,
-        &[
-            "观察",
-            "沉淀",
-            "精炼",
-            "reflect",
-            "hindsight",
-            "灵魂",
-            "日报",
-        ],
-    ) {
-        observations.push(ReflectiveObservation {
-            title: "Reflection must make a judgment".to_string(),
-            confidence: "high".to_string(),
-            evidence_refs: all_refs.clone(),
-            detail: "Compressing facts is not enough; Jianling V4 must turn evidence into memorable, actionable judgments about what happened and what pattern is emerging.".to_string(),
-            next_action: "Daily/monthly reflections must lead with human-readable judgment and push raw evidence down into the evidence appendix.".to_string(),
-            topic_key: None,
-        });
-    }
 
     if !rejected_source_files.is_empty() {
         observations.push(ReflectiveObservation {
@@ -3667,13 +3634,6 @@ fn confidence_for_distinct_dates(days: usize) -> &'static str {
         2 => "medium",
         _ => "high",
     }
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| {
-        let needle = needle.to_ascii_lowercase();
-        haystack.contains(&needle)
-    })
 }
 
 fn evidence_refs_for(anchors: &[JianlingSourceAnchor], count: usize) -> String {
@@ -5448,9 +5408,9 @@ mod tests {
             "profile": "default",
             "updated_at": "2026-06-01T00:00:00Z",
             "topics": {
-                "ledger-preservation": {
-                    "topic_key": "ledger-preservation",
-                    "title": "Preserve the factual ledger",
+                "legacy-topic": {
+                    "topic_key": "legacy-topic",
+                    "title": "Historical topic",
                     "first_seen": "2026-06-01",
                     "last_seen": "2026-06-01",
                     "repeat_count": 1,
@@ -5466,7 +5426,7 @@ mod tests {
             }
         }"#;
         let ledger: JianlingTopicLedger = serde_json::from_str(json).unwrap();
-        let entry = &ledger.topics["ledger-preservation"];
+        let entry = &ledger.topics["legacy-topic"];
         assert!(
             entry.distinct_dates.is_empty(),
             "missing field defaults to empty"
