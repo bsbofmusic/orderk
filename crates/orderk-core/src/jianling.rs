@@ -226,6 +226,13 @@ struct JianlingTopicEntry {
     modes_seen: Vec<String>,
     latest_next_action: String,
     promotion_status: String,
+    /// Distinct calendar dates (YYYY-MM-DD) on which this topic was observed.
+    /// Drives cross-day emergence: same-day re-runs do not inflate it, only
+    /// genuine recurrence across days does. Back-compat: missing in old ledgers
+    /// (serde default = empty); historical cross-day counts cannot be recovered
+    /// from occurrence hashes, so an upgraded entry conservatively restarts.
+    #[serde(default)]
+    distinct_dates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -509,6 +516,10 @@ struct EvidenceSource {
     hash: String,
     chars: usize,
     excerpt: String,
+    /// For conversation transcripts: a cleaned body (frontmatter/metadata/
+    /// message headers/fences stripped) used for theme extraction only.
+    /// Anchor `quote_hash` still uses the short `excerpt` (contract stability).
+    theme_excerpt: Option<String>,
 }
 
 pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<JianlingRunReport> {
@@ -572,11 +583,19 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             source_file_hash: format!("sha256:{}", file.hash),
             source_tier: source_tier_for_path(&file.path).to_string(),
         });
+        // For conversation transcripts, prepare a cleaned body for theme extraction
+        // (separate from the short anchor excerpt used for quote_hash stability).
+        let theme_excerpt = if file.path.starts_with("raw/transcripts/") {
+            Some(transcript_body_for_themes(&raw))
+        } else {
+            None
+        };
         evidence_sources.push(EvidenceSource {
             path: file.path.clone(),
             hash: format!("sha256:{}", file.hash),
             chars: raw.chars().count(),
             excerpt,
+            theme_excerpt,
         });
     }
     // Background (BG#) anchors/sources: prior generated daily reflections used as
@@ -595,11 +614,17 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             source_file_hash: format!("sha256:{}", file.hash),
             source_tier: source_tier_for_path(&file.path).to_string(),
         });
+        let theme_excerpt = if file.path.starts_with("raw/transcripts/") {
+            Some(transcript_body_for_themes(&raw))
+        } else {
+            None
+        };
         background_sources.push(EvidenceSource {
             path: file.path.clone(),
             hash: format!("sha256:{}", file.hash),
             chars: raw.chars().count(),
             excerpt,
+            theme_excerpt,
         });
     }
     let (source_raw_truth_files, source_generated_memory_files) =
@@ -1354,7 +1379,10 @@ fn update_topic_ledger_after_success(
     let durable_refs = durable_evidence_refs_for(run_id, anchors);
     let mut changed = false;
     for observation in observations {
-        let topic_key = topic_key_for_observation(observation.title);
+        let topic_key = observation
+            .topic_key
+            .clone()
+            .unwrap_or_else(|| topic_key_for_observation(&observation.title));
         let occurrence_id = observation_occurrence_id(&topic_key, mode, date, sources, anchors);
         let entry = ledger
             .topics
@@ -1373,13 +1401,15 @@ fn update_topic_ledger_after_success(
                 modes_seen: Vec::new(),
                 latest_next_action: observation.next_action.to_string(),
                 promotion_status: "none".to_string(),
+                distinct_dates: Vec::new(),
             });
         entry.title = observation.title.to_string();
         entry.last_seen = date.to_string();
-        entry.confidence =
-            stronger_confidence(&entry.confidence, observation.confidence).to_string();
         entry.latest_next_action = observation.next_action.to_string();
         push_unique(&mut entry.modes_seen, mode.as_str().to_string());
+        // Track distinct calendar dates so confidence/promotion react to genuine
+        // cross-day recurrence rather than same-day re-runs.
+        push_unique(&mut entry.distinct_dates, date.to_string());
         for source_path in &source_paths {
             push_unique(&mut entry.source_paths, source_path.clone());
         }
@@ -1394,6 +1424,20 @@ fn update_topic_ledger_after_success(
         if !entry.seen_occurrences.contains(&occurrence_id) {
             entry.seen_occurrences.push(occurrence_id);
             entry.repeat_count = entry.seen_occurrences.len();
+            changed = true;
+        }
+        // Confidence ladder: content topics (and any topic) earn confidence by
+        // recurring across distinct days. The observation's own confidence acts
+        // as a floor (process-invariant observations stay high); cross-day
+        // recurrence can only raise it, never lower it.
+        let recurrence_confidence = confidence_for_distinct_dates(entry.distinct_dates.len());
+        let merged = stronger_confidence(
+            stronger_confidence(&entry.confidence, &observation.confidence),
+            recurrence_confidence,
+        )
+        .to_string();
+        if merged != entry.confidence {
+            entry.confidence = merged;
             changed = true;
         }
     }
@@ -1427,21 +1471,43 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
+/// Minimum number of distinct calendar dates a topic must recur on before it
+/// is eligible for a lesson proposal. Cross-day recurrence — not same-day
+/// repetition — is the real emergence signal.
+const JIANLING_PROMOTION_MIN_DISTINCT_DATES: usize = 3;
+
 fn promotion_candidates_for_mode<'a>(
     mode: &JianlingRunMode,
     ledger: &'a JianlingTopicLedger,
 ) -> Vec<&'a JianlingTopicEntry> {
-    if matches!(mode, JianlingRunMode::Daily | JianlingRunMode::Manual) {
-        return Vec::new();
-    }
+    // Daily/Manual are now eligible: a topic that genuinely recurs across days
+    // should compile into a lesson proposal without waiting for a weekly run
+    // (which, in practice, never ran). The gate is intentionally strict —
+    // cross-day recurrence + high confidence — so single-day noise can't leak.
+    let min_dates = if matches!(mode, JianlingRunMode::Daily | JianlingRunMode::Manual) {
+        JIANLING_PROMOTION_MIN_DISTINCT_DATES
+    } else {
+        // Weekly+ rollups keep the original 2-occurrence behavior.
+        2
+    };
     ledger
         .topics
         .values()
         .filter(|entry| {
-            entry.repeat_count >= 2
+            let recurrence_ok = if matches!(mode, JianlingRunMode::Daily | JianlingRunMode::Manual)
+            {
+                entry.distinct_dates.len() >= min_dates
+            } else {
+                entry.repeat_count >= min_dates
+            };
+            recurrence_ok
                 && entry.confidence == "high"
                 && entry.promotion_status != "accepted"
                 && entry.promotion_status != "superseded"
+                // Already-proposed topics wait for human review instead of being
+                // re-proposed (and re-indexed) on every subsequent daily run —
+                // this is the primary churn guard now that Daily can promote.
+                && entry.promotion_status != "proposed"
         })
         .collect()
 }
@@ -1505,6 +1571,19 @@ fn render_lesson_proposal(entry: &JianlingTopicEntry, run_id: &str, date: &str) 
     out.push_str("- owner skill candidate: only after human approval and independent audit.\n");
     out.push_str("- PRD/test-gate candidate: only through explicit repo change, not automatic memory promotion.\n");
     out
+}
+
+/// Strip the cosmetic, run-specific lines (`run_id:` and `date:`) from a lesson
+/// proposal body so two proposals for the same topic on different days compare
+/// equal. Used by the churn guard to avoid daily rewrites of unchanged lessons.
+fn lesson_proposal_semantic_body(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            !t.starts_with("run_id:") && !t.starts_with("date:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn write_promotion_proposals(
@@ -1596,6 +1675,31 @@ fn write_promotion_proposals(
         }
         ensure_plain_output_file(&target, "jianling lesson proposal")?;
         let body = render_lesson_proposal(entry, run_id, date);
+        // Churn guard: if a prior Jianling-generated `proposed` file is
+        // semantically identical (same topic evidence/judgment, ignoring the
+        // cosmetic run_id/date lines that change every run), skip the rewrite +
+        // index feedback. With Daily promotion now open, a recurring topic would
+        // otherwise be rewritten and re-indexed every single day for no change.
+        if let Some(existing_text) = existing.as_deref() {
+            if lesson_proposal_semantic_body(existing_text) == lesson_proposal_semantic_body(&body)
+            {
+                writes.push(JianlingPromotionWrite {
+                    rel_path,
+                    body: String::new(),
+                    file_op: JianlingFileOp {
+                        op: "skip".to_string(),
+                        target_path: String::new(),
+                        preimage_hash: file_hash_if_exists(&target)?,
+                        postimage_hash: String::new(),
+                        byte_count: 0,
+                        index_update_required: false,
+                    },
+                    skipped: true,
+                    warning: None,
+                });
+                continue;
+            }
+        }
         let preimage_hash = file_hash_if_exists(&target)?;
         let op = if target.exists() { "replace" } else { "create" }.to_string();
         let postimage_hash = format!("sha256:{}", sha256_hex(body.as_bytes()));
@@ -2998,11 +3102,15 @@ fn render_jianling_digest(
 }
 
 struct ReflectiveObservation {
-    title: &'static str,
-    confidence: &'static str,
+    title: String,
+    confidence: String,
     evidence_refs: String,
-    detail: &'static str,
-    next_action: &'static str,
+    detail: String,
+    next_action: String,
+    /// Explicit ledger topic key. Content-derived observations carry their
+    /// extracted + synonym-normalized key here; the hardcoded process-invariant
+    /// observations leave it `None` and fall back to the title match table.
+    topic_key: Option<String>,
 }
 
 fn derive_reflective_observations(
@@ -3033,11 +3141,12 @@ fn derive_reflective_observations(
         ],
     ) {
         observations.push(ReflectiveObservation {
-            title: "Independent review preference",
-            confidence: "high",
+            title: "Independent review preference".to_string(),
+            confidence: "high".to_string(),
             evidence_refs: all_refs.clone(),
-            detail: "The repeated user/process signal is independent verification: complex delivery cannot rely on one self-attestation pass; it needs subagent audit, mechanical evidence, real execution, and final acceptance together.",
-            next_action: "For complex code or release work, produce an evidence pack, run an independent subagent review, and publish only after review findings are closed.",
+            detail: "The repeated user/process signal is independent verification: complex delivery cannot rely on one self-attestation pass; it needs subagent audit, mechanical evidence, real execution, and final acceptance together.".to_string(),
+            next_action: "For complex code or release work, produce an evidence pack, run an independent subagent review, and publish only after review findings are closed.".to_string(),
+            topic_key: None,
         });
     }
 
@@ -3054,11 +3163,12 @@ fn derive_reflective_observations(
         ],
     ) {
         observations.push(ReflectiveObservation {
-            title: "Preserve the factual ledger",
-            confidence: "high",
+            title: "Preserve the factual ledger".to_string(),
+            confidence: "high".to_string(),
             evidence_refs: all_refs.clone(),
-            detail: "Reflection must not replace the ledger; raw truth, source anchors, hashes, receipts, and DB/index evidence must remain auditable across daily/monthly rollups.",
-            next_action: "After every reflection write, verify the receipt, source anchors, file hash, and index DB freshness before calling it second-brain memory.",
+            detail: "Reflection must not replace the ledger; raw truth, source anchors, hashes, receipts, and DB/index evidence must remain auditable across daily/monthly rollups.".to_string(),
+            next_action: "After every reflection write, verify the receipt, source anchors, file hash, and index DB freshness before calling it second-brain memory.".to_string(),
+            topic_key: None,
         });
     }
 
@@ -3075,38 +3185,475 @@ fn derive_reflective_observations(
         ],
     ) {
         observations.push(ReflectiveObservation {
-            title: "Reflection must make a judgment",
-            confidence: "high",
+            title: "Reflection must make a judgment".to_string(),
+            confidence: "high".to_string(),
             evidence_refs: all_refs.clone(),
-            detail: "Compressing facts is not enough; Jianling V4 must turn evidence into memorable, actionable judgments about what happened and what pattern is emerging.",
-            next_action: "Daily/monthly reflections must lead with human-readable judgment and push raw evidence down into the evidence appendix.",
+            detail: "Compressing facts is not enough; Jianling V4 must turn evidence into memorable, actionable judgments about what happened and what pattern is emerging.".to_string(),
+            next_action: "Daily/monthly reflections must lead with human-readable judgment and push raw evidence down into the evidence appendix.".to_string(),
+            topic_key: None,
         });
     }
 
     if !rejected_source_files.is_empty() {
         observations.push(ReflectiveObservation {
-            title: "Coverage is incomplete",
-            confidence: "medium",
+            title: "Coverage is incomplete".to_string(),
+            confidence: "medium".to_string(),
             evidence_refs: all_refs.clone(),
-            detail: "The source budget did not cover every primary source, so the reflection is only a partial conclusion and must not be promoted into global memory yet.",
-            next_action: "Increase max_source_files or inspect rejected sources before promoting the observation into durable memory.",
+            detail: "The source budget did not cover every primary source, so the reflection is only a partial conclusion and must not be promoted into global memory yet.".to_string(),
+            next_action: "Increase max_source_files or inspect rejected sources before promoting the observation into durable memory.".to_string(),
+            topic_key: None,
         });
     }
 
+    // Content-derived topics: break out of the closed 5-title echo chamber so
+    // the ledger can accumulate what the user actually keeps working on, and
+    // cross-day recurrence can eventually drive a lesson proposal.
+    observations.extend(derive_content_topic_observations(sources, &all_refs));
+
     if observations.is_empty() {
         observations.push(ReflectiveObservation {
-            title: "Evidence first",
-            confidence: if sources.is_empty() { "low" } else { "medium" },
+            title: "Evidence first".to_string(),
+            confidence: if sources.is_empty() { "low" } else { "medium" }.to_string(),
             evidence_refs: if all_refs.is_empty() {
                 "none".to_string()
             } else {
                 all_refs
             },
-            detail: "When no stable pattern is detected, keep the conclusion conservative: preserve facts, state coverage, and wait for repeated evidence before upgrading the insight.",
-            next_action: "Keep the ledger and wait for more repeated evidence instead of turning one weak signal into a durable preference.",
+            detail: "When no stable pattern is detected, keep the conclusion conservative: preserve facts, state coverage, and wait for repeated evidence before upgrading the insight.".to_string(),
+            next_action: "Keep the ledger and wait for more repeated evidence instead of turning one weak signal into a durable preference.".to_string(),
+            topic_key: None,
         });
     }
     observations
+}
+
+/// Maximum number of content-derived topics a single run may contribute, to
+/// prevent term-frequency explosion from flooding the ledger.
+const JIANLING_MAX_CONTENT_TOPICS: usize = 8;
+/// Minimum salience (combined: occurrence count + source spread) a candidate
+/// theme must reach before it is allowed into the ledger.
+const JIANLING_CONTENT_TOPIC_MIN_OCCURRENCES: usize = 2;
+
+/// Extract content topics from real evidence so the ledger reflects what the
+/// user keeps doing, not just the 5 hardcoded process invariants.
+///
+/// Detection runs two parallel paths (either may fire):
+///   1. structured signals (frontmatter `tags:`, `[[wikilinks]]`) when present
+///      — only meaningful for brain/article sources;
+///   2. plain-text fallback (the primary path for raw transcripts that carry
+///      no frontmatter): normalized term/bigram frequency over the excerpt,
+///      stopwords removed, top salient terms kept.
+///
+/// Normalization (a SEPARATE concern from detection) then collapses synonyms
+/// to a single stable key so recurring real topics aggregate across days.
+///
+/// Content topics enter at `low` confidence; cross-day recurrence upgrades them
+/// (see `confidence_for_distinct_dates`), which is what eventually clears the
+/// promotion gate. They never auto-promote to USER memory / skills.
+/// Clean a conversation transcript's full raw text for theme extraction: strip
+/// YAML frontmatter, fixed boilerplate, Session Metadata block, message headers
+/// (`### ... — role`), HTML comments, and code fence markers. Returns a larger
+/// sample (up to ~8000 chars) of actual dialogue content, independent of the
+/// short anchor `excerpt` (which stays at 900 chars for `quote_hash` stability).
+fn transcript_body_for_themes(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_frontmatter = false;
+    let mut in_metadata_block = false;
+    let mut skip_next_fence = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        // Track YAML frontmatter boundaries (opening --- on its own line).
+        if trimmed == "---" {
+            in_frontmatter = !in_frontmatter;
+            continue;
+        }
+        if in_frontmatter {
+            continue;
+        }
+        // Skip HTML comments (<!-- ... -->).
+        if trimmed.starts_with("<!--") {
+            continue;
+        }
+        // Skip "## Session Metadata" block until next ##.
+        if trimmed == "## Session Metadata" {
+            in_metadata_block = true;
+            continue;
+        }
+        if in_metadata_block && (trimmed.starts_with("## ") || trimmed.starts_with("# ")) {
+            in_metadata_block = false;
+            // Don't continue here; let the heading fall through to be skipped by
+            // the boilerplate check below if it's "## Transcript".
+        }
+        if in_metadata_block {
+            continue;
+        }
+        // Skip message headers: `### 2026-06-14T... — user` / `### ... — assistant`.
+        if trimmed.starts_with("### ")
+            && (trimmed.contains(" — user") || trimmed.contains(" — assistant"))
+        {
+            continue;
+        }
+        // Skip code fence markers (```text / ```), but NOT the content between them.
+        if trimmed.starts_with("```") {
+            skip_next_fence = !skip_next_fence;
+            continue;
+        }
+        // Skip fixed boilerplate lines (appears in every transcript).
+        if trimmed.starts_with("> 本文件保存") || trimmed.starts_with("> 稳定偏好") {
+            continue;
+        }
+        // Skip common section headings that carry no theme signal.
+        if trimmed == "## Transcript" || trimmed.starts_with("# 对话原话") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        // Budget: cap at ~8000 chars to keep memory bounded (transcripts can be 45KB+).
+        if out.len() > 8000 {
+            break;
+        }
+    }
+    out
+}
+
+/// Extract theme signal from a transcript's `title:` or `session_title:` frontmatter
+/// field, stripping the fixed prefix "对话原话 - " and trailing " #数字"序号.
+/// Returns None if the title is missing, generic, or too short after cleaning.
+fn extract_title_theme(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix("title:")
+            .or_else(|| trimmed.strip_prefix("session_title:"))
+        {
+            let title = rest.trim().trim_matches('"');
+            // Strip fixed prefix "对话原话 - " (appears in every transcript).
+            let cleaned = title.strip_prefix("对话原话 - ").unwrap_or(title).trim();
+            // Strip trailing " #数字" sequence number.
+            let cleaned = cleaned
+                .rsplit_once(" #")
+                .map(|(prefix, _)| prefix)
+                .unwrap_or(cleaned)
+                .trim();
+            // Reject if empty or too short after stripping.
+            if cleaned.chars().count() >= 3 {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn derive_content_topic_observations(
+    sources: &[EvidenceSource],
+    all_refs: &str,
+) -> Vec<ReflectiveObservation> {
+    use std::collections::HashMap;
+
+    if sources.is_empty() {
+        return Vec::new();
+    }
+
+    // candidate key -> (occurrence count, set of source paths it appeared in, display label)
+    let mut counts: HashMap<String, (usize, std::collections::BTreeSet<String>, String)> =
+        HashMap::new();
+
+    let mut bump = |key: String, label: String, source_path: &str, weight: usize| {
+        let entry = counts
+            .entry(key)
+            .or_insert_with(|| (0, std::collections::BTreeSet::new(), label));
+        entry.0 += weight;
+        entry.1.insert(source_path.to_string());
+    };
+
+    // Step 3: Title strong signal — extract theme from transcript title before
+    // scanning the body. Titles are human-written topic summaries (high信噪比).
+    for source in sources {
+        if source.path.starts_with("raw/transcripts/") {
+            // Title lives in the original excerpt (short frontmatter sample),
+            // not the cleaned theme_excerpt.
+            if let Some(title_theme) = extract_title_theme(&source.excerpt) {
+                // Weight=4: title is the strongest programmatic signal.
+                for (raw, freq) in extract_plaintext_theme_terms(&title_theme) {
+                    if let Some((key, label)) = normalize_content_theme(&raw) {
+                        bump(key, label, &source.path, freq * 4);
+                    }
+                }
+            }
+        }
+    }
+
+    for source in sources {
+        let excerpt = source.theme_excerpt.as_deref().unwrap_or(&source.excerpt);
+        // Path 1: structured signals (tags + wikilinks). An explicit tag /
+        // wikilink is an intentional signal, weighted as one occurrence each.
+        for raw in extract_structured_theme_terms(excerpt) {
+            if let Some((key, label)) = normalize_content_theme(&raw) {
+                bump(key, label, &source.path, 1);
+            }
+        }
+        // Path 2: plain-text fallback (primary for raw transcripts). Carries the
+        // in-excerpt frequency so a term repeated within one transcript counts
+        // as genuinely salient even when there is only a single source.
+        for (raw, freq) in extract_plaintext_theme_terms(excerpt) {
+            if let Some((key, label)) = normalize_content_theme(&raw) {
+                bump(key, label, &source.path, freq);
+            }
+        }
+    }
+
+    // Salience: total occurrences + source spread must clear the floor.
+    let mut ranked: Vec<(String, usize, usize, String)> = counts
+        .into_iter()
+        .map(|(key, (occ, paths, label))| (key, occ, paths.len(), label))
+        .filter(|(_, occ, spread, _)| {
+            *occ >= JIANLING_CONTENT_TOPIC_MIN_OCCURRENCES || *spread >= 2
+        })
+        .collect();
+    // Strongest signal first: source spread, then raw occurrences, then key for stability.
+    ranked.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(JIANLING_MAX_CONTENT_TOPICS);
+
+    ranked
+        .into_iter()
+        .map(|(key, occ, spread, label)| ReflectiveObservation {
+            title: format!("Recurring focus: {label}"),
+            // Content topics start conservative; cross-day recurrence upgrades
+            // them. confidence is recomputed in the ledger from distinct_dates.
+            confidence: "low".to_string(),
+            evidence_refs: all_refs.to_string(),
+            detail: format!(
+                "The evidence repeatedly centers on `{label}` (occurrences={occ}, sources={spread}). This is a content theme the user keeps engaging with, tracked for cross-day emergence rather than treated as an immediate durable conclusion."
+            ),
+            next_action: format!(
+                "Watch whether `{label}` recurs across multiple days; only after sustained cross-day recurrence should it be considered for a lesson proposal."
+            ),
+            topic_key: Some(key),
+        })
+        .collect()
+}
+
+/// Extract structured theme terms: frontmatter `tags:` and `[[wikilinks]]`.
+/// Returns raw (un-normalized) terms; empty for plain transcripts.
+fn extract_structured_theme_terms(excerpt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    // [[wikilinks]] anywhere in the excerpt.
+    let bytes = excerpt.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(close) = excerpt[i + 2..].find("]]") {
+                let inner = &excerpt[i + 2..i + 2 + close];
+                let term = inner.split('|').next().unwrap_or(inner).trim();
+                if !term.is_empty() {
+                    out.push(term.to_string());
+                }
+                i = i + 2 + close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // frontmatter `tags:` line(s): `tags: a, b` or `tags: [a, b]`.
+    for line in excerpt.lines() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower
+            .strip_prefix("tags:")
+            .or_else(|| lower.strip_prefix("- tags:"))
+        {
+            // Re-slice on the original line to keep case for labels.
+            let orig_rest = &trimmed[trimmed.len() - rest.len()..];
+            for tag in orig_rest
+                .trim_matches(|c: char| c == '[' || c == ']' || c.is_whitespace())
+                .split([',', ' '])
+            {
+                let tag = tag.trim().trim_start_matches('#');
+                if !tag.is_empty() {
+                    out.push(tag.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Plain-text fallback theme extraction: ASCII word frequency + CJK bigram
+/// frequency over the excerpt, stopwords removed, top salient terms kept.
+/// This is the primary path for raw transcripts with no frontmatter. Returns
+/// `(term, in_excerpt_frequency)` so callers can weight by salience.
+fn extract_plaintext_theme_terms(excerpt: &str) -> Vec<(String, usize)> {
+    use std::collections::HashMap;
+    let mut freq: HashMap<String, usize> = HashMap::new();
+
+    // ASCII tokens (length >= 3, not a stopword).
+    let mut current = String::new();
+    for ch in excerpt.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            if current.chars().count() >= 3 && !is_jianling_theme_stopword(&current) {
+                *freq.entry(current.clone()).or_insert(0) += 1;
+            }
+            current.clear();
+        }
+    }
+    if current.chars().count() >= 3 && !is_jianling_theme_stopword(&current) {
+        *freq.entry(current.clone()).or_insert(0) += 1;
+    }
+
+    // CJK bigrams (consecutive non-ASCII alphanumerics).
+    let cjk: Vec<char> = excerpt
+        .chars()
+        .filter(|c| !c.is_ascii() && c.is_alphanumeric())
+        .collect();
+    for window in cjk.windows(2) {
+        let bigram: String = window.iter().collect();
+        *freq.entry(bigram).or_insert(0) += 1;
+    }
+
+    // Keep only terms that appear at least twice within this excerpt, then take
+    // the strongest few (capped to limit downstream salience work).
+    let mut ranked: Vec<(String, usize)> = freq.into_iter().filter(|(_, n)| *n >= 2).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(12);
+    ranked
+}
+
+/// Stopwords for theme extraction (English + romanized noise). Kept local so
+/// the archived sword_spirit list stays decoupled.
+fn is_jianling_theme_stopword(value: &str) -> bool {
+    matches!(
+        value,
+        // English stopwords (虚词).
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "from"
+            | "this"
+            | "that"
+            | "you"
+            | "are"
+            | "was"
+            | "were"
+            | "not"
+            | "but"
+            | "into"
+            | "about"
+            | "have"
+            | "has"
+            | "had"
+            | "will"
+            | "can"
+            | "use"
+            | "uses"
+            | "using"
+            | "see"
+            | "note"
+            | "notes"
+            | "your"
+            | "they"
+            | "them"
+            | "what"
+            | "when"
+            | "then"
+            | "than"
+            | "there"
+            | "here"
+            | "which"
+            | "would"
+            | "could"
+            | "should"
+            | "also"
+            | "just"
+            | "only"
+            | "more"
+            | "most"
+            | "some"
+            | "any"
+            | "all"
+            | "one"
+            | "two"
+            | "out"
+            | "its"
+            | "his"
+            | "her"
+            | "our"
+            // Transcript structural noise (框架词,永远不是用户主题).
+            | "raw"
+            | "conversation"
+            | "transcript"
+            | "source"
+            | "source-evidence"
+            | "text"  // code fence marker `text`
+            | "redacted"
+            | "compaction"
+            | "reference"
+            | "summary"
+            | "metadata"
+            | "session"
+            | "sha256"
+            | "type"
+            | "status"
+            | "trust"
+            | "tier"
+            | "primary"
+            | "archived"
+            | "started"
+            | "ended"
+    )
+}
+
+/// Normalize a raw theme term into a stable `(topic_key, display_label)`.
+/// Synonyms collapse to one key so the same real topic aggregates across days.
+/// Returns `None` if the term is too short/empty to be a meaningful topic.
+fn normalize_content_theme(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.chars().count() < 2 {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // Synonym table (normalization, NOT detection): map known aliases to a
+    // canonical key + label. Extend freely; this is a growable map, not a
+    // closed match that gates what can be detected.
+    let (key, label): (String, String) = match lower.as_str() {
+        "orderk" | "order-k" | "剑灵" | "jianling" | "sword" | "swordspirit" => {
+            ("orderk".to_string(), "orderk".to_string())
+        }
+        "hermes" | "赫尔墨斯" => ("hermes".to_string(), "hermes".to_string()),
+        "obsidian" | "vault" | "第二大脑" | "二脑" => {
+            ("second-brain".to_string(), "second-brain".to_string())
+        }
+        "codex" => ("codex".to_string(), "codex".to_string()),
+        "minimax" | "m3" => ("minimax".to_string(), "minimax".to_string()),
+        "审计" | "audit" => ("audit".to_string(), "audit".to_string()),
+        "反思" | "reflect" | "reflection" => ("reflection".to_string(), "reflection".to_string()),
+        other => {
+            let key = slugify_topic_key(other);
+            if key == "observed-pattern" {
+                return None;
+            }
+            (format!("content-{key}"), other.to_string())
+        }
+    };
+    Some((key, label))
+}
+
+/// Confidence ladder driven by cross-day recurrence: a content topic earns
+/// trust by reappearing on distinct calendar days, which is exactly what the
+/// promotion gate requires. 1 day = low, 2 = medium, >=3 = high.
+fn confidence_for_distinct_dates(days: usize) -> &'static str {
+    match days {
+        0 | 1 => "low",
+        2 => "medium",
+        _ => "high",
+    }
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -4618,5 +5165,269 @@ mod tests {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
         assert!(names.iter().all(|name| !name.contains("secret-value")));
+    }
+
+    // ---- Jianling intelligence loop (v0.1.29) unit tests ----
+
+    fn content_source(path: &str, excerpt: &str) -> EvidenceSource {
+        EvidenceSource {
+            path: path.to_string(),
+            hash: format!("sha256:{}", sha256_hex(excerpt.as_bytes())),
+            chars: excerpt.chars().count(),
+            excerpt: excerpt.to_string(),
+            theme_excerpt: None,
+        }
+    }
+
+    fn content_anchor(path: &str) -> JianlingSourceAnchor {
+        JianlingSourceAnchor {
+            id: format!("S{}", path.len()),
+            path: path.to_string(),
+            quote_hash: format!("q:{path}"),
+            source_file_hash: format!("h:{path}"),
+            source_tier: "raw_truth".to_string(),
+        }
+    }
+
+    fn empty_ledger() -> JianlingTopicLedger {
+        JianlingTopicLedger {
+            schema_version: "orderk.jianling.topic_ledger.v1".to_string(),
+            profile: "default".to_string(),
+            updated_at: String::new(),
+            topics: BTreeMap::new(),
+        }
+    }
+
+    // Stage 1: content topics escape the closed 5-title echo chamber.
+    #[test]
+    fn content_topics_are_extracted_from_raw_transcript_without_frontmatter() {
+        // A plain transcript (no frontmatter, no wikilinks) that keeps hitting
+        // the same real topic must still yield a non-hardcoded content topic.
+        let excerpt = "今天又在调 orderk 的剑灵反思。orderk 的晋升管道是关键。\
+            orderk orderk 反复出现。subagent review matters too.";
+        let sources = vec![content_source("raw/transcripts/t1.md", excerpt)];
+        let obs = derive_content_topic_observations(&sources, "[S1]");
+        let keys: Vec<&str> = obs.iter().filter_map(|o| o.topic_key.as_deref()).collect();
+        assert!(
+            keys.contains(&"orderk"),
+            "expected an `orderk` content topic from plain text, got {keys:?}"
+        );
+        // Content topics must NOT be one of the 5 hardcoded process keys.
+        for o in &obs {
+            assert!(
+                o.topic_key.is_some(),
+                "content topic must carry an explicit key"
+            );
+            assert_eq!(o.confidence, "low", "content topics start conservative");
+        }
+    }
+
+    #[test]
+    fn structured_signals_extract_tags_and_wikilinks() {
+        let excerpt = "---\ntags: orderk, second-brain\n---\n\nSee [[Hermes]] and [[剑灵]].";
+        let terms = extract_structured_theme_terms(excerpt);
+        assert!(terms.iter().any(|t| t.eq_ignore_ascii_case("orderk")));
+        assert!(terms.iter().any(|t| t == "Hermes"));
+        assert!(terms.iter().any(|t| t == "剑灵"));
+    }
+
+    // Regression guard: wikilink byte-slicing must not panic on multi-byte UTF-8
+    // (CJK + 4-byte emoji) sitting between the ASCII `[[` / `]]` anchors.
+    #[test]
+    fn structured_signal_wikilink_slicing_is_utf8_safe() {
+        let excerpt = "prefix 🚀 [[剑灵🗡️管道]] middle [[orderk]] 尾巴🌟 tail";
+        let terms = extract_structured_theme_terms(excerpt);
+        assert!(terms.iter().any(|t| t == "剑灵🗡️管道"));
+        assert!(terms.iter().any(|t| t == "orderk"));
+        // An unterminated `[[` after multi-byte content must also not panic.
+        let _ = extract_structured_theme_terms("🚀🌟 [[未闭合的链接 🗡️");
+        let _ = extract_structured_theme_terms("[[");
+    }
+
+    #[test]
+    fn synonym_table_collapses_aliases_to_one_key() {
+        assert_eq!(
+            normalize_content_theme("jianling").map(|(k, _)| k),
+            Some("orderk".to_string())
+        );
+        assert_eq!(
+            normalize_content_theme("剑灵").map(|(k, _)| k),
+            Some("orderk".to_string())
+        );
+        assert_eq!(
+            normalize_content_theme("二脑").map(|(k, _)| k),
+            Some("second-brain".to_string())
+        );
+        // Unknown but meaningful term gets a stable content- prefixed key.
+        assert_eq!(
+            normalize_content_theme("kanban").map(|(k, _)| k),
+            Some("content-kanban".to_string())
+        );
+        // Noise normalizes to None (no topic).
+        assert_eq!(normalize_content_theme("!").map(|(k, _)| k), None);
+    }
+
+    // Stage 1.5: confidence ladder is driven by cross-day recurrence.
+    #[test]
+    fn confidence_ladder_tracks_distinct_days() {
+        assert_eq!(confidence_for_distinct_dates(1), "low");
+        assert_eq!(confidence_for_distinct_dates(2), "medium");
+        assert_eq!(confidence_for_distinct_dates(3), "high");
+        assert_eq!(confidence_for_distinct_dates(9), "high");
+    }
+
+    // Stage 2: distinct_dates ignores same-day re-runs, counts cross-day.
+    #[test]
+    fn distinct_dates_ignores_same_day_reruns_and_upgrades_confidence_across_days() {
+        let mut ledger = empty_ledger();
+        let excerpt = "orderk orderk orderk 剑灵 reflection pipeline work";
+        let sources = vec![content_source("raw/transcripts/a.md", excerpt)];
+        let anchors = vec![content_anchor("raw/transcripts/a.md")];
+        let obs = derive_content_topic_observations(&sources, "[S1]");
+        assert!(
+            !obs.is_empty(),
+            "need a content topic to exercise the ledger"
+        );
+
+        // Day 1, run twice — distinct_dates stays at 1, confidence low.
+        for _ in 0..2 {
+            update_topic_ledger_after_success(
+                &mut ledger,
+                "run-d1",
+                &JianlingRunMode::Daily,
+                "2026-06-12",
+                &obs,
+                &anchors,
+                &sources,
+            );
+        }
+        let entry = ledger.topics.get("orderk").expect("orderk topic present");
+        assert_eq!(
+            entry.distinct_dates.len(),
+            1,
+            "same-day reruns must not inflate days"
+        );
+        assert_eq!(entry.confidence, "low");
+
+        // Day 2 -> medium.
+        update_topic_ledger_after_success(
+            &mut ledger,
+            "run-d2",
+            &JianlingRunMode::Daily,
+            "2026-06-13",
+            &obs,
+            &anchors,
+            &sources,
+        );
+        assert_eq!(ledger.topics["orderk"].distinct_dates.len(), 2);
+        assert_eq!(ledger.topics["orderk"].confidence, "medium");
+
+        // Day 3 -> high.
+        update_topic_ledger_after_success(
+            &mut ledger,
+            "run-d3",
+            &JianlingRunMode::Daily,
+            "2026-06-14",
+            &obs,
+            &anchors,
+            &sources,
+        );
+        assert_eq!(ledger.topics["orderk"].distinct_dates.len(), 3);
+        assert_eq!(ledger.topics["orderk"].confidence, "high");
+    }
+
+    // Stage 3: Daily promotion fires only after >=3 distinct days at high.
+    #[test]
+    fn daily_promotion_requires_three_distinct_days() {
+        let mut high_2days = empty_ledger();
+        high_2days.topics.insert(
+            "orderk".to_string(),
+            JianlingTopicEntry {
+                topic_key: "orderk".to_string(),
+                title: "Recurring focus: orderk".to_string(),
+                first_seen: "2026-06-12".to_string(),
+                last_seen: "2026-06-13".to_string(),
+                repeat_count: 2,
+                confidence: "high".to_string(),
+                seen_occurrences: vec!["o1".to_string(), "o2".to_string()],
+                durable_evidence_refs: Vec::new(),
+                source_paths: Vec::new(),
+                source_file_hashes: Vec::new(),
+                modes_seen: vec!["daily".to_string()],
+                latest_next_action: "watch".to_string(),
+                promotion_status: "none".to_string(),
+                distinct_dates: vec!["2026-06-12".to_string(), "2026-06-13".to_string()],
+            },
+        );
+        // 2 distinct days: not eligible for Daily promotion.
+        assert!(
+            promotion_candidates_for_mode(&JianlingRunMode::Daily, &high_2days).is_empty(),
+            "2 distinct days must not promote on Daily"
+        );
+
+        // Add a 3rd day: now eligible.
+        high_2days
+            .topics
+            .get_mut("orderk")
+            .unwrap()
+            .distinct_dates
+            .push("2026-06-14".to_string());
+        let candidates = promotion_candidates_for_mode(&JianlingRunMode::Daily, &high_2days);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "3 distinct days at high should promote on Daily"
+        );
+        assert_eq!(candidates[0].topic_key, "orderk");
+    }
+
+    // Stage 3 churn guard: unchanged proposal ignoring run_id/date compares equal.
+    #[test]
+    fn lesson_proposal_semantic_body_ignores_run_id_and_date() {
+        let day1 = "---\ngenerated_by: orderk-jianling\nrun_id: run-aaa\nstatus: proposed\ndate: 2026-06-12\ntopic_key: orderk\n---\nbody";
+        let day2 = "---\ngenerated_by: orderk-jianling\nrun_id: run-bbb\nstatus: proposed\ndate: 2026-06-14\ntopic_key: orderk\n---\nbody";
+        assert_eq!(
+            lesson_proposal_semantic_body(day1),
+            lesson_proposal_semantic_body(day2),
+            "only run_id/date changed -> semantically identical"
+        );
+        let day3_changed = day2.replace("topic_key: orderk", "topic_key: hermes");
+        assert_ne!(
+            lesson_proposal_semantic_body(day1),
+            lesson_proposal_semantic_body(&day3_changed)
+        );
+    }
+
+    // Back-compat: old ledger JSON without distinct_dates deserializes (default empty).
+    #[test]
+    fn old_ledger_without_distinct_dates_deserializes() {
+        let json = r#"{
+            "schema_version": "orderk.jianling.topic_ledger.v1",
+            "profile": "default",
+            "updated_at": "2026-06-01T00:00:00Z",
+            "topics": {
+                "ledger-preservation": {
+                    "topic_key": "ledger-preservation",
+                    "title": "Preserve the factual ledger",
+                    "first_seen": "2026-06-01",
+                    "last_seen": "2026-06-01",
+                    "repeat_count": 1,
+                    "confidence": "high",
+                    "seen_occurrences": ["occurrence:abc"],
+                    "durable_evidence_refs": [],
+                    "source_paths": [],
+                    "source_file_hashes": [],
+                    "modes_seen": ["daily"],
+                    "latest_next_action": "verify",
+                    "promotion_status": "none"
+                }
+            }
+        }"#;
+        let ledger: JianlingTopicLedger = serde_json::from_str(json).unwrap();
+        let entry = &ledger.topics["ledger-preservation"];
+        assert!(
+            entry.distinct_dates.is_empty(),
+            "missing field defaults to empty"
+        );
     }
 }

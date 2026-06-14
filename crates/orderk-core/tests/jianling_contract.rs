@@ -1235,6 +1235,123 @@ fn jianling_weekly_promotes_repeated_high_confidence_topic_to_lesson_proposal() 
     let _ = fs::remove_dir_all(vault);
 }
 
+/// End-to-end proof of the v0.1.29 intelligence loop: a CONTENT topic the user
+/// keeps engaging with (not one of the 5 hardcoded process invariants) recurs
+/// across 3 distinct days and, on day 3, compiles into a lesson proposal via
+/// the DAILY run — a path that was structurally impossible before (Daily used
+/// to return zero promotion candidates and content topics never entered the
+/// ledger at all).
+#[test]
+fn jianling_daily_promotes_content_topic_after_three_distinct_days() {
+    let vault = temp_vault("daily-content-promote");
+    // Each day's transcript repeats the real topic "orderk" enough times to be
+    // salient, with no frontmatter/wikilinks (pure raw transcript path).
+    let body = "# Session\n\n用户说：今天继续打磨 orderk 的剑灵反思管道。\
+        orderk 的晋升逻辑、orderk 的 ledger、orderk 的召回都要验证。\
+        orderk orderk orderk 是今天反复出现的核心主题。\n";
+    for date in ["2026-06-12", "2026-06-13", "2026-06-14"] {
+        seed_raw_dialogue_on(&vault, date, body);
+    }
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    let mut day3_promotions: Vec<String> = Vec::new();
+    for date in ["2026-06-12", "2026-06-13", "2026-06-14"] {
+        let daily = jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: "default".to_string(),
+                mode: JianlingRunMode::Daily,
+                dry_run: false,
+                scheduled: true,
+                db: Some(db.clone()),
+                date: Some(date.to_string()),
+                max_source_files: 20,
+            },
+        )
+        .unwrap();
+        assert!(daily.ok, "daily {date} should pass: {daily:#?}");
+        if date == "2026-06-12" || date == "2026-06-13" {
+            // Before 3 distinct days, Daily must NOT promote the content topic.
+            assert!(
+                daily.promotion_paths.is_empty(),
+                "day {date}: content topic must not promote before 3 distinct days, got {:?}",
+                daily.promotion_paths
+            );
+        }
+        if date == "2026-06-14" {
+            day3_promotions = daily.promotion_paths.clone();
+        }
+    }
+
+    // Day 3: the content topic must now compile into a lesson proposal.
+    let ledger = read_topic_ledger(&vault);
+    let orderk = &ledger["topics"]["orderk"];
+    assert_eq!(
+        orderk["distinct_dates"].as_array().unwrap().len(),
+        3,
+        "orderk should have recurred across 3 distinct days: {orderk:#?}"
+    );
+    assert_eq!(orderk["confidence"], "high", "3 distinct days -> high");
+
+    assert!(
+        day3_promotions.contains(&"brain/lessons/orderk.md".to_string()),
+        "day 3 daily run should promote the orderk content topic, got {day3_promotions:?}"
+    );
+    let lesson = fs::read_to_string(vault.join("brain/lessons/orderk.md")).unwrap();
+    assert!(lesson.contains("status: proposed"));
+    assert!(lesson.contains("topic_key: orderk"));
+    assert!(lesson.contains("confidence: high"));
+    // proposal-only: never an auto-approved memory write.
+    assert!(!lesson.contains("status: active_user_approved"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+/// Churn guard: once a content topic is proposed, a subsequent same-day-content
+/// Daily run on a later date must NOT rewrite the unchanged lesson file (only
+/// run_id/date would differ), so it produces no churn and no re-index.
+#[test]
+fn jianling_daily_promotion_does_not_rechurn_unchanged_lesson() {
+    let vault = temp_vault("daily-content-no-churn");
+    let body = "# Session\n\n用户说：orderk orderk orderk 剑灵 晋升 管道 是核心主题。\n";
+    for date in ["2026-06-12", "2026-06-13", "2026-06-14", "2026-06-15"] {
+        seed_raw_dialogue_on(&vault, date, body);
+    }
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    let mut day4_promotion_ops = 0usize;
+    for date in ["2026-06-12", "2026-06-13", "2026-06-14", "2026-06-15"] {
+        let daily = jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: "default".to_string(),
+                mode: JianlingRunMode::Daily,
+                dry_run: false,
+                scheduled: true,
+                db: Some(db.clone()),
+                date: Some(date.to_string()),
+                max_source_files: 20,
+            },
+        )
+        .unwrap();
+        assert!(daily.ok, "daily {date} should pass: {daily:#?}");
+        if date == "2026-06-15" {
+            day4_promotion_ops = daily.promotion_file_ops.len();
+        }
+    }
+    // Day 3 created the proposal; day 4's content is semantically identical, so
+    // the churn guard must skip the rewrite (no promotion file op recorded).
+    assert_eq!(
+        day4_promotion_ops, 0,
+        "unchanged lesson must not be rewritten on a later day"
+    );
+    assert!(vault.join("brain/lessons/orderk.md").is_file());
+
+    let _ = fs::remove_dir_all(vault);
+}
+
 #[test]
 fn jianling_weekly_does_not_promote_single_occurrence() {
     let vault = temp_vault("weekly-single-no-promote");
