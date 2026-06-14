@@ -2348,13 +2348,20 @@ pub fn jianling_validate_file(
         "## User/system patterns",
         "## Open risks",
         "## Next actions",
-        "## Evidence appendix",
     ];
-    let missing_sections = required_sections
+    let mut missing_sections = required_sections
         .iter()
         .copied()
         .filter(|section| !text.contains(section))
         .collect::<Vec<_>>();
+    // Evidence appendix boundary may be the English heading (deterministic-only
+    // digest) or the bilingual heading inserted by render_llm_primary_digest when
+    // the K diary is promoted to the primary body. Accept either form so the
+    // contract does not silently break if the deterministic body heading changes.
+    if !text.contains("## Evidence appendix") && !text.contains(JIANLING_EVIDENCE_APPENDIX_HEADING)
+    {
+        missing_sections.push("## Evidence appendix");
+    }
     let sections_ok = missing_sections.is_empty();
     checks.push(check(
         "digest_v2_sections",
