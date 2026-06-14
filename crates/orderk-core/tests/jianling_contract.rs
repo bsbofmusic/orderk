@@ -79,6 +79,15 @@ fn seed_quality_review_source(vault: &Path, date: &str, extra: &str) {
     );
 }
 
+fn seed_prior_daily_reflection(vault: &Path, date: &str, body: &str) {
+    let path = vault.join(format!("brain/daily/{date}.md"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let content = format!(
+        "---\ngenerated_by: orderk-jianling\nstatus: active_generated\nsource_tier: generated_memory\n---\n\n{body}\n"
+    );
+    fs::write(path, content).unwrap();
+}
+
 fn seed_mock_index_db(vault: &Path, db: &Path) {
     let provider = MockEmbeddingProvider::new(8);
     index_vault(
@@ -198,7 +207,7 @@ fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
     assert!(daily_text.contains("source_tier: generated_memory"));
     assert!(daily_text.contains("source_raw_truth_files:"));
     assert!(daily_text.contains("source_generated_memory_files: 0"));
-    assert!(daily_text.contains("source_selection_policy: 'daily/manual selects raw transcript sources only; no prior generated reflections are used before writing'"));
+    assert!(daily_text.contains("source_selection_policy: 'daily/manual writes from the current-day raw transcript sources only; the prior N-day generated daily reflections are loaded as read-only [BG#] background context (never citable as same-day evidence)'"));
     assert!(daily_text.contains("source_anchors:"));
     assert!(daily_text.contains("digest_schema_version: orderk.jianling.digest.v2"));
     assert!(daily_text.contains("reflection_layers: [factual_ledger, reflective_synthesis]"));
@@ -1909,9 +1918,292 @@ fn jianling_apply_rejects_llm_reflection_with_extra_top_level_heading() {
     let _ = fs::remove_dir_all(vault);
 }
 
+// ---- Jianling V4 cross-day background (BG#/S#) tests ----
+
+#[test]
+fn jianling_daily_sees_past_7_days_generated_only_as_background() {
+    let vault = temp_vault("v4-bg-window");
+    seed_raw_dialogue_on(
+        &vault,
+        "2026-06-10",
+        "# Session 2026-06-10\n\n用户说：今天复杂任务又要求子代理 审计 复查，不接受假收口。\n",
+    );
+    // In-window prior reflections (date-7..date-1).
+    seed_prior_daily_reflection(
+        &vault,
+        "2026-06-09",
+        "### Observations\n- prior conclusion about audit preference [S1] confidence: high; next: keep auditing.",
+    );
+    seed_prior_daily_reflection(
+        &vault,
+        "2026-06-03",
+        "### Observations\n- edge of the 7-day window [S1] confidence: medium; next: watch.",
+    );
+    // Out-of-window prior reflection (older than 7 days) must NOT appear as background.
+    seed_prior_daily_reflection(
+        &vault,
+        "2026-06-01",
+        "### Observations\n- way too old to be background [S1] confidence: low; next: ignore.",
+    );
+
+    let server = FakeAnthropicServer::start(
+        "### Observations\n- new today [S1] confidence: high; next: keep independent audit.\n### Open risks\n- low risk [S1] confidence: medium.\n### Next actions\n- verify receipt [S1].\n",
+    );
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_BGWINDOW", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "bgwindow".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    // Two in-window background reflections, today's raw is the only S# source.
+    assert_eq!(report.source_background_files, 2);
+    assert_eq!(report.source_files, 1, "today only uses raw transcript");
+    let bodies = server.request_bodies();
+    assert_eq!(bodies.len(), 1);
+    let prompt = &bodies[0];
+    assert!(
+        prompt.contains("BACKGROUND"),
+        "prompt must carry a background section"
+    );
+    assert!(prompt.contains("[BG1]"), "background anchors are BG#");
+    assert!(prompt.contains("brain/daily/2026-06-09.md"));
+    assert!(prompt.contains("brain/daily/2026-06-03.md"));
+    assert!(
+        !prompt.contains("brain/daily/2026-06-01.md"),
+        "older-than-7-day reflection must be excluded from background"
+    );
+    assert!(prompt.contains("TODAY'S EVIDENCE"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_daily_excludes_target_file_from_background() {
+    let vault = temp_vault("v4-bg-exclude-today");
+    seed_raw_dialogue_on(
+        &vault,
+        "2026-06-10",
+        "# Session 2026-06-10\n\n用户说：今天的新结论必须基于今天的原始证据。\n",
+    );
+    // A reflection already exists at today's target path; it must never be loaded
+    // as background (a daily run cannot see its own output).
+    seed_prior_daily_reflection(
+        &vault,
+        "2026-06-10",
+        "### Observations\n- stale same-day self [S1] confidence: high; next: do not echo.",
+    );
+    seed_prior_daily_reflection(
+        &vault,
+        "2026-06-09",
+        "### Observations\n- legit background [S1] confidence: high; next: keep.",
+    );
+
+    let server = FakeAnthropicServer::start(
+        "### Observations\n- fresh today [S1] confidence: high; next: keep audit.\n### Open risks\n- low [S1] confidence: medium.\n### Next actions\n- verify [S1].\n",
+    );
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_BGEXCLUDE", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "bgexclude".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.source_background_files, 1,
+        "only the prior day counts; today's own target is excluded"
+    );
+    let bodies = server.request_bodies();
+    let prompt = &bodies[0];
+    assert!(prompt.contains("brain/daily/2026-06-09.md"));
+    assert!(
+        !prompt.contains("stale same-day self"),
+        "today's own reflection must never be background"
+    );
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_daily_observation_must_cite_today_s_anchor_not_only_background() {
+    let vault = temp_vault("v4-bg-cite-guard");
+    seed_raw_dialogue_on(
+        &vault,
+        "2026-06-10",
+        "# Session 2026-06-10\n\n用户说：观察必须引用今天的证据，不能只抄背景。\n",
+    );
+    seed_prior_daily_reflection(
+        &vault,
+        "2026-06-09",
+        "### Observations\n- background only [S1] confidence: high; next: keep.",
+    );
+
+    // First response cites only [BG1] (must be rejected); repair cites [S1].
+    let server = FakeAnthropicServer::start_sequence(vec![
+        "### Observations\n- only cites background [BG1] confidence: high; next: should be rejected.\n### Open risks\n- low [BG1] confidence: medium.\n### Next actions\n- nothing [BG1].\n",
+        "### Observations\n- now cites today [S1] confidence: high; next: keep independent audit.\n### Open risks\n- low [S1] confidence: medium.\n### Next actions\n- verify receipt [S1].\n",
+    ]);
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_BGCITE", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "bgcite".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    // The [BG1]-only draft is rejected, then repaired to a valid [S1] citation.
+    assert!(
+        report.ok,
+        "repair to a valid [S#] citation keeps the run healthy"
+    );
+    assert_eq!(report.provider_status, "called_live");
+    assert_eq!(
+        server.request_count(),
+        2,
+        "BG-only draft must be rejected then repaired"
+    );
+    let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
+    assert!(daily_text.contains("now cites today [S1]"));
+    assert!(!daily_text.contains("only cites background [BG1]"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_daily_uses_configured_llm_max_tokens() {
+    let vault = temp_vault("v4-max-tokens");
+    seed_raw_dialogue_on(
+        &vault,
+        "2026-06-10",
+        "# Session 2026-06-10\n\n用户说：M3 量大管饱，但要硬格式化。\n",
+    );
+    let server = FakeAnthropicServer::start(
+        "### Observations\n- today [S1] confidence: high; next: keep audit.\n### Open risks\n- low [S1] confidence: medium.\n### Next actions\n- verify [S1].\n",
+    );
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_MAXTOK", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "maxtok".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.llm_max_tokens, 2000,
+        "receipt surfaces the LLM token budget"
+    );
+    let bodies = server.request_bodies();
+    let request: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(
+        request["max_tokens"], 2000,
+        "LLM call uses the 2000-token budget"
+    );
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_daily_with_no_past_reflections_skips_background_section() {
+    let vault = temp_vault("v4-bg-empty");
+    seed_raw_dialogue_on(
+        &vault,
+        "2026-06-10",
+        "# Session 2026-06-10\n\n用户说：第一天没有历史反思，不应出现背景段。\n",
+    );
+    let server = FakeAnthropicServer::start(
+        "### Observations\n- first day [S1] confidence: high; next: keep audit.\n### Open risks\n- low [S1] confidence: medium.\n### Next actions\n- verify [S1].\n",
+    );
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_BGEMPTY", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "bgempty".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.source_background_files, 0);
+    let bodies = server.request_bodies();
+    let prompt = &bodies[0];
+    assert!(
+        !prompt.contains("BACKGROUND (prior reflections"),
+        "no background section when there are no prior reflections"
+    );
+    assert!(prompt.contains("TODAY'S EVIDENCE"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
 struct FakeAnthropicServer {
     base_url: String,
     count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1926,6 +2218,8 @@ impl FakeAnthropicServer {
         listener.set_nonblocking(true).unwrap();
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count_for_thread = count.clone();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let bodies_for_thread = bodies.clone();
         let handle = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             while std::time::Instant::now() < deadline
@@ -1941,8 +2235,44 @@ impl FakeAnthropicServer {
                             .copied()
                             .or_else(|| texts.last().copied())
                             .unwrap_or("");
-                        let mut buf = [0_u8; 8192];
-                        let _ = stream.read(&mut buf);
+                        // Read the full HTTP request (headers + Content-Length body).
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                            .ok();
+                        let mut raw_bytes: Vec<u8> = Vec::new();
+                        let mut chunk = [0_u8; 8192];
+                        loop {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    raw_bytes.extend_from_slice(&chunk[..n]);
+                                    let raw = String::from_utf8_lossy(&raw_bytes);
+                                    if let Some((head, body)) = raw.split_once("\r\n\r\n") {
+                                        let content_len = head
+                                            .lines()
+                                            .find_map(|line| {
+                                                let lower = line.to_ascii_lowercase();
+                                                lower
+                                                    .strip_prefix("content-length:")
+                                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                            })
+                                            .unwrap_or(0);
+                                        if body.len() >= content_len {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let raw = String::from_utf8_lossy(&raw_bytes).to_string();
+                        let request_body = raw
+                            .split_once("\r\n\r\n")
+                            .map(|(_, body)| body.to_string())
+                            .unwrap_or_default();
+                        if let Ok(mut guard) = bodies_for_thread.lock() {
+                            guard.push(request_body);
+                        }
                         let body = serde_json::json!({
                             "content": [{"type":"text", "text": text}]
                         })
@@ -1964,12 +2294,17 @@ impl FakeAnthropicServer {
         Self {
             base_url: format!("http://{addr}"),
             count,
+            bodies,
             handle: Some(handle),
         }
     }
 
     fn request_count(&self) -> usize {
         self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn request_bodies(&self) -> Vec<String> {
+        self.bodies.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
 

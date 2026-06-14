@@ -659,6 +659,37 @@ Input:
 - previous 7/30-day generated digests for context;
 - relevant existing wiki/brain docs retrieved through OrderK search.
 
+#### 8.1.1 Cross-day background context (V4)
+
+Daily/manual runs are no longer amnesiac. In addition to today's raw transcripts
+(the `[S#]` evidence tier), the run loads the previous `JIANLING_DAILY_BACKGROUND_DAYS`
+(default 7) of **generated** `brain/daily/*.md` reflections as a read-only `[BG#]`
+background tier. Rules enforced in code (`crates/orderk-core/src/jianling.rs`):
+
+- **Window is `[date-7, date-1]`, end-exclusive** (`source_file_in_background_window`):
+  a daily run never ingests its own `brain/daily/<date>.md` output.
+- Only **managed** files (`generated_by: orderk-jianling`) qualify as background.
+- The LLM evidence pack renders two labelled sections — `BACKGROUND (read-only…)`
+  and `TODAY'S EVIDENCE` — and both the generate and repair prompts carry an explicit
+  anti-copy clause.
+- The contract validator (`validate_live_llm_reflection_contract`) requires every
+  Observations section to cite **at least one `[S#]` today-evidence anchor**; a
+  `[BG#]`-only reflection is rejected (then repaired). `[BG#]` can never satisfy the
+  citation contract, because the validator is only ever passed today's `S`-anchors.
+- `max_tokens` is the named constant `JIANLING_LLM_MAX_TOKENS` (2000).
+- The run receipt surfaces `source_background_files` and `llm_max_tokens` for transparency,
+  and the evidence pack carries `background_generated_sources` plus a `primary_raw_sources`
+  subset filtered to the `raw_truth` tier (accurate for weekly+ rollups too).
+
+**Residual risk (D):** anti-copy is enforced at the prompt level only; the validator does
+not detect paraphrase or near-verbatim restatement of a background bullet. The `[S#]`
+citation gate bounds this (a laundered conclusion still needs a real today-evidence anchor),
+but a follow-up n-gram / embedding-similarity check against `background_sources` is the
+recommended hardening. A second residual: prior generated reflections are now sent to the
+LLM as prompt context, so anything written into a managed daily file becomes prompt input
+(excerpts are still passed through `redacted_excerpt`).
+
+
 Steps:
 
 1. **Collect**: find new or changed source files since last watermark.

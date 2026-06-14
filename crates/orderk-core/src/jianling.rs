@@ -23,6 +23,8 @@ const CONTROL_ROOT: &str = ".orderk/jianling";
 const JIANLING_VERSION: &str = "0.1";
 const JIANLING_CHUNK_SIZE: usize = 40;
 const DEFAULT_ANTHROPIC_MINIMAX_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
+const JIANLING_LLM_MAX_TOKENS: u32 = 2000;
+const JIANLING_DAILY_BACKGROUND_DAYS: i64 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -303,6 +305,10 @@ pub struct JianlingRunReport {
     #[serde(default)]
     pub source_generated_memory_files: usize,
     #[serde(default)]
+    pub source_background_files: usize,
+    #[serde(default)]
+    pub llm_max_tokens: u32,
+    #[serde(default)]
     pub source_selection_policy: String,
     #[serde(default)]
     pub rejected_source_files: Vec<String>,
@@ -477,6 +483,8 @@ struct EvidencePack<'a> {
     run_id: &'a str,
     source_anchors: &'a [JianlingSourceAnchor],
     selected_sources: Vec<EvidenceSource>,
+    background_generated_sources: Vec<EvidenceSource>,
+    primary_raw_sources: Vec<EvidenceSource>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -485,6 +493,14 @@ struct EvidencePackOwned {
     run_id: String,
     source_anchors: Vec<JianlingSourceAnchor>,
     selected_sources: Vec<EvidenceSource>,
+    // Round-trip / forward-compat fields: present in the serialized evidence pack
+    // so external consumers can read the BG/S split; not inspected by validation.
+    #[serde(default)]
+    #[allow(dead_code)]
+    background_generated_sources: Vec<EvidenceSource>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    primary_raw_sources: Vec<EvidenceSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -563,6 +579,29 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             excerpt,
         });
     }
+    // Background (BG#) anchors/sources: prior generated daily reflections used as
+    // read-only context only. Never counted as today's evidence and never
+    // citable to satisfy the Observations [S#] requirement.
+    let mut background_anchors = Vec::new();
+    let mut background_sources = Vec::new();
+    for (idx, file) in selection.background.iter().enumerate() {
+        let raw = fs::read_to_string(&file.abs_path)
+            .with_context(|| format!("read background source file {}", file.abs_path.display()))?;
+        let excerpt = redacted_excerpt(&raw, 900);
+        background_anchors.push(JianlingSourceAnchor {
+            id: format!("BG{}", idx + 1),
+            path: file.path.clone(),
+            quote_hash: sha256_hex(excerpt.as_bytes()),
+            source_file_hash: format!("sha256:{}", file.hash),
+            source_tier: source_tier_for_path(&file.path).to_string(),
+        });
+        background_sources.push(EvidenceSource {
+            path: file.path.clone(),
+            hash: format!("sha256:{}", file.hash),
+            chars: raw.chars().count(),
+            excerpt,
+        });
+    }
     let (source_raw_truth_files, source_generated_memory_files) =
         source_tier_counts(&source_anchors);
     let source_selection_policy = source_selection_policy_for_mode(&options.mode).to_string();
@@ -587,6 +626,8 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             run_id: &run_id,
             anchors: &source_anchors,
             sources: &evidence_sources,
+            background_anchors: &background_anchors,
+            background_sources: &background_sources,
             source_total_files: selection.total_files,
             rejected_source_files: &selection.rejected_paths,
         })? {
@@ -607,6 +648,8 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
                             run_id: &run_id,
                             anchors: &source_anchors,
                             sources: &evidence_sources,
+                            background_anchors: &background_anchors,
+                            background_sources: &background_sources,
                             source_total_files: selection.total_files,
                             rejected_source_files: &selection.rejected_paths,
                         },
@@ -675,6 +718,16 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         run_id: &run_id,
         source_anchors: &source_anchors,
         selected_sources: evidence_sources.clone(),
+        background_generated_sources: background_sources.clone(),
+        // Raw-truth subset of the selected sources, accurate for every mode:
+        // for daily this is today's transcripts; for weekly+ it excludes the
+        // generated rollups that also appear in selected_sources.
+        primary_raw_sources: source_anchors
+            .iter()
+            .zip(evidence_sources.iter())
+            .filter(|(anchor, _)| anchor.source_tier == "raw_truth")
+            .map(|(_, source)| source.clone())
+            .collect(),
     };
     let evidence_json = serde_json::to_string_pretty(&evidence_pack)? + "\n";
     let evidence_hash = format!("sha256:{}", sha256_hex(evidence_json.as_bytes()));
@@ -759,6 +812,8 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         source_total_files: selection.total_files,
         source_raw_truth_files,
         source_generated_memory_files,
+        source_background_files: background_sources.len(),
+        llm_max_tokens: JIANLING_LLM_MAX_TOKENS,
         source_selection_policy,
         rejected_source_files: selection.rejected_paths,
         chunking_status: if selected.is_empty() {
@@ -2517,6 +2572,9 @@ struct JianlingSourceSelection {
     selected: Vec<crate::models::ScannedFile>,
     total_files: usize,
     rejected_paths: Vec<String>,
+    /// Daily/manual only: past N-day generated `brain/daily` reflections used as
+    /// READ-ONLY background context (BG# anchors). Never today's evidence.
+    background: Vec<crate::models::ScannedFile>,
 }
 
 #[derive(Debug)]
@@ -2534,8 +2592,19 @@ fn select_source_files(
 ) -> Result<JianlingSourceSelection> {
     let limit = max_source_files.max(1);
     let (window_start, window_end) = source_window_for_mode(mode, date)?;
+    let today = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .with_context(|| format!("parse Jianling date: {date}"))?;
+    // Daily/manual background window: the previous N days of generated daily
+    // reflections, excluding today (so a daily run never sees its own output).
+    let bg_window = matches!(mode, JianlingRunMode::Daily | JianlingRunMode::Manual).then(|| {
+        (
+            today - ChronoDuration::days(JIANLING_DAILY_BACKGROUND_DAYS),
+            today,
+        )
+    });
     let mut generated = Vec::new();
     let mut raw = Vec::new();
+    let mut background = Vec::new();
     for file in scan_vault(vault)? {
         if is_primary_jianling_source(&file.path)
             && source_file_in_window(&file, &window_start, &window_end)
@@ -2546,10 +2615,22 @@ fn select_source_files(
             && is_managed_jianling_generated_source(&file.abs_path)?
         {
             generated.push(file);
+        } else if let Some((bg_start, bg_end)) = bg_window {
+            // Daily background: prior generated daily reflections in [date-N, date-1].
+            if file.path.starts_with("brain/daily/")
+                && source_file_in_background_window(&file, &bg_start, &bg_end)
+                && is_managed_jianling_generated_source(&file.abs_path)?
+            {
+                background.push(file);
+            }
         }
     }
     generated.sort_by(|a, b| a.path.cmp(&b.path));
     raw.sort_by(|a, b| a.path.cmp(&b.path));
+    background.sort_by(|a, b| a.path.cmp(&b.path));
+    // Most recent background first, capped to the background-day budget.
+    background.reverse();
+    background.truncate(JIANLING_DAILY_BACKGROUND_DAYS.max(0) as usize);
     let mut primary = generated;
     primary.extend(raw);
     let total_files = primary.len();
@@ -2566,6 +2647,7 @@ fn select_source_files(
         selected,
         total_files,
         rejected_paths,
+        background,
     })
 }
 
@@ -2598,7 +2680,7 @@ fn source_tier_counts(anchors: &[JianlingSourceAnchor]) -> (usize, usize) {
 fn source_selection_policy_for_mode(mode: &JianlingRunMode) -> &'static str {
     match mode {
         JianlingRunMode::Daily | JianlingRunMode::Manual => {
-            "daily/manual selects raw transcript sources only; no prior generated reflections are used before writing"
+            "daily/manual writes from the current-day raw transcript sources only; the prior N-day generated daily reflections are loaded as read-only [BG#] background context (never citable as same-day evidence)"
         }
         JianlingRunMode::Weekly => {
             "weekly selects managed brain/daily reflections first, then raw sources in the same window"
@@ -2665,6 +2747,21 @@ fn source_file_in_window(
         return false;
     };
     &source_date >= window_start && &source_date <= window_end
+}
+
+/// Background window for daily/manual mode: `[start, end)` — end-exclusive so the
+/// current run's own date is never pulled in as background.
+fn source_file_in_background_window(
+    file: &crate::models::ScannedFile,
+    window_start: &NaiveDate,
+    window_end: &NaiveDate,
+) -> bool {
+    let Some(source_date) =
+        generated_reflection_path_date(&file.path).or_else(|| mtime_date(file.mtime))
+    else {
+        return false;
+    };
+    &source_date >= window_start && &source_date < window_end
 }
 
 fn transcript_path_date(path: &str) -> Option<NaiveDate> {
@@ -3056,6 +3153,17 @@ fn validate_live_llm_reflection_contract(
         .nth(1)
         .and_then(|tail| tail.split("### Open risks").next())
         .unwrap_or("");
+    // Background [BG#] anchors are read-only context and must never satisfy the
+    // evidence-citation requirement. Observations must cite at least one real
+    // today-evidence [S#] anchor that exists in the source set.
+    let observation_cites_today_evidence = anchors.iter().any(|anchor| {
+        anchor.id.starts_with('S') && observation_body.contains(&format!("[{}]", anchor.id))
+    });
+    if !observation_cites_today_evidence {
+        return Err(anyhow!(
+            "observations must cite at least one today-evidence [S#] anchor (background [BG#] does not count)"
+        ));
+    }
     let has_observation_next = observation_body
         .lines()
         .any(|line| line.to_ascii_lowercase().contains("next:"));
@@ -3875,6 +3983,8 @@ struct LiveReflectionInput<'a> {
     run_id: &'a str,
     anchors: &'a [JianlingSourceAnchor],
     sources: &'a [EvidenceSource],
+    background_anchors: &'a [JianlingSourceAnchor],
+    background_sources: &'a [EvidenceSource],
     source_total_files: usize,
     rejected_source_files: &'a [String],
 }
@@ -3891,14 +4001,20 @@ fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option
         return Ok(None);
     }
     let mut client = AnthropicCompatibleChatClient::from_slot(&slot)?;
-    let evidence = render_live_reflection_evidence(input.sources, input.anchors);
+    let evidence = render_live_reflection_evidence(
+        input.sources,
+        input.anchors,
+        input.background_sources,
+        input.background_anchors,
+    );
     let prompt = format!(
-        "You are the OrderK Jianling V4 sleep-reflection writer. Write a pure-English Obsidian reflection using only the supplied evidence.\n\nCore goal: keep both the factual ledger and the judgment. The ledger is objective source anchors, hashes, and run evidence; the reflection is a memorable judgment distilled from repeated behavior, user corrections, and workflow changes. Do not turn the raw evidence list into the reflection.\n\nConstraints:\n- Do not invent facts beyond the evidence.\n- Every observation must cite a [S1]-style source anchor and include confidence: high/medium/low.\n- Output exactly three level-3 Markdown headings, in this exact order: `### Observations`, `### Open risks`, and `### Next actions`; do not output `##` or `#`.\n- The `### Open risks` heading is mandatory even if there are no new risks; include one evidence-cited bullet when risk is low.\n- Each item under `### Observations` must include a source anchor, `confidence: ...`, and `next: ...`.\n- Prefer durable user/process patterns: repeated requests for subagent audit = strong independent-review preference; repeated file/index/hash failures = the user does not accept fake closure.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\nevidence:\n{evidence}",
+        "You are the OrderK Jianling V4 sleep-reflection writer. Write a pure-English Obsidian reflection using only the supplied evidence.\n\nCore goal: keep both the factual ledger and the judgment. The ledger is objective source anchors, hashes, and run evidence; the reflection is a memorable judgment distilled from repeated behavior, user corrections, and workflow changes. Do not turn the raw evidence list into the reflection.\n\nEvidence tiers:\n- The BACKGROUND section lists prior days' reflections as [BG1]-style anchors. It is READ-ONLY context to understand what was already concluded. You MUST NOT copy, paraphrase, or restate background bullets, and you MUST NOT cite [BG#] as if it were today's evidence.\n- The TODAY'S EVIDENCE section lists today's raw sources as [S1]-style anchors. Only [S#] anchors are valid evidence for observations.\n\nConstraints:\n- Do not invent facts beyond the evidence.\n- Every observation must cite at least one [S1]-style source anchor (never only [BG#]) and include confidence: high/medium/low.\n- Reflect on what is NEW today relative to the background; do not repeat background conclusions verbatim.\n- Output exactly three level-3 Markdown headings, in this exact order: `### Observations`, `### Open risks`, and `### Next actions`; do not output `##` or `#`.\n- The `### Open risks` heading is mandatory even if there are no new risks; include one evidence-cited bullet when risk is low.\n- Each item under `### Observations` must include a source anchor, `confidence: ...`, and `next: ...`.\n- Prefer durable user/process patterns: repeated requests for subagent audit = strong independent-review preference; repeated file/index/hash failures = the user does not accept fake closure.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nbackground_sources={}\nrejected_sources={}\nevidence:\n{evidence}",
         input.run_id,
         input.mode.as_str(),
         input.date,
         input.source_total_files,
         input.sources.len(),
+        input.background_sources.len(),
         input.rejected_source_files.len()
     );
     let text = client.send_prompt(&prompt)?;
@@ -3921,15 +4037,21 @@ fn repair_live_llm_reflection(
         return Ok(None);
     }
     let mut client = AnthropicCompatibleChatClient::from_slot(&slot)?;
-    let evidence = render_live_reflection_evidence(input.sources, input.anchors);
+    let evidence = render_live_reflection_evidence(
+        input.sources,
+        input.anchors,
+        input.background_sources,
+        input.background_anchors,
+    );
     let invalid_preview = invalid_text.chars().take(4000).collect::<String>();
     let prompt = format!(
-        "Your previous OrderK Jianling reflection failed digest.v2 validation: {validation_error}. Rewrite it from scratch using only the supplied evidence.\n\nReturn only Markdown with exactly these three level-3 headings, in this exact order and spelling:\n### Observations\n### Open risks\n### Next actions\n\nRules:\n- No `#` or `##` headings.\n- No other `###` headings.\n- Every observation must cite a [S1]-style source anchor, include `confidence: high/medium/low`, and include `next: ...`.\n- The `### Open risks` heading is mandatory even if risk is low.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nrejected_sources={}\nevidence:\n{}\n\ninvalid_previous_output:\n{}",
+        "Your previous OrderK Jianling reflection failed digest.v2 validation: {validation_error}. Rewrite it from scratch using only the supplied evidence.\n\nReturn only Markdown with exactly these three level-3 headings, in this exact order and spelling:\n### Observations\n### Open risks\n### Next actions\n\nEvidence tiers:\n- The BACKGROUND section lists prior days' reflections as [BG1]-style anchors. It is READ-ONLY context. Do NOT copy, paraphrase, or restate background bullets, and do NOT cite [BG#] as today's evidence.\n- The TODAY'S EVIDENCE section lists today's raw sources as [S1]-style anchors. Only [S#] anchors are valid evidence.\n\nRules:\n- No `#` or `##` headings.\n- No other `###` headings.\n- Every observation must cite at least one [S1]-style source anchor (never only [BG#]), include `confidence: high/medium/low`, and include `next: ...`.\n- The `### Open risks` heading is mandatory even if risk is low.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nbackground_sources={}\nrejected_sources={}\nevidence:\n{}\n\ninvalid_previous_output:\n{}",
         input.run_id,
         input.mode.as_str(),
         input.date,
         input.source_total_files,
         input.sources.len(),
+        input.background_sources.len(),
         input.rejected_source_files.len(),
         evidence,
         invalid_preview
@@ -3941,22 +4063,36 @@ fn repair_live_llm_reflection(
 fn render_live_reflection_evidence(
     sources: &[EvidenceSource],
     anchors: &[JianlingSourceAnchor],
+    background_sources: &[EvidenceSource],
+    background_anchors: &[JianlingSourceAnchor],
 ) -> String {
-    sources
-        .iter()
-        .zip(anchors.iter())
-        .take(12)
-        .map(|(source, anchor)| {
-            format!(
-                "[{}] path={} hash={} excerpt={} ",
-                anchor.id,
-                source.path,
-                source.hash,
-                compact_one_line(&source.excerpt)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let render_section = |sources: &[EvidenceSource], anchors: &[JianlingSourceAnchor]| {
+        sources
+            .iter()
+            .zip(anchors.iter())
+            .take(12)
+            .map(|(source, anchor)| {
+                format!(
+                    "[{}] path={} hash={} excerpt={} ",
+                    anchor.id,
+                    source.path,
+                    source.hash,
+                    compact_one_line(&source.excerpt)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let today = render_section(sources, anchors);
+    let mut out = String::new();
+    if !background_sources.is_empty() && !background_anchors.is_empty() {
+        out.push_str("BACKGROUND (prior reflections — read-only, do not copy or cite as today's evidence):\n");
+        out.push_str(&render_section(background_sources, background_anchors));
+        out.push_str("\n\n");
+    }
+    out.push_str("TODAY'S EVIDENCE (only [S#] anchors are valid evidence):\n");
+    out.push_str(&today);
+    out
 }
 
 struct AnthropicCompatibleChatClient {
@@ -4008,7 +4144,7 @@ impl AnthropicCompatibleChatClient {
             .build();
         let body = json!({
             "model": self.model,
-            "max_tokens": 700,
+            "max_tokens": JIANLING_LLM_MAX_TOKENS,
             "temperature": 0.0,
             "thinking": {"type": "disabled"},
             "system": "Return only the requested Markdown text. Do not include thinking, code fences, or extra explanation.",
