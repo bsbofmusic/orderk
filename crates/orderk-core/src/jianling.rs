@@ -25,6 +25,17 @@ const JIANLING_CHUNK_SIZE: usize = 40;
 const DEFAULT_ANTHROPIC_MINIMAX_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
 const JIANLING_LLM_MAX_TOKENS: u32 = 2000;
 const JIANLING_DAILY_BACKGROUND_DAYS: i64 = 7;
+/// Per-source body cap (chars, after one-line compaction) when feeding evidence
+/// to the LLM. theme_excerpt can be ~8000 chars; we trim each source so a single
+/// huge transcript cannot crowd out the rest.
+const JIANLING_LLM_EVIDENCE_PER_SOURCE_CHARS: usize = 1600;
+/// Maximum number of sources fed to the LLM in one section. Replaces the old
+/// hardcoded `.take(12)`; with the cleaned theme_excerpt this covers a typical
+/// day's transcripts without truncating most sources out of view.
+const JIANLING_LLM_EVIDENCE_MAX_SOURCES: usize = 24;
+/// Total char budget across all sources in one evidence section (the binding
+/// limit that keeps M3 input within context regardless of per-source size).
+const JIANLING_LLM_EVIDENCE_TOTAL_CHARS: usize = 28000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -655,6 +666,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             background_sources: &background_sources,
             source_total_files: selection.total_files,
             rejected_source_files: &selection.rejected_paths,
+            vault: &vault,
         })? {
             match validate_live_llm_reflection_contract(&reflection, &source_anchors) {
                 Ok(()) => {
@@ -677,6 +689,7 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
                             background_sources: &background_sources,
                             source_total_files: selection.total_files,
                             rejected_source_files: &selection.rejected_paths,
+                            vault: &vault,
                         },
                         &reflection,
                         &validation_error,
@@ -3672,6 +3685,23 @@ fn evidence_refs_for(anchors: &[JianlingSourceAnchor], count: usize) -> String {
         .join(" ")
 }
 
+/// Soft contract for the K historian reflection (digest.v3).
+///
+/// The old contract hard-required three English headings
+/// (`### Observations/### Open risks/### Next actions`) plus `confidence:`/`next:`
+/// markers. That rigidity was the root cause of M3 schema-fail (M3 reliably
+/// refused to emit `### Next actions`), and it is incompatible with the K
+/// first-person Chinese diary. We keep only the auditable hard constraints and
+/// drop the cosmetic structure:
+///
+/// HARD (reject):
+///   - empty text;
+///   - cites no real today-evidence `[S#]` anchor ("凡事有据");
+///   - contains code fences (` ``` `), which pollute the vault note;
+///
+/// SOFT (allowed): any heading depth, any language, free-form narrative.
+/// Heading-shape and section-name checks are intentionally removed so the
+/// historian can write `## 今日主线 / ## 客观底账 / ## 我的看法 ...`.
 fn validate_live_llm_reflection_contract(
     text: &str,
     anchors: &[JianlingSourceAnchor],
@@ -3680,60 +3710,18 @@ fn validate_live_llm_reflection_contract(
     if trimmed.is_empty() {
         return Err(anyhow!("empty reflection"));
     }
-    for required in ["### Observations", "### Open risks", "### Next actions"] {
-        if !trimmed.contains(required) {
-            return Err(anyhow!("missing required LLM section {required}"));
-        }
-    }
-    if !trimmed.contains("confidence:") {
-        return Err(anyhow!("missing confidence marker"));
-    }
-    let has_known_anchor = anchors.iter().any(|anchor| {
-        let marker = format!("[{}]", anchor.id);
-        trimmed.contains(&marker)
-    });
-    if !has_known_anchor {
-        return Err(anyhow!("missing known source anchor citation"));
-    }
-    let observation_body = trimmed
-        .split("### Observations")
-        .nth(1)
-        .and_then(|tail| tail.split("### Open risks").next())
-        .unwrap_or("");
-    // Background [BG#] anchors are read-only context and must never satisfy the
-    // evidence-citation requirement. Observations must cite at least one real
-    // today-evidence [S#] anchor that exists in the source set.
-    let observation_cites_today_evidence = anchors.iter().any(|anchor| {
-        anchor.id.starts_with('S') && observation_body.contains(&format!("[{}]", anchor.id))
-    });
-    if !observation_cites_today_evidence {
-        return Err(anyhow!(
-            "observations must cite at least one today-evidence [S#] anchor (background [BG#] does not count)"
-        ));
-    }
-    let has_observation_next = observation_body
-        .lines()
-        .any(|line| line.to_ascii_lowercase().contains("next:"));
-    if !has_observation_next {
-        return Err(anyhow!("missing next action in observation section"));
-    }
-    let allowed_headings = ["### Observations", "### Open risks", "### Next actions"];
-    for line in trimmed.lines().map(str::trim_start) {
-        if line.starts_with("# ") || line.starts_with("## ") {
-            return Err(anyhow!(
-                "top-level headings are not allowed in LLM reflection"
-            ));
-        }
-        if line.starts_with("### ")
-            && !allowed_headings
-                .iter()
-                .any(|heading| line.starts_with(heading))
-        {
-            return Err(anyhow!("unexpected LLM reflection heading: {line}"));
-        }
-    }
     if trimmed.contains("```") {
         return Err(anyhow!("code fences are not allowed in reflection"));
+    }
+    // Must cite at least one real today-evidence [S#] anchor that exists in the
+    // source set. Background [BG#] anchors are read-only context and never count.
+    let cites_today_evidence = anchors
+        .iter()
+        .any(|anchor| anchor.id.starts_with('S') && trimmed.contains(&format!("[{}]", anchor.id)));
+    if !cites_today_evidence {
+        return Err(anyhow!(
+            "reflection must cite at least one today-evidence [S#] anchor (background [BG#] does not count)"
+        ));
     }
     Ok(())
 }
@@ -4534,6 +4522,53 @@ struct LiveReflectionInput<'a> {
     background_sources: &'a [EvidenceSource],
     source_total_files: usize,
     rejected_source_files: &'a [String],
+    /// Vault root, used to hot-load the historian prompt from
+    /// `<vault>/.orderk/jianling/prompts/historian.md` (falls back to the
+    /// compiled-in default when the file is absent).
+    vault: &'a Path,
+}
+
+/// Compiled-in default K historian prompt. Used when the vault override file is
+/// absent so reflection always has a working prompt even on a fresh vault.
+const DEFAULT_HISTORIAN_PROMPT: &str = include_str!("assets/jianling_historian_prompt.md");
+
+/// Vault-relative path for the hot-loadable historian prompt. Editing this file
+/// changes the next run's reflection voice with no recompile.
+const HISTORIAN_PROMPT_REL: &str = ".orderk/jianling/prompts/historian.md";
+
+/// Load the historian system prompt. Reads the vault override file if present
+/// and non-empty; otherwise returns the compiled-in default. The returned text
+/// is treated as a trusted template: today's untrusted evidence is appended by
+/// the caller, never substituted into the template, so transcript text cannot
+/// inject template directives.
+fn load_historian_prompt(vault: &Path) -> String {
+    let override_path = vault.join(HISTORIAN_PROMPT_REL);
+    if let Ok(text) = std::fs::read_to_string(&override_path) {
+        if !text.trim().is_empty() {
+            return text;
+        }
+    }
+    DEFAULT_HISTORIAN_PROMPT.to_string()
+}
+
+/// Build the full user-message prompt: the trusted historian template
+/// (hot-loaded), then a run-context block, then the evidence block. Evidence is
+/// concatenated, never fed through placeholder substitution, so untrusted
+/// transcript content cannot alter the template (O2 prompt-injection guard).
+fn build_historian_prompt(input: &LiveReflectionInput<'_>, evidence: &str) -> String {
+    let template = load_historian_prompt(input.vault);
+    format!(
+        "{template}\n\n# 今天这次运行的元信息(只读参考,别写进日记)\nrun_id={run_id}\nmode={mode}\ndate={date}\nsource_total_files={total}\nselected_sources={selected}\nbackground_sources={bg}\nrejected_sources={rejected}\n\n# 今天的原料(证据)\n{evidence}",
+        template = template,
+        run_id = input.run_id,
+        mode = input.mode.as_str(),
+        date = input.date,
+        total = input.source_total_files,
+        selected = input.sources.len(),
+        bg = input.background_sources.len(),
+        rejected = input.rejected_source_files.len(),
+        evidence = evidence,
+    )
 }
 
 fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option<String>> {
@@ -4554,16 +4589,7 @@ fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option
         input.background_sources,
         input.background_anchors,
     );
-    let prompt = format!(
-        "You are the OrderK Jianling V4 sleep-reflection writer. Write a pure-English Obsidian reflection using only the supplied evidence.\n\nCore goal: keep both the factual ledger and the judgment. The ledger is objective source anchors, hashes, and run evidence; the reflection is a memorable judgment distilled from repeated behavior, user corrections, and workflow changes. Do not turn the raw evidence list into the reflection.\n\nEvidence tiers:\n- The BACKGROUND section lists prior days' reflections as [BG1]-style anchors. It is READ-ONLY context to understand what was already concluded. You MUST NOT copy, paraphrase, or restate background bullets, and you MUST NOT cite [BG#] as if it were today's evidence.\n- The TODAY'S EVIDENCE section lists today's raw sources as [S1]-style anchors. Only [S#] anchors are valid evidence for observations.\n\nConstraints:\n- Do not invent facts beyond the evidence.\n- Every observation must cite at least one [S1]-style source anchor (never only [BG#]) and include confidence: high/medium/low.\n- Reflect on what is NEW today relative to the background; do not repeat background conclusions verbatim.\n- Output exactly three level-3 Markdown headings, in this exact order: `### Observations`, `### Open risks`, and `### Next actions`; do not output `##` or `#`.\n- The `### Open risks` heading is mandatory even if there are no new risks; include one evidence-cited bullet when risk is low.\n- Each item under `### Observations` must include a source anchor, `confidence: ...`, and `next: ...`.\n- Prefer durable user/process patterns: repeated requests for subagent audit = strong independent-review preference; repeated file/index/hash failures = the user does not accept fake closure.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nbackground_sources={}\nrejected_sources={}\nevidence:\n{evidence}",
-        input.run_id,
-        input.mode.as_str(),
-        input.date,
-        input.source_total_files,
-        input.sources.len(),
-        input.background_sources.len(),
-        input.rejected_source_files.len()
-    );
+    let prompt = build_historian_prompt(&input, &evidence);
     let text = client.send_prompt(&prompt)?;
     Ok(Some(text.trim().to_string()))
 }
@@ -4591,17 +4617,12 @@ fn repair_live_llm_reflection(
         input.background_anchors,
     );
     let invalid_preview = invalid_text.chars().take(4000).collect::<String>();
+    let base = build_historian_prompt(&input, &evidence);
     let prompt = format!(
-        "Your previous OrderK Jianling reflection failed digest.v2 validation: {validation_error}. Rewrite it from scratch using only the supplied evidence.\n\nReturn only Markdown with exactly these three level-3 headings, in this exact order and spelling:\n### Observations\n### Open risks\n### Next actions\n\nEvidence tiers:\n- The BACKGROUND section lists prior days' reflections as [BG1]-style anchors. It is READ-ONLY context. Do NOT copy, paraphrase, or restate background bullets, and do NOT cite [BG#] as today's evidence.\n- The TODAY'S EVIDENCE section lists today's raw sources as [S1]-style anchors. Only [S#] anchors are valid evidence.\n\nRules:\n- No `#` or `##` headings.\n- No other `###` headings.\n- Every observation must cite at least one [S1]-style source anchor (never only [BG#]), include `confidence: high/medium/low`, and include `next: ...`.\n- The `### Open risks` heading is mandatory even if risk is low.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nbackground_sources={}\nrejected_sources={}\nevidence:\n{}\n\ninvalid_previous_output:\n{}",
-        input.run_id,
-        input.mode.as_str(),
-        input.date,
-        input.source_total_files,
-        input.sources.len(),
-        input.background_sources.len(),
-        input.rejected_source_files.len(),
-        evidence,
-        invalid_preview
+        "{base}\n\n# 上一版没过硬约束,重写\n你上一篇日记没满足硬约束:{validation_error}。\n请用上面同样的身份和调子,从头重写一篇 K 的夜班日记。务必:至少引用一个今天的 [S#] 证据(不能只引 [BG#]);不要用 ``` 代码围栏;不要泄露任何凭证。其他写法照上面的要求。\n\n# 上一版(仅供你知道哪里没写好,别照抄)\n{invalid_preview}",
+        base = base,
+        validation_error = validation_error,
+        invalid_preview = invalid_preview,
     );
     let text = client.send_prompt(&prompt)?;
     Ok(Some(text.trim().to_string()))
@@ -4613,22 +4634,43 @@ fn render_live_reflection_evidence(
     background_sources: &[EvidenceSource],
     background_anchors: &[JianlingSourceAnchor],
 ) -> String {
+    // Feed the LLM the CLEANED transcript body (theme_excerpt: frontmatter,
+    // Session Metadata, message headers and fences stripped) rather than the
+    // short anchor `excerpt` (which is frontmatter-polluted and only exists for
+    // quote_hash stability). Truncation is governed by three budgets so a single
+    // long transcript cannot crowd everything else out of M3's context:
+    //   - at most JIANLING_LLM_EVIDENCE_MAX_SOURCES sources,
+    //   - at most JIANLING_LLM_EVIDENCE_PER_SOURCE_CHARS chars per source,
+    //   - at most JIANLING_LLM_EVIDENCE_TOTAL_CHARS chars across the section.
     let render_section = |sources: &[EvidenceSource], anchors: &[JianlingSourceAnchor]| {
-        sources
+        let mut lines = Vec::new();
+        let mut total_chars = 0usize;
+        for (source, anchor) in sources
             .iter()
             .zip(anchors.iter())
-            .take(12)
-            .map(|(source, anchor)| {
-                format!(
-                    "[{}] path={} hash={} excerpt={} ",
-                    anchor.id,
-                    source.path,
-                    source.hash,
-                    compact_one_line(&source.excerpt)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .take(JIANLING_LLM_EVIDENCE_MAX_SOURCES)
+        {
+            let body = source.theme_excerpt.as_deref().unwrap_or(&source.excerpt);
+            let mut body = compact_one_line(body);
+            if body.chars().count() > JIANLING_LLM_EVIDENCE_PER_SOURCE_CHARS {
+                body = body
+                    .chars()
+                    .take(JIANLING_LLM_EVIDENCE_PER_SOURCE_CHARS)
+                    .collect::<String>();
+                body.push('…');
+            }
+            if total_chars + body.chars().count() > JIANLING_LLM_EVIDENCE_TOTAL_CHARS
+                && !lines.is_empty()
+            {
+                break;
+            }
+            total_chars += body.chars().count();
+            lines.push(format!(
+                "[{}] path={} hash={} excerpt={} ",
+                anchor.id, source.path, source.hash, body
+            ));
+        }
+        lines.join("\n")
     };
     let today = render_section(sources, anchors);
     let mut out = String::new();

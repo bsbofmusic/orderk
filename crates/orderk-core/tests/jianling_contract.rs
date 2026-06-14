@@ -1905,9 +1905,11 @@ fn jianling_apply_calls_configured_llm_and_writes_contract_valid_reflection() {
 fn jianling_apply_repairs_llm_reflection_missing_required_section_once() {
     let vault = temp_vault("live-llm-repair");
     seed_raw_dialogue(&vault);
+    // First response violates a HARD constraint (code fence); the soft historian
+    // contract rejects it, repair fires once, and the second response is clean.
     let server = FakeAnthropicServer::start_sequence(vec![
-        "### Observations\n- First draft is grounded but incomplete [S1] confidence: high; next: repair the missing section.\n### Next actions\n- validate the repaired response [S1].\n",
-        "### Observations\n- Repaired LLM reflection keeps exact headings [S1] confidence: high; next: keep contract repair before degrading.\n### Open risks\n- no extra risk beyond source evidence [S1] confidence: medium.\n### Next actions\n- verify receipt and index feedback [S1].\n",
+        "## 今日主线\n我今天陪老板做了点事 [S1]。\n```rust\nfn oops() {}\n```\n",
+        "## 今日主线\n我今天陪老板把剑灵的反思框架翻新了一遍 [S1]。\n## 我的看法\n这次是真把判断放前面了。",
     ]);
     let _guard = ScopedEnv::set(&[
         ("ORDERK_JIANLING_LLM_ENABLED_LLMREPAIR", "1"),
@@ -1940,10 +1942,9 @@ fn jianling_apply_repairs_llm_reflection_missing_required_section_once() {
         .any(|warning| warning.contains("repaired after initial contract rejection")));
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
     assert!(daily_text.contains("### LLM reflection (MiniMax M3)"));
-    assert!(
-        daily_text.contains("Repaired LLM reflection keeps exact headings [S1] confidence: high")
-    );
-    assert!(!daily_text.contains("First draft is grounded but incomplete"));
+    assert!(daily_text.contains("这次是真把判断放前面了"));
+    // The fenced first draft must not survive into the written note.
+    assert!(!daily_text.contains("fn oops()"));
     assert_eq!(server.request_count(), 2);
 
     let _ = fs::remove_dir_all(vault);
@@ -1953,7 +1954,9 @@ fn jianling_apply_repairs_llm_reflection_missing_required_section_once() {
 fn jianling_apply_rejects_contract_invalid_llm_reflection() {
     let vault = temp_vault("live-llm-invalid");
     seed_raw_dialogue(&vault);
-    let server = FakeAnthropicServer::start("- LLM reflection from fake MiniMax [S1]\n");
+    // Response cites no today-evidence [S#] anchor at all -> violates the hard
+    // "凡事有据" constraint. Repair (served the same text) fails again -> degraded.
+    let server = FakeAnthropicServer::start("## 今日主线\n我今天想了很多但一个证据都没引。\n");
     let _guard = ScopedEnv::set(&[
         ("ORDERK_JIANLING_LLM_ENABLED_LLMMODEINVALID", "1"),
         ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
@@ -1989,18 +1992,21 @@ fn jianling_apply_rejects_contract_invalid_llm_reflection() {
         .any(|warning| warning.contains("live LLM reflection rejected")));
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
     assert!(!daily_text.contains("### LLM reflection (MiniMax M3)"));
-    assert!(!daily_text.contains("LLM reflection from fake MiniMax"));
+    assert!(!daily_text.contains("一个证据都没引"));
     assert_eq!(server.request_count(), 2);
 
     let _ = fs::remove_dir_all(vault);
 }
 
 #[test]
-fn jianling_apply_rejects_llm_reflection_with_extra_top_level_heading() {
-    let vault = temp_vault("live-llm-extra-heading");
+fn jianling_apply_accepts_llm_reflection_with_chinese_h2_headings() {
+    // The soft historian contract intentionally ALLOWS `##` headings so K can
+    // write `## 今日主线 / ## 我的看法 ...`. This used to be rejected by the old
+    // rigid digest.v2 contract; the flip is the entire point of V4.1.
+    let vault = temp_vault("live-llm-h2-headings");
     seed_raw_dialogue(&vault);
     let server = FakeAnthropicServer::start(
-        "## Extra top-level heading\n### Observations\n- looks grounded [S1] confidence: high; next: do not publish invalid structure.\n### Open risks\n- top-level heading would break seven-section digest [S1] confidence: high.\n### Next actions\n- reject this response [S1].\n",
+        "## 今日主线\n我今天陪老板把剑灵从记账员改回史学家 [S1]。\n## 我的看法\n判断放前面,证据垫后面,这才像反思 [S1]。\n## 还没完的事\n发版还没拍板。",
     );
     let _guard = ScopedEnv::set(&[
         ("ORDERK_JIANLING_LLM_ENABLED_LLMHEADING", "1"),
@@ -2023,14 +2029,14 @@ fn jianling_apply_rejects_llm_reflection_with_extra_top_level_heading() {
     )
     .unwrap();
 
-    assert!(!report.ok);
-    assert_eq!(report.status, "degraded_llm_schema_invalid");
-    assert_eq!(report.provider_status, "called_live_schema_invalid");
-    assert!(report.fallback_used);
+    assert!(report.ok, "H2 headings are valid in the soft contract");
+    assert_eq!(report.provider_status, "called_live");
+    assert!(!report.fallback_used);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(!daily_text.contains("Extra top-level heading"));
-    assert!(!daily_text.contains("\n## Extra top-level heading"));
-    assert_eq!(server.request_count(), 2);
+    assert!(daily_text.contains("### LLM reflection (MiniMax M3)"));
+    assert!(daily_text.contains("把剑灵从记账员改回史学家"));
+    // No repair needed: a single valid call.
+    assert_eq!(server.request_count(), 1);
 
     let _ = fs::remove_dir_all(vault);
 }
