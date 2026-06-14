@@ -117,6 +117,9 @@ fn seed_mock_index_db_with_options(vault: &Path, db: &Path, options: &IndexOptio
 
 #[test]
 fn jianling_dry_run_reports_sources_without_writing_generated_memory() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("dry-run");
     seed_raw_dialogue(&vault);
 
@@ -426,6 +429,9 @@ fn jianling_index_freshness_mismatch_fails_closed_without_success_label() {
 
 #[test]
 fn jianling_apply_degrades_when_index_db_is_missing() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("missing-index-db");
     seed_raw_dialogue(&vault);
     let db = vault.join(".obsidian/orderk/missing.sqlite");
@@ -465,6 +471,9 @@ fn jianling_apply_degrades_when_index_db_is_missing() {
 
 #[test]
 fn jianling_index_feedback_reuses_existing_db_chunk_profile() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("chunk-profile");
     seed_raw_dialogue(&vault);
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -503,6 +512,9 @@ fn jianling_index_feedback_reuses_existing_db_chunk_profile() {
 
 #[test]
 fn jianling_daily_updates_topic_ledger_for_reflective_observations() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("ledger-create");
     seed_quality_review_source(&vault, "2026-06-10", "第一次落账。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -547,6 +559,9 @@ fn jianling_daily_updates_topic_ledger_for_reflective_observations() {
 
 #[test]
 fn jianling_topic_ledger_dedupes_same_occurrence_rerun() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("ledger-dedupe");
     seed_quality_review_source(&vault, "2026-06-10", "重复同日。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -575,6 +590,9 @@ fn jianling_topic_ledger_dedupes_same_occurrence_rerun() {
 
 #[test]
 fn jianling_topic_ledger_counts_distinct_daily_occurrences() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("ledger-distinct");
     seed_quality_review_source(&vault, "2026-06-10", "第一天。");
     seed_quality_review_source(&vault, "2026-06-11", "第二天。");
@@ -607,6 +625,9 @@ fn jianling_topic_ledger_counts_distinct_daily_occurrences() {
 
 #[test]
 fn jianling_run_refuses_to_overwrite_human_daily_note() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("human-daily-safe");
     seed_raw_dialogue(&vault);
     fs::create_dir_all(vault.join("brain/daily")).unwrap();
@@ -642,6 +663,9 @@ fn jianling_run_refuses_to_overwrite_human_daily_note() {
 #[cfg(unix)]
 #[test]
 fn jianling_run_rejects_symlinked_generated_output_root() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     use std::os::unix::fs as unix_fs;
 
     let vault = temp_vault("symlink-escape");
@@ -676,6 +700,9 @@ fn jianling_run_rejects_symlinked_generated_output_root() {
 
 #[test]
 fn jianling_validate_run_rejects_tampered_generated_markdown_and_evidence() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("tamper");
     seed_raw_dialogue(&vault);
 
@@ -840,6 +867,9 @@ fn seed_many_raw_dialogues(vault: &Path, count: usize) {
 
 #[test]
 fn jianling_daily_selects_only_requested_date_window() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("daily-date-window");
     let day10 = vault.join("raw/transcripts/hermes-sessions/2026/06/10");
     let day11 = vault.join("raw/transcripts/hermes-sessions/2026/06/11");
@@ -880,6 +910,9 @@ fn jianling_daily_selects_only_requested_date_window() {
 
 #[test]
 fn jianling_weekly_monthly_yearly_select_expected_date_windows() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("calendar-source-window");
     for (date, name) in [
         ("2025/12/31", "old-year"),
@@ -964,6 +997,9 @@ fn jianling_weekly_monthly_yearly_select_expected_date_windows() {
 
 #[test]
 fn jianling_rollups_include_lower_level_generated_reflections() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("hierarchical-rollup-sources");
     seed_raw_dialogue_on(&vault, "2026-06-01", "# day one\n\nRaw day one source.\n");
     seed_raw_dialogue_on(&vault, "2026-06-07", "# sunday\n\nRaw sunday source.\n");
@@ -1113,6 +1149,9 @@ fn jianling_worker_plans_calendar_modes_without_external_cron() {
 
 #[test]
 fn jianling_weekly_and_monthly_write_prd_paths_not_reflections_bucket() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("weekly-monthly-paths");
     seed_raw_dialogue(&vault);
 
@@ -1159,6 +1198,9 @@ fn jianling_weekly_and_monthly_write_prd_paths_not_reflections_bucket() {
 
 #[test]
 fn jianling_weekly_does_not_promote_deleted_hardcoded_review_template() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("weekly-no-hardcoded-review-promote");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
@@ -1221,6 +1263,9 @@ fn jianling_weekly_does_not_promote_deleted_hardcoded_review_template() {
 /// ledger at all).
 #[test]
 fn jianling_daily_promotes_content_topic_after_three_distinct_days() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("daily-content-promote");
     // Each day's transcript repeats the real topic "orderk" enough times to be
     // salient, with no frontmatter/wikilinks (pure raw transcript path).
@@ -1291,6 +1336,9 @@ fn jianling_daily_promotes_content_topic_after_three_distinct_days() {
 /// run_id/date would differ), so it produces no churn and no re-index.
 #[test]
 fn jianling_daily_promotion_does_not_rechurn_unchanged_lesson() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("daily-content-no-churn");
     let body = "# Session\n\n用户说：orderk orderk orderk 剑灵 晋升 管道 是核心主题。\n";
     for date in ["2026-06-12", "2026-06-13", "2026-06-14", "2026-06-15"] {
@@ -1332,6 +1380,9 @@ fn jianling_daily_promotion_does_not_rechurn_unchanged_lesson() {
 
 #[test]
 fn jianling_weekly_does_not_promote_single_occurrence() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("weekly-single-no-promote");
     seed_quality_review_source(&vault, "2026-06-10", "单次不能沉淀成长课题。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -1376,6 +1427,9 @@ fn jianling_weekly_does_not_promote_single_occurrence() {
 
 #[test]
 fn jianling_global_profile_lock_blocks_cross_mode_conflicts() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("global-lock");
     seed_raw_dialogue(&vault);
     let lock_dir = vault.join(".orderk/jianling/locks");
@@ -1410,6 +1464,9 @@ fn jianling_global_profile_lock_blocks_cross_mode_conflicts() {
 
 #[test]
 fn jianling_daily_promotion_index_failure_is_fail_closed() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("daily-fail-closed");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
@@ -1464,6 +1521,9 @@ fn jianling_daily_promotion_index_failure_is_fail_closed() {
 
 #[test]
 fn jianling_promotion_overwrite_rules_respect_existing_targets() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("promotion-overwrite");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
@@ -1523,6 +1583,9 @@ fn jianling_promotion_overwrite_rules_respect_existing_targets() {
 
 #[test]
 fn jianling_empty_source_does_not_update_topic_ledger() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("empty-source-ledger");
     fs::create_dir_all(vault.join("raw/system-snapshots/2026/06/10")).unwrap();
     fs::write(
@@ -1555,6 +1618,9 @@ fn jianling_empty_source_does_not_update_topic_ledger() {
 
 #[test]
 fn jianling_rollup_uses_existing_daily_reflections_after_raw_sources_are_removed() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("empty-rollup-ledger");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
@@ -1622,6 +1688,9 @@ fn jianling_rollup_uses_existing_daily_reflections_after_raw_sources_are_removed
 
 #[test]
 fn jianling_partial_large_run_writes_kanban_chunk_and_foreman_receipts() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("chunked");
     seed_many_raw_dialogues(&vault, 95);
 
@@ -1717,6 +1786,9 @@ fn jianling_partial_large_run_writes_kanban_chunk_and_foreman_receipts() {
 
 #[test]
 fn jianling_validate_run_rejects_tampered_kanban_auditor_card() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("kanban-tamper");
     seed_many_raw_dialogues(&vault, 45);
 
