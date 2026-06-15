@@ -1,6 +1,6 @@
 # OrderK V4 Jianling / Sword Spirit PRD — Built-in Sleep Reflection & Markdown Memory Compiler
 
-> Status: **V4 P0/P1 production launch on `orderk-cli@0.1.21` release: deterministic Markdown compiler, receipts/validators, OrderK-managed `systemd --user` timer, `jianling worker --once` planner, profile-wide run lock, self-check/chat-smoke, persistent run logs, live MiniMax M3 reflection behind an explicit hot switch, and verified single-file `orderk index --path` feedback for generated Markdown. Full autonomous card/proposal UX remains gated.**
+> Status: **V4 production line: `0.1.21` launched the P0/P1 scheduler/compiler slice; the current 2026-06-15 v41 line on `0.1.28` adds K-voice historian reflection, default-on live LLM activation when a valid chain/key pointer exists, bounded post-write index feedback, receipts/validators, OrderK-managed `systemd --user` timer, and writer/auditor/foreman gates. Full autonomous approval UX remains gated.**
 > Date: 2026-06-10
 > Owner intent: 茶老板提出“剑灵是睡后反思者”，不是外部 Hermes/agent cron，而是 OrderK 自身安装后、配置 LLM 后无感运转的内嵌夜间记忆整理机制。
 > Naming note: The new Jianling / Sword Spirit product generation is **OrderK V4**. V4 is built after the current V3 baseline, but it is not a patch label for V3. The old V3 release line must be archived clearly in npm, GitHub Releases, CHANGELOG, and repo docs before V4 changes the product boundary. Old `orderk-v2-sword-spirit-prd.md` remains historical and is not the active V4 design source.
@@ -54,13 +54,13 @@ V3 archive gate before V4 boundary change:
 
 ### 2.2 Boundary transition / active docs state
 
-This PRD records the V4 product-boundary change. The `0.1.21` release promotes the P0/P1 Jianling slice: `orderk jianling` exists as an explicit Markdown compiler sidecar with deterministic digest generation, an OrderK-managed active `systemd --user` timer, `jianling worker --once` calendar planner, receipts/evidence packs, validators, safety gates, profile-wide locks, persistent run logs, self-check/chat-smoke, a live Anthropic-compatible MiniMax M3 reflection slot, and verified single-file `orderk index --path` feedback for generated Markdown. The search/MCP query path remains read-only; live reflection is **not implicit** and only runs when an explicit Jianling LLM enable switch is set.
+This PRD records the V4 product-boundary change. The `0.1.21` release promoted the P0/P1 Jianling scheduler/compiler slice. The current `0.1.28` / v41 production line keeps `orderk jianling` as an explicit Markdown compiler sidecar with an OrderK-managed active `systemd --user` timer, `jianling worker --once` planner, receipts/evidence packs, validators, safety gates, profile-wide locks, persistent run logs, self-check/chat-smoke, live Anthropic-compatible MiniMax M3 reflection, and verified single-file `orderk index --path` feedback for generated Markdown. The search/MCP query path remains read-only. Live reflection activation resolves in this order: per-profile override, global override, then default-on when a valid LLM chain/key-env pointer exists.
 
 Promotion rule:
 
 1. Old `orderk-v2-sword-spirit-prd.md` remains historical and must not be used as the active design source.
-2. `0.1.21` user-facing docs may say “OrderK has Jianling V4 P0/P1 production scheduler” for deterministic digest/scheduler/receipt/validator/self-check/logs plus the live MiniMax M3 reflection slot behind `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]`.
-3. User-facing docs must not claim always-on autonomous LLM reflection: `jianling run` calls LLM only when the explicit hot switch is enabled, and `chat-smoke` is the separate live connectivity command.
+2. `0.1.21` user-facing docs may say “OrderK has Jianling V4 P0/P1 production scheduler”; current docs should say `0.1.28` / v41 has historian reflection and default-on live LLM activation when a valid chain/key pointer exists.
+3. User-facing docs must not claim unmanaged autonomous writes: scheduler activation, write targets, receipts, guards, and source anchors stay explicit; `chat-smoke` is the separate live connectivity command.
 4. Search/MCP docs must continue to state the query path is read-only; Jianling write behavior is explicit and separate.
 
 ### 2.3 Compatibility with current OrderK
@@ -83,7 +83,7 @@ This update records the hard lessons from the V4 implementation drill. It is par
 
 | Question | PRD answer after implementation |
 |---|---|
-| Is Jianling an explicit switch? | Yes. `orderk jianling enable/disable` controls the scheduler. Live LLM reflection inside `jianling run` has a second explicit hot switch: `ORDERK_JIANLING_LLM_ENABLED_<PROFILE>=1` or global `ORDERK_JIANLING_LLM_ENABLED=1`. Without it, a configured LLM is reported as configured but inactive; no silent live reflection call is made. |
+| Is Jianling an explicit switch? | Scheduler ownership is explicit: `orderk jianling enable/disable` controls the systemd timer. Historical `0.1.21` live reflection used an explicit LLM hot switch. Current v41 resolves live LLM activation as per-profile override, then global override, then default-on when a valid LLM chain/key-env pointer exists. Setting either switch false still disables the live call intentionally. |
 | Is it hot-swappable? | Yes for the live reflection slot: model/profile/key env/base URL are resolved at run time through the existing Sword model profile. Changing env/profile then rerunning `chat-smoke`, `self-check`, or `run` is enough; no rebuild is required. |
 | Do daily/weekly/monthly runs conflict? | They must not. The implemented lock is profile-wide (`.orderk/jianling/locks/<profile>.lock`), not per-mode; daily, weekly, and monthly runs for the same vault/profile are mutually exclusive. Receipts record mode/run-id and the lock path. |
 | What if the evidence exceeds the LLM/context budget? | The run must fail closed or become explicit partial. Current P0/P1 uses a Kanban harness: writer cards draft bounded evidence slices, auditor cards check format/traceability against writer drafts and final Markdown draft, and a foreman manifest gates the final Markdown write. Receipts record `partial_source_file_limit`, rejected source paths, chunk count, chunk dir, and foreman manifest path. Silent truncation is forbidden. |
@@ -145,6 +145,21 @@ Configuration and logging are layered, not a single hidden daemon:
 | MCP tool output | live agent-facing search surface; must be tested after binary replacement |
 
 A run must not be called “满血全开” merely because config files look right. It must verify active binary, active DB, default reranker, fresh MCP process, MCP tool calls, Jianling scheduler, live LLM smoke, latest receipt/log, and bounded index/search feedback. Stale `/home/agent/.local/bin/orderk (deleted)` MCP processes are an explicit P1 operational hazard after deploy.
+
+### 2.6 Production status update — 2026-06-15
+
+As of the 2026-06-15 production verification, the active V4 line is no longer only the original `0.1.21` P0/P1 scheduler slice. The deployed production binary at `/home/agent/.local/bin/orderk` is built from the v41 tree on the `0.1.28` version line (the version string was not bumped by the v41 patch set, so production verification must use binary fingerprints, not `orderk --version`). The decisive v41 fingerprints are UTF-8 prompt markers such as `夜班日记`, `今日主线`, `我的看法`, and `K 的夜班` compiled through `include_str!("assets/jianling_historian_prompt.md")`.
+
+The current accepted V4 behavior is:
+
+1. **Search/MCP remains read-only.** `orderk search/get/status/health/doctor/mcp` do not mutate the vault.
+2. **Jianling is the explicit write-capable compiler.** It writes generated Markdown under `brain/daily|weekly|monthly|yearly|lessons` only through receipts, guards, source anchors, and the writer/auditor/foreman gate.
+3. **Historian reflection is the main human-facing layer.** The LLM writes a K-voice night-shift diary; deterministic anchors, hashes, and counts are evidence material, not the whole reflection.
+4. **Live reflection is production-verified through MiniMax M3.** A connected `chat-smoke` result is `ok=true`, `status=connected`, and `response_preview=orderk-jianling-smoke-ok`; false negatives can occur if a manual shell omits the systemd user-manager environment containing the key-env pointer.
+5. **Operational evidence is part of DR.** `.orderk/` contains Jianling run receipts, redacted evidence packs, logs, smoke receipts, scheduler/watermark/audit state, and eval cases. It is now a declared Obsidian DR backup surface after `dr_audit` rejected it as unclassified during the 2026-06-15 backup repair.
+
+Open caveats remain explicit: natural timer proof requires the next `systemd --user` trigger receipt, and a generated Markdown file is only considered searchable when the post-write index feedback and active DB file hash/size freshness checks pass.
+
 
 ---
 
@@ -358,14 +373,15 @@ Required behavior:
 orderk init --vault ~/obsidian-vault
 # config/profile path, or env-only for the current implementation slice:
 export ORDERK_SWORD_LLM_API_KEY_ENV=MINIMAX_API_KEY
-export ORDERK_JIANLING_LLM_ENABLED_DEFAULT=1   # explicit hot switch for live run reflection
+# Optional override. If absent, v41 defaults live reflection on when a valid LLM chain/key pointer exists.
+# export ORDERK_JIANLING_LLM_ENABLED_DEFAULT=1
 orderk jianling chat-smoke --vault ~/obsidian-vault --profile default
 orderk jianling self-check --vault ~/obsidian-vault --profile default
 orderk jianling enable --schedule "03:30" --timezone Asia/Shanghai
 orderk jianling doctor --vault ~/obsidian-vault --profile default
 ```
 
-If LLM credentials are not configured, `chat-smoke` reports `llm_unconfigured` and writes a failed smoke receipt; Search/index still works. If credentials are configured but `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]` is absent, `jianling run` stays deterministic and reports the live slot as explicitly inactive rather than silently calling LLM.
+If LLM credentials are not configured, `chat-smoke` reports `llm_unconfigured` and writes a failed smoke receipt; Search/index still works. If credentials are configured and no enable/disable override is set, v41 treats the valid chain as live-enabled by default. Explicit false/off overrides remain the emergency kill switch.
 
 ### 6.5 Silent success / explicit failure
 
@@ -1482,7 +1498,7 @@ Pass:
 
 ### P3.1 — 2026-06-01..2026-06-10 live drill gate
 
-Fixture: a real or synthetic vault with daily source files from 2026-06-01 through 2026-06-10, `ORDERK_SWORD_LLM_API_KEY_ENV` pointing to the configured MiniMax M3 key env, and `ORDERK_JIANLING_LLM_ENABLED_<PROFILE>=1`.
+Fixture: a real or synthetic vault with daily source files from 2026-06-01 through 2026-06-10, `ORDERK_SWORD_LLM_API_KEY_ENV` pointing to the configured MiniMax M3 key env, and no false/off LLM override; include one subcase with `ORDERK_JIANLING_LLM_ENABLED_<PROFILE>` unset to prove v41 default-on behavior.
 
 Pass:
 - 10 daily runs, one weekly run at 2026-06-07, and one monthly run at 2026-06-10 complete with `provider_status=called_live`;
