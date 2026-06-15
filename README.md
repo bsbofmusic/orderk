@@ -1,6 +1,6 @@
 # orderk
 
-orderk is a tiny, local retrieval blade for Obsidian Markdown vaults, with an optional built-in Markdown memory compiler called Jianling. Current release target: `v0.1.27`.
+orderk is a tiny, local retrieval blade for Obsidian Markdown vaults, with an optional built-in Markdown memory compiler called Jianling. Current production line: `v0.1.28` / V4 Jianling historian reflection.
 
 By default it turns your vault into fast, structured read-only evidence for humans, scripts, and AI agents. When explicitly enabled, `orderk jianling` can also write generated Markdown digests only under `brain/`, with receipts and source anchors under `.orderk/jianling/`. Raw notes and raw transcripts remain human-owned source of truth.
 
@@ -28,7 +28,7 @@ It is built for people who want better recall without giving another app permiss
 
 | Feature | Benefit |
 |---|---|
-| Single Rust binary | Small surface area and fast startup. The current Linux x64 release build is 10,774,304 bytes, about 10.3 MiB, under a 30 MiB release-gate ceiling. |
+| Single Rust binary | Small surface area and fast startup. The active production Linux x64 build is still comfortably under the 30 MiB release-gate ceiling. |
 | On-demand search CLI | Search/index/get/status are one command, one result, then exit. Jianling scheduling is opt-in and uses managed systemd-user timer files rather than a resident orderk server. |
 | Low runtime memory | A live search probe on the maintainer machine used about 9.2 MiB VmRSS and 12.3 MiB VmPeak, under a 15 MiB baseline ceiling. |
 | Disposable SQLite index | Files, chunks, embeddings, FTS, vector rows, settings, and feedback live in one rebuildable DB. Delete the index and your Markdown vault is still intact. |
@@ -36,7 +36,7 @@ It is built for people who want better recall without giving another app permiss
 | Metadata-aware reranking | Paths, headings, tags, frontmatter, confidence, status, source type, and link evidence can influence rank without an LLM rewrite step. |
 | Retrieval workflow controls | Opt-in chunk overlap, deterministic query expansion, JSON Lines output, and eval A/B give agents and maintainers more control. A real SiliconFlow `Qwen/Qwen3-Reranker-4B` model reranker runs by default for second-pass ranking quality. |
 | Obsidian-native evidence | Results can include snippets, headings, tags, wikilinks, backlinks, neighbor chunks, score breakdowns, and routing timings, so agents can explain what they found. |
-| Cheap embeddings by default | Production defaults use SiliconFlow + `BAAI/bge-m3` (`1024` dimensions), which is strong enough for everyday personal-vault recall without paying for a large memory platform. |
+| Cheap embeddings by default | Standalone CLI examples keep using SiliconFlow + `BAAI/bge-m3` (`1024` dimensions); the maintained production profile uses `Qwen/Qwen3-Embedding-4B` with Qwen3 reranking. |
 | Read-only agent surface | CLI search and MCP expose retrieval, status, and health. They do not expose note writing, save, forget, chat, or index mutation tools. |
 | Obsidian workflow stays intact | No migration, no hosted workspace, no lock-in. Try it, rebuild it, or remove it without changing your notes. |
 
@@ -181,12 +181,12 @@ Agent
 | Obsidian desktop plugin | Source-only wrapper in `packages/obsidian`; not published as a maintained npm package |
 | Core Rust retrieval engine | `crates/orderk-core` |
 
-## Production defaults
+## Production/default profiles
 
-- **Embedding provider**: `siliconflow`
-- **Embedding model**: `BAAI/bge-m3`
-- **Embedding dimension**: `1024`
-- **Vector backend**: `sqlite_vec`
+There are two defaults to keep distinct:
+
+- **Standalone CLI example/default**: `siliconflow` + `BAAI/bge-m3` + `1024` + `sqlite_vec`. This is what the quick-start examples show.
+- **Maintainer production profile**: `siliconflow` + `Qwen/Qwen3-Embedding-4B` + `1024` + `sqlite_vec`, with `Qwen/Qwen3-Reranker-4B` available for the normal rerank path. This is the active Obsidian/Jianling deployment profile.
 
 Set one of these environment variables before indexing or searching:
 
@@ -321,7 +321,7 @@ orderk jianling validate-file --vault /path/to/vault --file brain/daily/2026-06-
 orderk jianling validate-run --vault /path/to/vault --run-id <run-id>
 ```
 
-Jianling is still conservative, but no longer a stub: deterministic digest generation, systemd-user scheduler templates, receipt/evidence/watermark sidecars, validators, live Anthropic-compatible MiniMax M3 reflection, and a Kanban writer/auditor/foreman hard gate are wired into the product path. LLM reflection is explicit: it only runs when `ORDERK_JIANLING_LLM_ENABLED_<PROFILE>=1` (or global `ORDERK_JIANLING_LLM_ENABLED=1`) and credentials are provided through environment variables such as `ORDERK_SWORD_LLM_API_KEY_ENV`. Provider errors fail closed instead of writing fake-success reflection text. Query-time search still uses the read-only retrieval path.
+Jianling is conservative but production-wired: systemd-user scheduling, receipt/evidence/watermark sidecars, validators, live Anthropic-compatible MiniMax M3 reflection, bounded post-write index feedback, and a Kanban writer/auditor/foreman hard gate are in the product path. The current V4 historian line makes the live LLM diary the human-facing reflection layer (`今日主线 / 客观底账 / 我的看法 / 跟前几天连起来看 / 还没完的事`) while keeping the deterministic ledger as auditable evidence. LLM activation is resolved as per-profile override, then global override, then default-on when a valid LLM chain/key-env pointer is configured; provider errors are recorded as live-call failures rather than fake-success reflection text. Raw API key values must never be stored in generated Markdown, receipts, docs, or repo config. Query-time search still uses the read-only retrieval path.
 
 The generated Markdown path is a hard-gated pipeline, not a receipt afterthought:
 
