@@ -38,7 +38,7 @@ orderk jianling chat-smoke --vault /path/to/vault
 orderk jianling validate-run --vault /path/to/vault --run-id <run-id>
 ```
 
-Jianling writes generated Markdown only under `brain/` and only after its Kanban writer/auditor/foreman hard gate accepts the run. Writer cards include `draft_markdown` and `draft_hash`; auditor cards check format, traceability, source-anchor coverage, and hash integrity; the foreman controls the final write. Live MiniMax M3 reflection is explicit via `ORDERK_JIANLING_LLM_ENABLED_<PROFILE>=1` plus environment-based credentials such as `ORDERK_SWORD_LLM_API_KEY_ENV`; provider failures fail closed.
+Jianling writes generated Markdown only under `brain/` and only after its Kanban writer/auditor/foreman hard gate accepts the run. Writer cards include `draft_markdown` and `draft_hash`; auditor cards check format, traceability, source-anchor coverage, and hash integrity; the foreman controls the final write. In the current v41 line, live MiniMax M3 reflection resolves as per-profile override, then global override, then default-on when a valid LLM chain/key-env pointer such as `ORDERK_SWORD_LLM_API_KEY_ENV` exists; explicit false/off overrides remain the kill switch, and provider failures fail closed.
 
 ## Environment
 
