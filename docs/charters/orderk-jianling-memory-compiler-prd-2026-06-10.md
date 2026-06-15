@@ -1223,7 +1223,7 @@ orderk jianling run --mode daily --date 2026-06-10 --json
 orderk jianling run --mode weekly --date 2026-06-07 --json
 orderk jianling run --mode monthly --date 2026-06-10 --json
 orderk jianling run --dry-run --mode daily --date 2026-06-10 --json
-# Live reflection requires explicit env/profile switch, e.g. ORDERK_JIANLING_LLM_ENABLED_DEFAULT=1
+# Optional override: v41 defaults live reflection on when a valid LLM chain/key pointer exists.
 ```
 
 ### 13.3 Review / apply / rollback
@@ -1442,7 +1442,7 @@ If budgets are exceeded, job must degrade/queue rather than run away.
 - OrderK-managed schedule install/status/disable works and reports scheduler owner/backend;
 - On Linux P0, installing OrderK + configuring LLM + `orderk jianling enable` can produce a scheduled next run without Hermes/agent/external scripts;
 - Timer mode resident daemon count remains 0 except short-lived `orderk jianling run` worker; server-loop mode reports its resident process explicitly;
-- Missing LLM config fails closed for live reflection and is visible in `chat-smoke` / `self-check` receipts; a configured LLM without `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]` remains explicitly inactive, not implicitly called;
+- Missing LLM config fails closed for live reflection and is visible in `chat-smoke` / `self-check` receipts; current v41 live activation resolves as per-profile override, then global override, then default-on when a valid chain/key-env pointer exists; explicit false/off overrides intentionally disable the live call;
 - Raw transcripts are never mutated;
 - Generated output is Markdown with valid frontmatter;
 - Every `active_generated` or `active_user_approved` card has source refs and passes source-anchor resolution;
@@ -1553,11 +1553,11 @@ Pass:
 - dry-run collects sources and reports; deterministic run writes guarded generated Markdown only, never raw transcripts;
 - self-check must make broken LLM/lock/path/timer/receipt state visible without waiting for a user complaint.
 
-### Phase 2 — Explicit-switch LLM provider + daily compiler MVP
+### Phase 2 — LLM provider activation + daily compiler MVP
 
 - Implement Anthropic-compatible MiniMax M3 live slot using Sword model profile plumbing and `ORDERK_SWORD_LLM_API_KEY_ENV` indirection;
 - `chat-smoke` performs the live LLM probe and writes redacted smoke receipt;
-- `jianling run` calls live LLM only when `ORDERK_JIANLING_LLM_ENABLED[_PROFILE]` is true; otherwise it stays deterministic and records the explicit inactive status;
+- `jianling run` calls live LLM when v41 activation resolves true: per-profile override, global override, or default-on through a valid LLM chain/key-env pointer; false/off overrides record intentional inactive status;
 - cloud consent and guard statuses;
 - bounded evidence bundle with fail-closed or explicit partial/chunk/foreman metadata;
 - write one daily digest with optional live reflection section and automatic single-file index feedback + retrieval smoke; full structured card extraction, proposal apply/revert UX, full-vault strategy, and claim-level explain remain later gates;
