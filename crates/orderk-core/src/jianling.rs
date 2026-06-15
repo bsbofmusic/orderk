@@ -16,15 +16,29 @@ use crate::api::{
     index_paths_with_options, provider_from_name, query_with_options, status as orderk_status,
 };
 use crate::models::{IndexOptions, IndexPathOptions, IndexSummary, QueryOptions, VectorBackend};
-use crate::profiles::{resolve_sword_model_profile_from_env, SwordModelSlot};
+use crate::profiles::{resolve_llm_chain, resolve_sword_model_profile_from_env, SwordModelSlot};
 use crate::scanner::scan_vault;
 
 const CONTROL_ROOT: &str = ".orderk/jianling";
 const JIANLING_VERSION: &str = "0.1";
 const JIANLING_CHUNK_SIZE: usize = 40;
 const DEFAULT_ANTHROPIC_MINIMAX_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
+const DEFAULT_OPENAI_COMPAT_BASE_URL: &str = "https://api.openai.com";
 const JIANLING_LLM_MAX_TOKENS: u32 = 2000;
+const JIANLING_CHAT_SYSTEM_PROMPT: &str =
+    "Return only the requested Markdown text. Do not include thinking, code fences, or extra explanation.";
 const JIANLING_DAILY_BACKGROUND_DAYS: i64 = 7;
+/// Per-source body cap (chars, after one-line compaction) when feeding evidence
+/// to the LLM. theme_excerpt can be ~8000 chars; we trim each source so a single
+/// huge transcript cannot crowd out the rest.
+const JIANLING_LLM_EVIDENCE_PER_SOURCE_CHARS: usize = 1600;
+/// Maximum number of sources fed to the LLM in one section. Replaces the old
+/// hardcoded `.take(12)`; with the cleaned theme_excerpt this covers a typical
+/// day's transcripts without truncating most sources out of view.
+const JIANLING_LLM_EVIDENCE_MAX_SOURCES: usize = 24;
+/// Total char budget across all sources in one evidence section (the binding
+/// limit that keeps M3 input within context regardless of per-source size).
+const JIANLING_LLM_EVIDENCE_TOTAL_CHARS: usize = 28000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -226,6 +240,13 @@ struct JianlingTopicEntry {
     modes_seen: Vec<String>,
     latest_next_action: String,
     promotion_status: String,
+    /// Distinct calendar dates (YYYY-MM-DD) on which this topic was observed.
+    /// Drives cross-day emergence: same-day re-runs do not inflate it, only
+    /// genuine recurrence across days does. Back-compat: missing in old ledgers
+    /// (serde default = empty); historical cross-day counts cannot be recovered
+    /// from occurrence hashes, so an upgraded entry conservatively restarts.
+    #[serde(default)]
+    distinct_dates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -509,6 +530,10 @@ struct EvidenceSource {
     hash: String,
     chars: usize,
     excerpt: String,
+    /// For conversation transcripts: a cleaned body (frontmatter/metadata/
+    /// message headers/fences stripped) used for theme extraction only.
+    /// Anchor `quote_hash` still uses the short `excerpt` (contract stability).
+    theme_excerpt: Option<String>,
 }
 
 pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<JianlingRunReport> {
@@ -572,11 +597,19 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             source_file_hash: format!("sha256:{}", file.hash),
             source_tier: source_tier_for_path(&file.path).to_string(),
         });
+        // For conversation transcripts, prepare a cleaned body for theme extraction
+        // (separate from the short anchor excerpt used for quote_hash stability).
+        let theme_excerpt = if file.path.starts_with("raw/transcripts/") {
+            Some(transcript_body_for_themes(&raw))
+        } else {
+            None
+        };
         evidence_sources.push(EvidenceSource {
             path: file.path.clone(),
             hash: format!("sha256:{}", file.hash),
             chars: raw.chars().count(),
             excerpt,
+            theme_excerpt,
         });
     }
     // Background (BG#) anchors/sources: prior generated daily reflections used as
@@ -595,11 +628,17 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
             source_file_hash: format!("sha256:{}", file.hash),
             source_tier: source_tier_for_path(&file.path).to_string(),
         });
+        let theme_excerpt = if file.path.starts_with("raw/transcripts/") {
+            Some(transcript_body_for_themes(&raw))
+        } else {
+            None
+        };
         background_sources.push(EvidenceSource {
             path: file.path.clone(),
             hash: format!("sha256:{}", file.hash),
             chars: raw.chars().count(),
             excerpt,
+            theme_excerpt,
         });
     }
     let (source_raw_truth_files, source_generated_memory_files) =
@@ -619,84 +658,98 @@ pub fn jianling_run(vault: &Path, options: &JianlingRunOptions) -> Result<Jianli
         &selection.rejected_paths,
     );
     if !options.dry_run && jianling_live_llm_enabled(&profile) {
-        if let Some(reflection) = generate_live_llm_reflection(LiveReflectionInput {
-            profile: &profile,
-            mode: &options.mode,
-            date: &date,
-            run_id: &run_id,
-            anchors: &source_anchors,
-            sources: &evidence_sources,
-            background_anchors: &background_anchors,
-            background_sources: &background_sources,
-            source_total_files: selection.total_files,
-            rejected_source_files: &selection.rejected_paths,
-        })? {
-            match validate_live_llm_reflection_contract(&reflection, &source_anchors) {
-                Ok(()) => {
-                    provider_status = "called_live".to_string();
-                    generated_body.push_str("\n### LLM reflection (MiniMax M3)\n");
-                    generated_body.push_str(reflection.trim());
-                    generated_body.push('\n');
-                }
-                Err(err) => {
-                    let validation_error = err.to_string();
-                    let repair = repair_live_llm_reflection(
-                        LiveReflectionInput {
-                            profile: &profile,
-                            mode: &options.mode,
-                            date: &date,
-                            run_id: &run_id,
-                            anchors: &source_anchors,
-                            sources: &evidence_sources,
-                            background_anchors: &background_anchors,
-                            background_sources: &background_sources,
-                            source_total_files: selection.total_files,
-                            rejected_source_files: &selection.rejected_paths,
-                        },
-                        &reflection,
-                        &validation_error,
-                    );
-                    match repair {
-                        Ok(Some(repaired)) => {
-                            match validate_live_llm_reflection_contract(&repaired, &source_anchors)
-                            {
-                                Ok(()) => {
-                                    provider_status = "called_live".to_string();
-                                    warnings.push(format!(
+        match generate_live_llm_reflection(
+            LiveReflectionInput {
+                profile: &profile,
+                mode: &options.mode,
+                date: &date,
+                run_id: &run_id,
+                anchors: &source_anchors,
+                sources: &evidence_sources,
+                background_anchors: &background_anchors,
+                background_sources: &background_sources,
+                source_total_files: selection.total_files,
+                rejected_source_files: &selection.rejected_paths,
+                vault: &vault,
+            },
+            &mut warnings,
+        ) {
+            Ok(Some(reflection)) => {
+                match validate_live_llm_reflection_contract(&reflection, &source_anchors) {
+                    Ok(()) => {
+                        provider_status = "called_live".to_string();
+                        generated_body = render_llm_primary_digest(&generated_body, &reflection);
+                    }
+                    Err(err) => {
+                        let validation_error = err.to_string();
+                        let repair = repair_live_llm_reflection(
+                            LiveReflectionInput {
+                                profile: &profile,
+                                mode: &options.mode,
+                                date: &date,
+                                run_id: &run_id,
+                                anchors: &source_anchors,
+                                sources: &evidence_sources,
+                                background_anchors: &background_anchors,
+                                background_sources: &background_sources,
+                                source_total_files: selection.total_files,
+                                rejected_source_files: &selection.rejected_paths,
+                                vault: &vault,
+                            },
+                            &reflection,
+                            &validation_error,
+                        );
+                        match repair {
+                            Ok(Some(repaired)) => {
+                                match validate_live_llm_reflection_contract(
+                                    &repaired,
+                                    &source_anchors,
+                                ) {
+                                    Ok(()) => {
+                                        provider_status = "called_live".to_string();
+                                        warnings.push(format!(
                                         "live LLM reflection repaired after initial contract rejection: {validation_error}"
                                     ));
-                                    generated_body.push_str("\n### LLM reflection (MiniMax M3)\n");
-                                    generated_body.push_str(repaired.trim());
-                                    generated_body.push('\n');
-                                }
-                                Err(repair_err) => {
-                                    provider_status = "called_live_schema_invalid".to_string();
-                                    fallback_used = true;
-                                    llm_contract_degraded = true;
-                                    warnings.push(format!(
+                                        generated_body =
+                                            render_llm_primary_digest(&generated_body, &repaired);
+                                    }
+                                    Err(repair_err) => {
+                                        provider_status = "called_live_schema_invalid".to_string();
+                                        fallback_used = true;
+                                        llm_contract_degraded = true;
+                                        warnings.push(format!(
                                         "live LLM reflection rejected by digest.v2 contract: {validation_error}; repair also failed: {repair_err}"
                                     ));
+                                    }
                                 }
                             }
-                        }
-                        Ok(None) => {
-                            provider_status = "called_live_schema_invalid".to_string();
-                            fallback_used = true;
-                            llm_contract_degraded = true;
-                            warnings.push(format!(
+                            Ok(None) => {
+                                provider_status = "called_live_schema_invalid".to_string();
+                                fallback_used = true;
+                                llm_contract_degraded = true;
+                                warnings.push(format!(
                                 "live LLM reflection rejected by digest.v2 contract: {validation_error}; repair unavailable"
                             ));
-                        }
-                        Err(repair_err) => {
-                            provider_status = "called_live_schema_invalid".to_string();
-                            fallback_used = true;
-                            llm_contract_degraded = true;
-                            warnings.push(format!(
+                            }
+                            Err(repair_err) => {
+                                provider_status = "called_live_schema_invalid".to_string();
+                                fallback_used = true;
+                                llm_contract_degraded = true;
+                                warnings.push(format!(
                                 "live LLM reflection rejected by digest.v2 contract: {validation_error}; repair call failed: {repair_err}"
                             ));
+                            }
                         }
                     }
                 }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                provider_status = "called_live_error".to_string();
+                fallback_used = true;
+                warnings.push(format!(
+                    "live LLM reflection call failed; deterministic digest written instead: {err}"
+                ));
             }
         }
     }
@@ -1261,9 +1314,6 @@ fn save_topic_ledger_atomic(path: &Path, ledger: &JianlingTopicLedger) -> Result
 
 fn topic_key_for_observation(title: &str) -> String {
     match title {
-        "Independent review preference" => "quality-review-preference".to_string(),
-        "Preserve the factual ledger" => "ledger-preservation".to_string(),
-        "Reflection must make a judgment" => "reflective-judgment".to_string(),
         "Coverage is incomplete" => "partial-coverage-risk".to_string(),
         "Evidence first" => "evidence-first".to_string(),
         "质量复查偏好" => "quality-review-preference".to_string(),
@@ -1354,7 +1404,10 @@ fn update_topic_ledger_after_success(
     let durable_refs = durable_evidence_refs_for(run_id, anchors);
     let mut changed = false;
     for observation in observations {
-        let topic_key = topic_key_for_observation(observation.title);
+        let topic_key = observation
+            .topic_key
+            .clone()
+            .unwrap_or_else(|| topic_key_for_observation(&observation.title));
         let occurrence_id = observation_occurrence_id(&topic_key, mode, date, sources, anchors);
         let entry = ledger
             .topics
@@ -1373,13 +1426,15 @@ fn update_topic_ledger_after_success(
                 modes_seen: Vec::new(),
                 latest_next_action: observation.next_action.to_string(),
                 promotion_status: "none".to_string(),
+                distinct_dates: Vec::new(),
             });
         entry.title = observation.title.to_string();
         entry.last_seen = date.to_string();
-        entry.confidence =
-            stronger_confidence(&entry.confidence, observation.confidence).to_string();
         entry.latest_next_action = observation.next_action.to_string();
         push_unique(&mut entry.modes_seen, mode.as_str().to_string());
+        // Track distinct calendar dates so confidence/promotion react to genuine
+        // cross-day recurrence rather than same-day re-runs.
+        push_unique(&mut entry.distinct_dates, date.to_string());
         for source_path in &source_paths {
             push_unique(&mut entry.source_paths, source_path.clone());
         }
@@ -1394,6 +1449,20 @@ fn update_topic_ledger_after_success(
         if !entry.seen_occurrences.contains(&occurrence_id) {
             entry.seen_occurrences.push(occurrence_id);
             entry.repeat_count = entry.seen_occurrences.len();
+            changed = true;
+        }
+        // Confidence ladder: content topics (and any topic) earn confidence by
+        // recurring across distinct days. The observation's own confidence acts
+        // as a floor (process-invariant observations stay high); cross-day
+        // recurrence can only raise it, never lower it.
+        let recurrence_confidence = confidence_for_distinct_dates(entry.distinct_dates.len());
+        let merged = stronger_confidence(
+            stronger_confidence(&entry.confidence, &observation.confidence),
+            recurrence_confidence,
+        )
+        .to_string();
+        if merged != entry.confidence {
+            entry.confidence = merged;
             changed = true;
         }
     }
@@ -1427,21 +1496,43 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
+/// Minimum number of distinct calendar dates a topic must recur on before it
+/// is eligible for a lesson proposal. Cross-day recurrence — not same-day
+/// repetition — is the real emergence signal.
+const JIANLING_PROMOTION_MIN_DISTINCT_DATES: usize = 3;
+
 fn promotion_candidates_for_mode<'a>(
     mode: &JianlingRunMode,
     ledger: &'a JianlingTopicLedger,
 ) -> Vec<&'a JianlingTopicEntry> {
-    if matches!(mode, JianlingRunMode::Daily | JianlingRunMode::Manual) {
-        return Vec::new();
-    }
+    // Daily/Manual are now eligible: a topic that genuinely recurs across days
+    // should compile into a lesson proposal without waiting for a weekly run
+    // (which, in practice, never ran). The gate is intentionally strict —
+    // cross-day recurrence + high confidence — so single-day noise can't leak.
+    let min_dates = if matches!(mode, JianlingRunMode::Daily | JianlingRunMode::Manual) {
+        JIANLING_PROMOTION_MIN_DISTINCT_DATES
+    } else {
+        // Weekly+ rollups keep the original 2-occurrence behavior.
+        2
+    };
     ledger
         .topics
         .values()
         .filter(|entry| {
-            entry.repeat_count >= 2
+            let recurrence_ok = if matches!(mode, JianlingRunMode::Daily | JianlingRunMode::Manual)
+            {
+                entry.distinct_dates.len() >= min_dates
+            } else {
+                entry.repeat_count >= min_dates
+            };
+            recurrence_ok
                 && entry.confidence == "high"
                 && entry.promotion_status != "accepted"
                 && entry.promotion_status != "superseded"
+                // Already-proposed topics wait for human review instead of being
+                // re-proposed (and re-indexed) on every subsequent daily run —
+                // this is the primary churn guard now that Daily can promote.
+                && entry.promotion_status != "proposed"
         })
         .collect()
 }
@@ -1505,6 +1596,19 @@ fn render_lesson_proposal(entry: &JianlingTopicEntry, run_id: &str, date: &str) 
     out.push_str("- owner skill candidate: only after human approval and independent audit.\n");
     out.push_str("- PRD/test-gate candidate: only through explicit repo change, not automatic memory promotion.\n");
     out
+}
+
+/// Strip the cosmetic, run-specific lines (`run_id:` and `date:`) from a lesson
+/// proposal body so two proposals for the same topic on different days compare
+/// equal. Used by the churn guard to avoid daily rewrites of unchanged lessons.
+fn lesson_proposal_semantic_body(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            !t.starts_with("run_id:") && !t.starts_with("date:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn write_promotion_proposals(
@@ -1596,6 +1700,31 @@ fn write_promotion_proposals(
         }
         ensure_plain_output_file(&target, "jianling lesson proposal")?;
         let body = render_lesson_proposal(entry, run_id, date);
+        // Churn guard: if a prior Jianling-generated `proposed` file is
+        // semantically identical (same topic evidence/judgment, ignoring the
+        // cosmetic run_id/date lines that change every run), skip the rewrite +
+        // index feedback. With Daily promotion now open, a recurring topic would
+        // otherwise be rewritten and re-indexed every single day for no change.
+        if let Some(existing_text) = existing.as_deref() {
+            if lesson_proposal_semantic_body(existing_text) == lesson_proposal_semantic_body(&body)
+            {
+                writes.push(JianlingPromotionWrite {
+                    rel_path,
+                    body: String::new(),
+                    file_op: JianlingFileOp {
+                        op: "skip".to_string(),
+                        target_path: String::new(),
+                        preimage_hash: file_hash_if_exists(&target)?,
+                        postimage_hash: String::new(),
+                        byte_count: 0,
+                        index_update_required: false,
+                    },
+                    skipped: true,
+                    warning: None,
+                });
+                continue;
+            }
+        }
         let preimage_hash = file_hash_if_exists(&target)?;
         let op = if target.exists() { "replace" } else { "create" }.to_string();
         let postimage_hash = format!("sha256:{}", sha256_hex(body.as_bytes()));
@@ -2225,13 +2354,20 @@ pub fn jianling_validate_file(
         "## User/system patterns",
         "## Open risks",
         "## Next actions",
-        "## Evidence appendix",
     ];
-    let missing_sections = required_sections
+    let mut missing_sections = required_sections
         .iter()
         .copied()
         .filter(|section| !text.contains(section))
         .collect::<Vec<_>>();
+    // Evidence appendix boundary may be the English heading (deterministic-only
+    // digest) or the bilingual heading inserted by render_llm_primary_digest when
+    // the K diary is promoted to the primary body. Accept either form so the
+    // contract does not silently break if the deterministic body heading changes.
+    if !text.contains("## Evidence appendix") && !text.contains(JIANLING_EVIDENCE_APPENDIX_HEADING)
+    {
+        missing_sections.push("## Evidence appendix");
+    }
     let sections_ok = missing_sections.is_empty();
     checks.push(check(
         "digest_v2_sections",
@@ -2820,6 +2956,40 @@ fn chunk_count_for(source_count: usize) -> usize {
     }
 }
 
+const JIANLING_EVIDENCE_APPENDIX_HEADING: &str = "## 证据附录（Evidence appendix）";
+
+fn split_digest_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let body = text.strip_prefix("---\n")?;
+    let closing = body.find("\n---\n")?;
+    let frontmatter_end = "---\n".len() + closing + "\n---\n".len();
+    Some((&text[..frontmatter_end], &text[frontmatter_end..]))
+}
+
+fn render_llm_primary_digest(deterministic_digest: &str, reflection: &str) -> String {
+    let reflection = reflection.trim();
+    let mut out = String::new();
+    if let Some((frontmatter, deterministic_body)) = split_digest_frontmatter(deterministic_digest)
+    {
+        out.push_str(frontmatter);
+        out.push('\n');
+        out.push_str(reflection);
+        out.push_str("\n\n");
+        out.push_str(JIANLING_EVIDENCE_APPENDIX_HEADING);
+        out.push('\n');
+        out.push_str(deterministic_body.trim_start());
+    } else {
+        out.push_str(reflection);
+        out.push_str("\n\n");
+        out.push_str(JIANLING_EVIDENCE_APPENDIX_HEADING);
+        out.push('\n');
+        out.push_str(deterministic_digest.trim_start());
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 fn render_jianling_digest(
     mode: &JianlingRunMode,
     date: &str,
@@ -2998,11 +3168,15 @@ fn render_jianling_digest(
 }
 
 struct ReflectiveObservation {
-    title: &'static str,
-    confidence: &'static str,
+    title: String,
+    confidence: String,
     evidence_refs: String,
-    detail: &'static str,
-    next_action: &'static str,
+    detail: String,
+    next_action: String,
+    /// Explicit ledger topic key. Content-derived observations carry their
+    /// extracted + synonym-normalized key here; deterministic fallback/coverage
+    /// observations leave it `None` and fall back to the title match table.
+    topic_key: Option<String>,
 }
 
 fn derive_reflective_observations(
@@ -3011,109 +3185,468 @@ fn derive_reflective_observations(
     rejected_source_files: &[String],
 ) -> Vec<ReflectiveObservation> {
     let mut observations = Vec::new();
-    let joined = sources
-        .iter()
-        .map(|source| source.excerpt.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_ascii_lowercase();
     let all_refs = evidence_refs_for(anchors, sources.len());
-
-    if contains_any(
-        &joined,
-        &[
-            "子代理",
-            "subagent",
-            "审计",
-            "audit",
-            "复查",
-            "review",
-            "验收",
-            "gate",
-        ],
-    ) {
-        observations.push(ReflectiveObservation {
-            title: "Independent review preference",
-            confidence: "high",
-            evidence_refs: all_refs.clone(),
-            detail: "The repeated user/process signal is independent verification: complex delivery cannot rely on one self-attestation pass; it needs subagent audit, mechanical evidence, real execution, and final acceptance together.",
-            next_action: "For complex code or release work, produce an evidence pack, run an independent subagent review, and publish only after review findings are closed.",
-        });
-    }
-
-    if contains_any(
-        &joined,
-        &[
-            "完整原文",
-            "raw",
-            "底账",
-            "source anchor",
-            "hash",
-            "证据",
-            "receipt",
-        ],
-    ) {
-        observations.push(ReflectiveObservation {
-            title: "Preserve the factual ledger",
-            confidence: "high",
-            evidence_refs: all_refs.clone(),
-            detail: "Reflection must not replace the ledger; raw truth, source anchors, hashes, receipts, and DB/index evidence must remain auditable across daily/monthly rollups.",
-            next_action: "After every reflection write, verify the receipt, source anchors, file hash, and index DB freshness before calling it second-brain memory.",
-        });
-    }
-
-    if contains_any(
-        &joined,
-        &[
-            "观察",
-            "沉淀",
-            "精炼",
-            "reflect",
-            "hindsight",
-            "灵魂",
-            "日报",
-        ],
-    ) {
-        observations.push(ReflectiveObservation {
-            title: "Reflection must make a judgment",
-            confidence: "high",
-            evidence_refs: all_refs.clone(),
-            detail: "Compressing facts is not enough; Jianling V4 must turn evidence into memorable, actionable judgments about what happened and what pattern is emerging.",
-            next_action: "Daily/monthly reflections must lead with human-readable judgment and push raw evidence down into the evidence appendix.",
-        });
-    }
 
     if !rejected_source_files.is_empty() {
         observations.push(ReflectiveObservation {
-            title: "Coverage is incomplete",
-            confidence: "medium",
+            title: "Coverage is incomplete".to_string(),
+            confidence: "medium".to_string(),
             evidence_refs: all_refs.clone(),
-            detail: "The source budget did not cover every primary source, so the reflection is only a partial conclusion and must not be promoted into global memory yet.",
-            next_action: "Increase max_source_files or inspect rejected sources before promoting the observation into durable memory.",
+            detail: "The source budget did not cover every primary source, so the reflection is only a partial conclusion and must not be promoted into global memory yet.".to_string(),
+            next_action: "Increase max_source_files or inspect rejected sources before promoting the observation into durable memory.".to_string(),
+            topic_key: None,
         });
     }
 
+    // Content-derived topics: break out of the closed 5-title echo chamber so
+    // the ledger can accumulate what the user actually keeps working on, and
+    // cross-day recurrence can eventually drive a lesson proposal.
+    observations.extend(derive_content_topic_observations(sources, &all_refs));
+
     if observations.is_empty() {
         observations.push(ReflectiveObservation {
-            title: "Evidence first",
-            confidence: if sources.is_empty() { "low" } else { "medium" },
+            title: "Evidence first".to_string(),
+            confidence: if sources.is_empty() { "low" } else { "medium" }.to_string(),
             evidence_refs: if all_refs.is_empty() {
                 "none".to_string()
             } else {
                 all_refs
             },
-            detail: "When no stable pattern is detected, keep the conclusion conservative: preserve facts, state coverage, and wait for repeated evidence before upgrading the insight.",
-            next_action: "Keep the ledger and wait for more repeated evidence instead of turning one weak signal into a durable preference.",
+            detail: "When no stable pattern is detected, keep the conclusion conservative: preserve facts, state coverage, and wait for repeated evidence before upgrading the insight.".to_string(),
+            next_action: "Keep the ledger and wait for more repeated evidence instead of turning one weak signal into a durable preference.".to_string(),
+            topic_key: None,
         });
     }
     observations
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| {
-        let needle = needle.to_ascii_lowercase();
-        haystack.contains(&needle)
-    })
+/// Maximum number of content-derived topics a single run may contribute, to
+/// prevent term-frequency explosion from flooding the ledger.
+const JIANLING_MAX_CONTENT_TOPICS: usize = 8;
+/// Minimum salience (combined: occurrence count + source spread) a candidate
+/// theme must reach before it is allowed into the ledger.
+const JIANLING_CONTENT_TOPIC_MIN_OCCURRENCES: usize = 2;
+
+/// Extract content topics from real evidence so the ledger reflects what the
+/// user keeps doing, not just the 5 hardcoded process invariants.
+///
+/// Detection runs two parallel paths (either may fire):
+///   1. structured signals (frontmatter `tags:`, `[[wikilinks]]`) when present
+///      — only meaningful for brain/article sources;
+///   2. plain-text fallback (the primary path for raw transcripts that carry
+///      no frontmatter): normalized term/bigram frequency over the excerpt,
+///      stopwords removed, top salient terms kept.
+///
+/// Normalization (a SEPARATE concern from detection) then collapses synonyms
+/// to a single stable key so recurring real topics aggregate across days.
+///
+/// Content topics enter at `low` confidence; cross-day recurrence upgrades them
+/// (see `confidence_for_distinct_dates`), which is what eventually clears the
+/// promotion gate. They never auto-promote to USER memory / skills.
+/// Clean a conversation transcript's full raw text for theme extraction: strip
+/// YAML frontmatter, fixed boilerplate, Session Metadata block, message headers
+/// (`### ... — role`), HTML comments, and code fence markers. Returns a larger
+/// sample (up to ~8000 chars) of actual dialogue content, independent of the
+/// short anchor `excerpt` (which stays at 900 chars for `quote_hash` stability).
+fn transcript_body_for_themes(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_frontmatter = false;
+    let mut in_metadata_block = false;
+    let mut skip_next_fence = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        // Track YAML frontmatter boundaries (opening --- on its own line).
+        if trimmed == "---" {
+            in_frontmatter = !in_frontmatter;
+            continue;
+        }
+        if in_frontmatter {
+            continue;
+        }
+        // Skip HTML comments (<!-- ... -->).
+        if trimmed.starts_with("<!--") {
+            continue;
+        }
+        // Skip "## Session Metadata" block until next ##.
+        if trimmed == "## Session Metadata" {
+            in_metadata_block = true;
+            continue;
+        }
+        if in_metadata_block && (trimmed.starts_with("## ") || trimmed.starts_with("# ")) {
+            in_metadata_block = false;
+            // Don't continue here; let the heading fall through to be skipped by
+            // the boilerplate check below if it's "## Transcript".
+        }
+        if in_metadata_block {
+            continue;
+        }
+        // Skip message headers: `### 2026-06-14T... — user` / `### ... — assistant`.
+        if trimmed.starts_with("### ")
+            && (trimmed.contains(" — user") || trimmed.contains(" — assistant"))
+        {
+            continue;
+        }
+        // Skip code fence markers (```text / ```), but NOT the content between them.
+        if trimmed.starts_with("```") {
+            skip_next_fence = !skip_next_fence;
+            continue;
+        }
+        // Skip fixed boilerplate lines (appears in every transcript).
+        if trimmed.starts_with("> 本文件保存") || trimmed.starts_with("> 稳定偏好") {
+            continue;
+        }
+        // Skip common section headings that carry no theme signal.
+        if trimmed == "## Transcript" || trimmed.starts_with("# 对话原话") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        // Budget: cap at ~8000 chars to keep memory bounded (transcripts can be 45KB+).
+        if out.len() > 8000 {
+            break;
+        }
+    }
+    out
+}
+
+/// Extract theme signal from a transcript's `title:` or `session_title:` frontmatter
+/// field, stripping the fixed prefix "对话原话 - " and trailing " #数字"序号.
+/// Returns None if the title is missing, generic, or too short after cleaning.
+fn extract_title_theme(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix("title:")
+            .or_else(|| trimmed.strip_prefix("session_title:"))
+        {
+            let title = rest.trim().trim_matches('"');
+            // Strip fixed prefix "对话原话 - " (appears in every transcript).
+            let cleaned = title.strip_prefix("对话原话 - ").unwrap_or(title).trim();
+            // Strip trailing " #数字" sequence number.
+            let cleaned = cleaned
+                .rsplit_once(" #")
+                .map(|(prefix, _)| prefix)
+                .unwrap_or(cleaned)
+                .trim();
+            // Reject if empty or too short after stripping.
+            if cleaned.chars().count() >= 3 {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn derive_content_topic_observations(
+    sources: &[EvidenceSource],
+    all_refs: &str,
+) -> Vec<ReflectiveObservation> {
+    use std::collections::HashMap;
+
+    if sources.is_empty() {
+        return Vec::new();
+    }
+
+    // candidate key -> (occurrence count, set of source paths it appeared in, display label)
+    let mut counts: HashMap<String, (usize, std::collections::BTreeSet<String>, String)> =
+        HashMap::new();
+
+    let mut bump = |key: String, label: String, source_path: &str, weight: usize| {
+        let entry = counts
+            .entry(key)
+            .or_insert_with(|| (0, std::collections::BTreeSet::new(), label));
+        entry.0 += weight;
+        entry.1.insert(source_path.to_string());
+    };
+
+    // Step 3: Title strong signal — extract theme from transcript title before
+    // scanning the body. Titles are human-written topic summaries (high信噪比).
+    for source in sources {
+        if source.path.starts_with("raw/transcripts/") {
+            // Title lives in the original excerpt (short frontmatter sample),
+            // not the cleaned theme_excerpt.
+            if let Some(title_theme) = extract_title_theme(&source.excerpt) {
+                // Weight=4: title is the strongest programmatic signal.
+                for (raw, freq) in extract_plaintext_theme_terms(&title_theme) {
+                    if let Some((key, label)) = normalize_content_theme(&raw) {
+                        bump(key, label, &source.path, freq * 4);
+                    }
+                }
+            }
+        }
+    }
+
+    for source in sources {
+        let excerpt = source.theme_excerpt.as_deref().unwrap_or(&source.excerpt);
+        // Path 1: structured signals (tags + wikilinks). An explicit tag /
+        // wikilink is an intentional signal, weighted as one occurrence each.
+        for raw in extract_structured_theme_terms(excerpt) {
+            if let Some((key, label)) = normalize_content_theme(&raw) {
+                bump(key, label, &source.path, 1);
+            }
+        }
+        // Path 2: plain-text fallback (primary for raw transcripts). Carries the
+        // in-excerpt frequency so a term repeated within one transcript counts
+        // as genuinely salient even when there is only a single source.
+        for (raw, freq) in extract_plaintext_theme_terms(excerpt) {
+            if let Some((key, label)) = normalize_content_theme(&raw) {
+                bump(key, label, &source.path, freq);
+            }
+        }
+    }
+
+    // Salience: total occurrences + source spread must clear the floor.
+    let mut ranked: Vec<(String, usize, usize, String)> = counts
+        .into_iter()
+        .map(|(key, (occ, paths, label))| (key, occ, paths.len(), label))
+        .filter(|(_, occ, spread, _)| {
+            *occ >= JIANLING_CONTENT_TOPIC_MIN_OCCURRENCES || *spread >= 2
+        })
+        .collect();
+    // Strongest signal first: source spread, then raw occurrences, then key for stability.
+    ranked.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(JIANLING_MAX_CONTENT_TOPICS);
+
+    ranked
+        .into_iter()
+        .map(|(key, occ, spread, label)| ReflectiveObservation {
+            title: format!("Recurring focus: {label}"),
+            // Content topics start conservative; cross-day recurrence upgrades
+            // them. confidence is recomputed in the ledger from distinct_dates.
+            confidence: "low".to_string(),
+            evidence_refs: all_refs.to_string(),
+            detail: format!(
+                "The evidence repeatedly centers on `{label}` (occurrences={occ}, sources={spread}). This is a content theme the user keeps engaging with, tracked for cross-day emergence rather than treated as an immediate durable conclusion."
+            ),
+            next_action: format!(
+                "Watch whether `{label}` recurs across multiple days; only after sustained cross-day recurrence should it be considered for a lesson proposal."
+            ),
+            topic_key: Some(key),
+        })
+        .collect()
+}
+
+/// Extract structured theme terms: frontmatter `tags:` and `[[wikilinks]]`.
+/// Returns raw (un-normalized) terms; empty for plain transcripts.
+fn extract_structured_theme_terms(excerpt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    // [[wikilinks]] anywhere in the excerpt.
+    let bytes = excerpt.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(close) = excerpt[i + 2..].find("]]") {
+                let inner = &excerpt[i + 2..i + 2 + close];
+                let term = inner.split('|').next().unwrap_or(inner).trim();
+                if !term.is_empty() {
+                    out.push(term.to_string());
+                }
+                i = i + 2 + close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // frontmatter `tags:` line(s): `tags: a, b` or `tags: [a, b]`.
+    for line in excerpt.lines() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower
+            .strip_prefix("tags:")
+            .or_else(|| lower.strip_prefix("- tags:"))
+        {
+            // Re-slice on the original line to keep case for labels.
+            let orig_rest = &trimmed[trimmed.len() - rest.len()..];
+            for tag in orig_rest
+                .trim_matches(|c: char| c == '[' || c == ']' || c.is_whitespace())
+                .split([',', ' '])
+            {
+                let tag = tag.trim().trim_start_matches('#');
+                if !tag.is_empty() {
+                    out.push(tag.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Plain-text fallback theme extraction: ASCII word frequency + CJK bigram
+/// frequency over the excerpt, stopwords removed, top salient terms kept.
+/// This is the primary path for raw transcripts with no frontmatter. Returns
+/// `(term, in_excerpt_frequency)` so callers can weight by salience.
+fn extract_plaintext_theme_terms(excerpt: &str) -> Vec<(String, usize)> {
+    use std::collections::HashMap;
+    let mut freq: HashMap<String, usize> = HashMap::new();
+
+    // ASCII tokens (length >= 3, not a stopword).
+    let mut current = String::new();
+    for ch in excerpt.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            if current.chars().count() >= 3 && !is_jianling_theme_stopword(&current) {
+                *freq.entry(current.clone()).or_insert(0) += 1;
+            }
+            current.clear();
+        }
+    }
+    if current.chars().count() >= 3 && !is_jianling_theme_stopword(&current) {
+        *freq.entry(current.clone()).or_insert(0) += 1;
+    }
+
+    // CJK bigrams (consecutive non-ASCII alphanumerics).
+    let cjk: Vec<char> = excerpt
+        .chars()
+        .filter(|c| !c.is_ascii() && c.is_alphanumeric())
+        .collect();
+    for window in cjk.windows(2) {
+        let bigram: String = window.iter().collect();
+        *freq.entry(bigram).or_insert(0) += 1;
+    }
+
+    // Keep only terms that appear at least twice within this excerpt, then take
+    // the strongest few (capped to limit downstream salience work).
+    let mut ranked: Vec<(String, usize)> = freq.into_iter().filter(|(_, n)| *n >= 2).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(12);
+    ranked
+}
+
+/// Stopwords for theme extraction (English + romanized noise). Kept local so
+/// the archived sword_spirit list stays decoupled.
+fn is_jianling_theme_stopword(value: &str) -> bool {
+    matches!(
+        value,
+        // English stopwords (虚词).
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "from"
+            | "this"
+            | "that"
+            | "you"
+            | "are"
+            | "was"
+            | "were"
+            | "not"
+            | "but"
+            | "into"
+            | "about"
+            | "have"
+            | "has"
+            | "had"
+            | "will"
+            | "can"
+            | "use"
+            | "uses"
+            | "using"
+            | "see"
+            | "note"
+            | "notes"
+            | "your"
+            | "they"
+            | "them"
+            | "what"
+            | "when"
+            | "then"
+            | "than"
+            | "there"
+            | "here"
+            | "which"
+            | "would"
+            | "could"
+            | "should"
+            | "also"
+            | "just"
+            | "only"
+            | "more"
+            | "most"
+            | "some"
+            | "any"
+            | "all"
+            | "one"
+            | "two"
+            | "out"
+            | "its"
+            | "his"
+            | "her"
+            | "our"
+            // Transcript structural noise (框架词,永远不是用户主题).
+            | "raw"
+            | "conversation"
+            | "transcript"
+            | "source"
+            | "source-evidence"
+            | "text"  // code fence marker `text`
+            | "redacted"
+            | "compaction"
+            | "reference"
+            | "summary"
+            | "metadata"
+            | "session"
+            | "sha256"
+            | "type"
+            | "status"
+            | "trust"
+            | "tier"
+            | "primary"
+            | "archived"
+            | "started"
+            | "ended"
+    )
+}
+
+/// Normalize a raw theme term into a stable `(topic_key, display_label)`.
+/// Synonyms collapse to one key so the same real topic aggregates across days.
+/// Returns `None` if the term is too short/empty to be a meaningful topic.
+fn normalize_content_theme(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.chars().count() < 2 {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // Synonym table (normalization, NOT detection): map known aliases to a
+    // canonical key + label. Extend freely; this is a growable map, not a
+    // closed match that gates what can be detected.
+    let (key, label): (String, String) = match lower.as_str() {
+        "orderk" | "order-k" | "剑灵" | "jianling" | "sword" | "swordspirit" => {
+            ("orderk".to_string(), "orderk".to_string())
+        }
+        "hermes" | "赫尔墨斯" => ("hermes".to_string(), "hermes".to_string()),
+        "obsidian" | "vault" | "第二大脑" | "二脑" => {
+            ("second-brain".to_string(), "second-brain".to_string())
+        }
+        "codex" => ("codex".to_string(), "codex".to_string()),
+        "minimax" | "m3" => ("minimax".to_string(), "minimax".to_string()),
+        "审计" | "audit" => ("audit".to_string(), "audit".to_string()),
+        "反思" | "reflect" | "reflection" => ("reflection".to_string(), "reflection".to_string()),
+        other => {
+            let key = slugify_topic_key(other);
+            if key == "observed-pattern" {
+                return None;
+            }
+            (format!("content-{key}"), other.to_string())
+        }
+    };
+    Some((key, label))
+}
+
+/// Confidence ladder driven by cross-day recurrence: a content topic earns
+/// trust by reappearing on distinct calendar days, which is exactly what the
+/// promotion gate requires. 1 day = low, 2 = medium, >=3 = high.
+fn confidence_for_distinct_dates(days: usize) -> &'static str {
+    match days {
+        0 | 1 => "low",
+        2 => "medium",
+        _ => "high",
+    }
 }
 
 fn evidence_refs_for(anchors: &[JianlingSourceAnchor], count: usize) -> String {
@@ -3125,6 +3658,23 @@ fn evidence_refs_for(anchors: &[JianlingSourceAnchor], count: usize) -> String {
         .join(" ")
 }
 
+/// Soft contract for the K historian reflection (digest.v3).
+///
+/// The old contract hard-required three English headings
+/// (`### Observations/### Open risks/### Next actions`) plus `confidence:`/`next:`
+/// markers. That rigidity was the root cause of M3 schema-fail (M3 reliably
+/// refused to emit `### Next actions`), and it is incompatible with the K
+/// first-person Chinese diary. We keep only the auditable hard constraints and
+/// drop the cosmetic structure:
+///
+/// HARD (reject):
+///   - empty text;
+///   - cites no real today-evidence `[S#]` anchor ("凡事有据");
+///   - contains code fences (` ``` `), which pollute the vault note;
+///
+/// SOFT (allowed): any heading depth, any language, free-form narrative.
+/// Heading-shape and section-name checks are intentionally removed so the
+/// historian can write `## 今日主线 / ## 客观底账 / ## 我的看法 ...`.
 fn validate_live_llm_reflection_contract(
     text: &str,
     anchors: &[JianlingSourceAnchor],
@@ -3133,60 +3683,18 @@ fn validate_live_llm_reflection_contract(
     if trimmed.is_empty() {
         return Err(anyhow!("empty reflection"));
     }
-    for required in ["### Observations", "### Open risks", "### Next actions"] {
-        if !trimmed.contains(required) {
-            return Err(anyhow!("missing required LLM section {required}"));
-        }
-    }
-    if !trimmed.contains("confidence:") {
-        return Err(anyhow!("missing confidence marker"));
-    }
-    let has_known_anchor = anchors.iter().any(|anchor| {
-        let marker = format!("[{}]", anchor.id);
-        trimmed.contains(&marker)
-    });
-    if !has_known_anchor {
-        return Err(anyhow!("missing known source anchor citation"));
-    }
-    let observation_body = trimmed
-        .split("### Observations")
-        .nth(1)
-        .and_then(|tail| tail.split("### Open risks").next())
-        .unwrap_or("");
-    // Background [BG#] anchors are read-only context and must never satisfy the
-    // evidence-citation requirement. Observations must cite at least one real
-    // today-evidence [S#] anchor that exists in the source set.
-    let observation_cites_today_evidence = anchors.iter().any(|anchor| {
-        anchor.id.starts_with('S') && observation_body.contains(&format!("[{}]", anchor.id))
-    });
-    if !observation_cites_today_evidence {
-        return Err(anyhow!(
-            "observations must cite at least one today-evidence [S#] anchor (background [BG#] does not count)"
-        ));
-    }
-    let has_observation_next = observation_body
-        .lines()
-        .any(|line| line.to_ascii_lowercase().contains("next:"));
-    if !has_observation_next {
-        return Err(anyhow!("missing next action in observation section"));
-    }
-    let allowed_headings = ["### Observations", "### Open risks", "### Next actions"];
-    for line in trimmed.lines().map(str::trim_start) {
-        if line.starts_with("# ") || line.starts_with("## ") {
-            return Err(anyhow!(
-                "top-level headings are not allowed in LLM reflection"
-            ));
-        }
-        if line.starts_with("### ")
-            && !allowed_headings
-                .iter()
-                .any(|heading| line.starts_with(heading))
-        {
-            return Err(anyhow!("unexpected LLM reflection heading: {line}"));
-        }
-    }
     if trimmed.contains("```") {
         return Err(anyhow!("code fences are not allowed in reflection"));
+    }
+    // Must cite at least one real today-evidence [S#] anchor that exists in the
+    // source set. Background [BG#] anchors are read-only context and never count.
+    let cites_today_evidence = anchors
+        .iter()
+        .any(|anchor| anchor.id.starts_with('S') && trimmed.contains(&format!("[{}]", anchor.id)));
+    if !cites_today_evidence {
+        return Err(anyhow!(
+            "reflection must cite at least one today-evidence [S#] anchor (background [BG#] does not count)"
+        ));
     }
     Ok(())
 }
@@ -3930,26 +4438,63 @@ fn jianling_llm_profile_label() -> String {
 }
 
 fn jianling_provider_status_for_dry_run(dry_run: bool, profile: &str) -> String {
-    match resolve_sword_model_profile_from_env() {
-        Ok(profile) if profile.llm.provider == "disabled" => "disabled".to_string(),
-        Ok(profile) if profile.llm.api_key_configured && dry_run => {
-            "configured_not_called_dry_run".to_string()
-        }
-        Ok(model_profile)
-            if model_profile.llm.api_key_configured && !jianling_live_llm_enabled(profile) =>
-        {
+    match resolve_llm_chain() {
+        Ok(chain) if chain.is_empty() => match resolve_sword_model_profile_from_env() {
+            Ok(profile) if profile.llm.provider == "disabled" => "disabled".to_string(),
+            Ok(_) => "llm_unconfigured_skipped".to_string(),
+            Err(err) => format!("profile_error:{err}"),
+        },
+        Ok(_) if dry_run => "configured_not_called_dry_run".to_string(),
+        Ok(chain) if !jianling_live_llm_enabled_with_chain(profile, !chain.is_empty()) => {
             "configured_inactive_explicit_switch_off".to_string()
         }
-        Ok(model_profile) if model_profile.llm.api_key_configured => {
-            "configured_pending_live_call".to_string()
-        }
-        Ok(_) => "llm_unconfigured_skipped".to_string(),
+        Ok(_) => "configured_pending_live_call".to_string(),
         Err(err) => format!("profile_error:{err}"),
     }
 }
 
 fn jianling_live_llm_enabled(profile: &str) -> bool {
-    let suffix = profile
+    let chain_has_valid_slot = resolve_llm_chain()
+        .map(|chain| !chain.is_empty())
+        .unwrap_or(false);
+    jianling_live_llm_enabled_with_chain(profile, chain_has_valid_slot)
+}
+
+fn jianling_live_llm_enabled_with_chain(profile: &str, chain_has_valid_slot: bool) -> bool {
+    let suffix = jianling_profile_env_suffix(profile);
+    let per_profile_name = format!("ORDERK_JIANLING_LLM_ENABLED_{suffix}");
+    let per_profile = std::env::var(&per_profile_name).ok();
+    let global = std::env::var("ORDERK_JIANLING_LLM_ENABLED").ok();
+    jianling_live_llm_enabled_from_values(
+        per_profile.as_deref(),
+        global.as_deref(),
+        chain_has_valid_slot,
+    )
+}
+
+fn jianling_live_llm_enabled_from_values(
+    per_profile: Option<&str>,
+    global: Option<&str>,
+    chain_has_valid_slot: bool,
+) -> bool {
+    if let Some(value) = per_profile {
+        return parse_jianling_bool_flag(value);
+    }
+    if let Some(value) = global {
+        return parse_jianling_bool_flag(value);
+    }
+    chain_has_valid_slot
+}
+
+fn parse_jianling_bool_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn jianling_profile_env_suffix(profile: &str) -> String {
+    profile
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -3958,22 +4503,7 @@ fn jianling_live_llm_enabled(profile: &str) -> bool {
                 '_'
             }
         })
-        .collect::<String>();
-    let names = [
-        format!("ORDERK_JIANLING_LLM_ENABLED_{suffix}"),
-        "ORDERK_JIANLING_LLM_ENABLED".to_string(),
-    ];
-    names.iter().any(|name| {
-        std::env::var(name)
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
-    })
+        .collect::<String>()
 }
 
 struct LiveReflectionInput<'a> {
@@ -3987,38 +4517,110 @@ struct LiveReflectionInput<'a> {
     background_sources: &'a [EvidenceSource],
     source_total_files: usize,
     rejected_source_files: &'a [String],
+    /// Vault root, used to hot-load the historian prompt from
+    /// `<vault>/.orderk/jianling/prompts/historian.md` (falls back to the
+    /// compiled-in default when the file is absent).
+    vault: &'a Path,
 }
 
-fn generate_live_llm_reflection(input: LiveReflectionInput<'_>) -> Result<Option<String>> {
-    if !jianling_live_llm_enabled(input.profile) {
-        return Ok(None);
+/// Compiled-in default K historian prompt. Used when the vault override file is
+/// absent so reflection always has a working prompt even on a fresh vault.
+const DEFAULT_HISTORIAN_PROMPT: &str = include_str!("assets/jianling_historian_prompt.md");
+
+/// Vault-relative path for the hot-loadable historian prompt. Editing this file
+/// changes the next run's reflection voice with no recompile.
+const HISTORIAN_PROMPT_REL: &str = ".orderk/jianling/prompts/historian.md";
+
+/// Load the historian system prompt. Reads the vault override file if present
+/// and non-empty; otherwise returns the compiled-in default. The returned text
+/// is treated as a trusted template: today's untrusted evidence is appended by
+/// the caller, never substituted into the template, so transcript text cannot
+/// inject template directives.
+fn load_historian_prompt(vault: &Path) -> String {
+    let override_path = vault.join(HISTORIAN_PROMPT_REL);
+    if let Ok(text) = std::fs::read_to_string(&override_path) {
+        if !text.trim().is_empty() {
+            return text;
+        }
     }
+    DEFAULT_HISTORIAN_PROMPT.to_string()
+}
+
+/// Build the full user-message prompt: the trusted historian template
+/// (hot-loaded), then a run-context block, then the evidence block. Evidence is
+/// concatenated, never fed through placeholder substitution, so untrusted
+/// transcript content cannot alter the template (O2 prompt-injection guard).
+fn build_historian_prompt(input: &LiveReflectionInput<'_>, evidence: &str) -> String {
+    let template = load_historian_prompt(input.vault);
+    format!(
+        "{template}\n\n# 今天这次运行的元信息(只读参考,别写进日记)\nrun_id={run_id}\nmode={mode}\ndate={date}\nsource_total_files={total}\nselected_sources={selected}\nbackground_sources={bg}\nrejected_sources={rejected}\n\n# 今天的原料(证据)\n{evidence}",
+        template = template,
+        run_id = input.run_id,
+        mode = input.mode.as_str(),
+        date = input.date,
+        total = input.source_total_files,
+        selected = input.sources.len(),
+        bg = input.background_sources.len(),
+        rejected = input.rejected_source_files.len(),
+        evidence = evidence,
+    )
+}
+
+fn generate_live_llm_reflection(
+    input: LiveReflectionInput<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<String>> {
     if input.sources.is_empty() || input.anchors.is_empty() {
         return Ok(None);
     }
-    let slot = resolve_sword_model_profile_from_env()?.llm;
-    if slot.provider == "disabled" || !slot.api_key_configured {
+    let chain = resolve_llm_chain()?;
+    if !jianling_live_llm_enabled_with_chain(input.profile, !chain.is_empty()) {
         return Ok(None);
     }
-    let mut client = AnthropicCompatibleChatClient::from_slot(&slot)?;
+    if chain.is_empty() {
+        return Ok(None);
+    }
     let evidence = render_live_reflection_evidence(
         input.sources,
         input.anchors,
         input.background_sources,
         input.background_anchors,
     );
-    let prompt = format!(
-        "You are the OrderK Jianling V4 sleep-reflection writer. Write a pure-English Obsidian reflection using only the supplied evidence.\n\nCore goal: keep both the factual ledger and the judgment. The ledger is objective source anchors, hashes, and run evidence; the reflection is a memorable judgment distilled from repeated behavior, user corrections, and workflow changes. Do not turn the raw evidence list into the reflection.\n\nEvidence tiers:\n- The BACKGROUND section lists prior days' reflections as [BG1]-style anchors. It is READ-ONLY context to understand what was already concluded. You MUST NOT copy, paraphrase, or restate background bullets, and you MUST NOT cite [BG#] as if it were today's evidence.\n- The TODAY'S EVIDENCE section lists today's raw sources as [S1]-style anchors. Only [S#] anchors are valid evidence for observations.\n\nConstraints:\n- Do not invent facts beyond the evidence.\n- Every observation must cite at least one [S1]-style source anchor (never only [BG#]) and include confidence: high/medium/low.\n- Reflect on what is NEW today relative to the background; do not repeat background conclusions verbatim.\n- Output exactly three level-3 Markdown headings, in this exact order: `### Observations`, `### Open risks`, and `### Next actions`; do not output `##` or `#`.\n- The `### Open risks` heading is mandatory even if there are no new risks; include one evidence-cited bullet when risk is low.\n- Each item under `### Observations` must include a source anchor, `confidence: ...`, and `next: ...`.\n- Prefer durable user/process patterns: repeated requests for subagent audit = strong independent-review preference; repeated file/index/hash failures = the user does not accept fake closure.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nbackground_sources={}\nrejected_sources={}\nevidence:\n{evidence}",
-        input.run_id,
-        input.mode.as_str(),
-        input.date,
-        input.source_total_files,
-        input.sources.len(),
-        input.background_sources.len(),
-        input.rejected_source_files.len()
-    );
-    let text = client.send_prompt(&prompt)?;
-    Ok(Some(text.trim().to_string()))
+    let prompt = build_historian_prompt(&input, &evidence);
+    let mut failures = Vec::new();
+    for slot in chain {
+        let mut client = match AnthropicCompatibleChatClient::from_slot(&slot) {
+            Ok(client) => client,
+            Err(err) => {
+                let warning = format!(
+                    "live LLM provider {} model {} setup failed in fallback chain: {err}",
+                    slot.provider, slot.model
+                );
+                warnings.push(warning);
+                failures.push(format!("{}:{} setup: {err}", slot.provider, slot.model));
+                continue;
+            }
+        };
+        match client.send_prompt(&prompt) {
+            Ok(text) => return Ok(Some(text.trim().to_string())),
+            Err(err) => {
+                let warning = format!(
+                    "live LLM provider {} model {} failed in fallback chain: {err}",
+                    slot.provider, slot.model
+                );
+                warnings.push(warning);
+                failures.push(format!("{}:{} call: {err}", slot.provider, slot.model));
+            }
+        }
+    }
+    Err(anyhow!(
+        "Jianling LLM fallback chain exhausted: {}",
+        if failures.is_empty() {
+            "unknown error".to_string()
+        } else {
+            failures.join(" | ")
+        }
+    ))
 }
 
 fn repair_live_llm_reflection(
@@ -4026,17 +4628,17 @@ fn repair_live_llm_reflection(
     invalid_text: &str,
     validation_error: &str,
 ) -> Result<Option<String>> {
-    if !jianling_live_llm_enabled(input.profile) {
-        return Ok(None);
-    }
     if input.sources.is_empty() || input.anchors.is_empty() {
         return Ok(None);
     }
-    let slot = resolve_sword_model_profile_from_env()?.llm;
-    if slot.provider == "disabled" || !slot.api_key_configured {
+    let chain = resolve_llm_chain()?;
+    if !jianling_live_llm_enabled_with_chain(input.profile, !chain.is_empty()) {
         return Ok(None);
     }
-    let mut client = AnthropicCompatibleChatClient::from_slot(&slot)?;
+    let Some(slot) = chain.first() else {
+        return Ok(None);
+    };
+    let mut client = AnthropicCompatibleChatClient::from_slot(slot)?;
     let evidence = render_live_reflection_evidence(
         input.sources,
         input.anchors,
@@ -4044,17 +4646,12 @@ fn repair_live_llm_reflection(
         input.background_anchors,
     );
     let invalid_preview = invalid_text.chars().take(4000).collect::<String>();
+    let base = build_historian_prompt(&input, &evidence);
     let prompt = format!(
-        "Your previous OrderK Jianling reflection failed digest.v2 validation: {validation_error}. Rewrite it from scratch using only the supplied evidence.\n\nReturn only Markdown with exactly these three level-3 headings, in this exact order and spelling:\n### Observations\n### Open risks\n### Next actions\n\nEvidence tiers:\n- The BACKGROUND section lists prior days' reflections as [BG1]-style anchors. It is READ-ONLY context. Do NOT copy, paraphrase, or restate background bullets, and do NOT cite [BG#] as today's evidence.\n- The TODAY'S EVIDENCE section lists today's raw sources as [S1]-style anchors. Only [S#] anchors are valid evidence.\n\nRules:\n- No `#` or `##` headings.\n- No other `###` headings.\n- Every observation must cite at least one [S1]-style source anchor (never only [BG#]), include `confidence: high/medium/low`, and include `next: ...`.\n- The `### Open risks` heading is mandatory even if risk is low.\n- No code fences. Never reveal credentials.\n\nrun_id={}\nmode={}\ndate={}\nsource_total_files={}\nselected_sources={}\nbackground_sources={}\nrejected_sources={}\nevidence:\n{}\n\ninvalid_previous_output:\n{}",
-        input.run_id,
-        input.mode.as_str(),
-        input.date,
-        input.source_total_files,
-        input.sources.len(),
-        input.background_sources.len(),
-        input.rejected_source_files.len(),
-        evidence,
-        invalid_preview
+        "{base}\n\n# 上一版没过硬约束,重写\n你上一篇日记没满足硬约束:{validation_error}。\n请用上面同样的身份和调子,从头重写一篇 K 的夜班日记。务必:至少引用一个今天的 [S#] 证据(不能只引 [BG#]);不要用 ``` 代码围栏;不要泄露任何凭证。其他写法照上面的要求。\n\n# 上一版(仅供你知道哪里没写好,别照抄)\n{invalid_preview}",
+        base = base,
+        validation_error = validation_error,
+        invalid_preview = invalid_preview,
     );
     let text = client.send_prompt(&prompt)?;
     Ok(Some(text.trim().to_string()))
@@ -4066,22 +4663,43 @@ fn render_live_reflection_evidence(
     background_sources: &[EvidenceSource],
     background_anchors: &[JianlingSourceAnchor],
 ) -> String {
+    // Feed the LLM the CLEANED transcript body (theme_excerpt: frontmatter,
+    // Session Metadata, message headers and fences stripped) rather than the
+    // short anchor `excerpt` (which is frontmatter-polluted and only exists for
+    // quote_hash stability). Truncation is governed by three budgets so a single
+    // long transcript cannot crowd everything else out of M3's context:
+    //   - at most JIANLING_LLM_EVIDENCE_MAX_SOURCES sources,
+    //   - at most JIANLING_LLM_EVIDENCE_PER_SOURCE_CHARS chars per source,
+    //   - at most JIANLING_LLM_EVIDENCE_TOTAL_CHARS chars across the section.
     let render_section = |sources: &[EvidenceSource], anchors: &[JianlingSourceAnchor]| {
-        sources
+        let mut lines = Vec::new();
+        let mut total_chars = 0usize;
+        for (source, anchor) in sources
             .iter()
             .zip(anchors.iter())
-            .take(12)
-            .map(|(source, anchor)| {
-                format!(
-                    "[{}] path={} hash={} excerpt={} ",
-                    anchor.id,
-                    source.path,
-                    source.hash,
-                    compact_one_line(&source.excerpt)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .take(JIANLING_LLM_EVIDENCE_MAX_SOURCES)
+        {
+            let body = source.theme_excerpt.as_deref().unwrap_or(&source.excerpt);
+            let mut body = compact_one_line(body);
+            if body.chars().count() > JIANLING_LLM_EVIDENCE_PER_SOURCE_CHARS {
+                body = body
+                    .chars()
+                    .take(JIANLING_LLM_EVIDENCE_PER_SOURCE_CHARS)
+                    .collect::<String>();
+                body.push('…');
+            }
+            if total_chars + body.chars().count() > JIANLING_LLM_EVIDENCE_TOTAL_CHARS
+                && !lines.is_empty()
+            {
+                break;
+            }
+            total_chars += body.chars().count();
+            lines.push(format!(
+                "[{}] path={} hash={} excerpt={} ",
+                anchor.id, source.path, source.hash, body
+            ));
+        }
+        lines.join("\n")
     };
     let today = render_section(sources, anchors);
     let mut out = String::new();
@@ -4095,20 +4713,57 @@ fn render_live_reflection_evidence(
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JianlingChatProtocol {
+    Anthropic,
+    OpenAi,
+    Codex,
+}
+
+impl JianlingChatProtocol {
+    fn endpoint_suffix(self) -> &'static str {
+        match self {
+            Self::Anthropic => "/v1/messages",
+            Self::OpenAi => "/v1/chat/completions",
+            Self::Codex => "/v1/responses",
+        }
+    }
+
+    fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Anthropic => DEFAULT_ANTHROPIC_MINIMAX_BASE_URL,
+            Self::OpenAi | Self::Codex => DEFAULT_OPENAI_COMPAT_BASE_URL,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Codex => "codex",
+        }
+    }
+}
+
 struct AnthropicCompatibleChatClient {
     api_key: String,
     model: String,
     base_url: String,
+    protocol: JianlingChatProtocol,
 }
 
 impl AnthropicCompatibleChatClient {
     fn from_slot(slot: &SwordModelSlot) -> Result<Self> {
-        if slot.provider != "anthropic" {
-            return Err(anyhow!(
-                "Jianling chat smoke currently supports Anthropic-compatible provider only; got {}",
-                slot.provider
-            ));
-        }
+        let protocol = match slot.provider.as_str() {
+            "anthropic" => JianlingChatProtocol::Anthropic,
+            "openai" => JianlingChatProtocol::OpenAi,
+            "codex" => JianlingChatProtocol::Codex,
+            other => {
+                return Err(anyhow!(
+                "Jianling chat client supports anthropic, openai, and codex providers; got {other}"
+            ))
+            }
+        };
         let api_key_env = slot
             .api_key_env
             .as_deref()
@@ -4124,16 +4779,56 @@ impl AnthropicCompatibleChatClient {
             base_url: slot
                 .base_url
                 .clone()
-                .unwrap_or_else(|| DEFAULT_ANTHROPIC_MINIMAX_BASE_URL.to_string()),
+                .unwrap_or_else(|| protocol.default_base_url().to_string()),
+            protocol,
         })
     }
 
     fn endpoint(&self) -> String {
         let trimmed = self.base_url.trim_end_matches('/');
-        if trimmed.ends_with("/v1/messages") {
+        let suffix = self.protocol.endpoint_suffix();
+        if trimmed.ends_with(suffix) {
             trimmed.to_string()
         } else {
-            format!("{trimmed}/v1/messages")
+            format!("{trimmed}{suffix}")
+        }
+    }
+
+    fn request_body(&self, prompt: &str) -> String {
+        match self.protocol {
+            JianlingChatProtocol::Anthropic => json!({
+                "model": self.model,
+                "max_tokens": JIANLING_LLM_MAX_TOKENS,
+                "temperature": 0.0,
+                "thinking": {"type": "disabled"},
+                "system": JIANLING_CHAT_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": prompt}]
+            }),
+            JianlingChatProtocol::OpenAi => json!({
+                "model": self.model,
+                "max_tokens": JIANLING_LLM_MAX_TOKENS,
+                "temperature": 0.0,
+                "messages": [
+                    {"role": "system", "content": JIANLING_CHAT_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ]
+            }),
+            // field-spec only, not live-regressed
+            JianlingChatProtocol::Codex => json!({
+                "model": self.model,
+                "instructions": JIANLING_CHAT_SYSTEM_PROMPT,
+                "input": prompt,
+                "max_output_tokens": JIANLING_LLM_MAX_TOKENS
+            }),
+        }
+        .to_string()
+    }
+
+    fn extract_response_text(&self, body: &str) -> Result<String> {
+        match self.protocol {
+            JianlingChatProtocol::Anthropic => extract_anthropic_text(body),
+            JianlingChatProtocol::OpenAi => extract_openai_text(body),
+            JianlingChatProtocol::Codex => extract_codex_responses_text(body),
         }
     }
 
@@ -4142,27 +4837,27 @@ impl AnthropicCompatibleChatClient {
             .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build();
-        let body = json!({
-            "model": self.model,
-            "max_tokens": JIANLING_LLM_MAX_TOKENS,
-            "temperature": 0.0,
-            "thinking": {"type": "disabled"},
-            "system": "Return only the requested Markdown text. Do not include thinking, code fences, or extra explanation.",
-            "messages": [{"role": "user", "content": prompt}]
-        })
-        .to_string();
+        let body = self.request_body(prompt);
+        let endpoint = self.endpoint();
+        let authorization = format!("Bearer {}", self.api_key);
         let mut last_error = String::new();
         for attempt in 1..=3 {
-            match agent
-                .post(&self.endpoint())
-                .set("Content-Type", "application/json")
-                .set("x-api-key", &self.api_key)
-                .set("anthropic-version", "2023-06-01")
-                .send_string(&body)
-            {
+            let request = agent
+                .post(&endpoint)
+                .set("Content-Type", "application/json");
+            let result = match self.protocol {
+                JianlingChatProtocol::Anthropic => request
+                    .set("x-api-key", &self.api_key)
+                    .set("anthropic-version", "2023-06-01")
+                    .send_string(&body),
+                JianlingChatProtocol::OpenAi | JianlingChatProtocol::Codex => request
+                    .set("Authorization", &authorization)
+                    .send_string(&body),
+            };
+            match result {
                 Ok(response) => {
                     let response_body = response.into_string().context("read LLM response")?;
-                    return extract_anthropic_text(&response_body);
+                    return self.extract_response_text(&response_body);
                 }
                 Err(ureq::Error::Status(code, response)) => {
                     let body = response.into_string().unwrap_or_default();
@@ -4172,7 +4867,10 @@ impl AnthropicCompatibleChatClient {
                         thread::sleep(Duration::from_millis(retry_backoff_ms(attempt)));
                         continue;
                     }
-                    return Err(anyhow!("Jianling MiniMax M3 smoke failed: {message}"));
+                    return Err(anyhow!(
+                        "Jianling {} LLM call failed: {message}",
+                        self.protocol.label()
+                    ));
                 }
                 Err(ureq::Error::Transport(err)) => {
                     let message = err.to_string();
@@ -4182,13 +4880,15 @@ impl AnthropicCompatibleChatClient {
                         continue;
                     }
                     return Err(anyhow!(
-                        "Jianling MiniMax M3 smoke failed after 3 attempts: {message}"
+                        "Jianling {} LLM call failed after 3 attempts: {message}",
+                        self.protocol.label()
                     ));
                 }
             }
         }
         Err(anyhow!(
-            "Jianling MiniMax M3 smoke failed after 3 attempts: {}",
+            "Jianling {} LLM call failed after 3 attempts: {}",
+            self.protocol.label(),
             if last_error.is_empty() {
                 "unknown error"
             } else {
@@ -4209,6 +4909,56 @@ fn extract_anthropic_text(body: &str) -> Result<String> {
                         out.push('\n');
                     }
                     out.push_str(text);
+                }
+            }
+        }
+    }
+    if out.trim().is_empty() {
+        return Err(anyhow!(
+            "LLM response had no text content; response preview: {}",
+            body.chars().take(300).collect::<String>()
+        ));
+    }
+    Ok(out)
+}
+
+fn extract_openai_text(body: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(body).context("parse LLM response JSON")?;
+    let text = value
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(anyhow!(
+            "LLM response had no text content; response preview: {}",
+            body.chars().take(300).collect::<String>()
+        ));
+    }
+    Ok(text.to_string())
+}
+
+fn extract_codex_responses_text(body: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(body).context("parse LLM response JSON")?;
+    let mut out = String::new();
+    if let Some(items) = value.get("output").and_then(|v| v.as_array()) {
+        for item in items {
+            if let Some(blocks) = item.get("content").and_then(|v| v.as_array()) {
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                            if text.trim().is_empty() {
+                                continue;
+                            }
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(text);
+                        }
+                    }
                 }
             }
         }
@@ -4559,6 +5309,95 @@ mod tests {
     }
 
     #[test]
+    fn openai_chat_completion_text_extractor_reads_first_choice_message() {
+        let body = r#"{
+            "choices": [
+                {"message": {"role": "assistant", "content": "hello from openai"}}
+            ]
+        }"#;
+        assert_eq!(extract_openai_text(body).unwrap(), "hello from openai");
+
+        let err = extract_openai_text(r#"{"choices":[{"message":{"content":""}}]}"#).unwrap_err();
+        assert!(err.to_string().contains("no text content"), "{err:#}");
+    }
+
+    #[test]
+    fn codex_responses_text_extractor_concatenates_output_text_blocks() {
+        let body = r#"{
+            "output": [
+                {"content": [
+                    {"type": "output_text", "text": "first"},
+                    {"type": "other", "text": "ignored"}
+                ]},
+                {"content": [{"type": "output_text", "text": "second"}]}
+            ]
+        }"#;
+        assert_eq!(extract_codex_responses_text(body).unwrap(), "first\nsecond");
+
+        let err = extract_codex_responses_text(r#"{"output":[{"content":[]}]}"#).unwrap_err();
+        assert!(err.to_string().contains("no text content"), "{err:#}");
+    }
+
+    #[test]
+    fn chat_protocol_endpoints_append_expected_suffix_once() {
+        for (protocol, bare, suffixed) in [
+            (
+                JianlingChatProtocol::Anthropic,
+                "https://anthropic.example",
+                "https://anthropic.example/v1/messages",
+            ),
+            (
+                JianlingChatProtocol::OpenAi,
+                "https://openai.example",
+                "https://openai.example/v1/chat/completions",
+            ),
+            // field-spec only, not live-regressed
+            (
+                JianlingChatProtocol::Codex,
+                "https://codex.example",
+                "https://codex.example/v1/responses",
+            ),
+        ] {
+            let client = AnthropicCompatibleChatClient {
+                api_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                base_url: bare.to_string(),
+                protocol,
+            };
+            assert_eq!(client.endpoint(), suffixed);
+
+            let already_suffixed = AnthropicCompatibleChatClient {
+                api_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                base_url: suffixed.to_string(),
+                protocol,
+            };
+            assert_eq!(already_suffixed.endpoint(), suffixed);
+        }
+    }
+
+    #[test]
+    fn live_llm_enabled_prefers_profile_then_global_then_valid_chain_default() {
+        assert!(!jianling_live_llm_enabled_from_values(
+            Some("off"),
+            None,
+            true
+        ));
+        assert!(!jianling_live_llm_enabled_from_values(
+            None,
+            Some("false"),
+            true
+        ));
+        assert!(jianling_live_llm_enabled_from_values(None, None, true));
+        assert!(!jianling_live_llm_enabled_from_values(None, None, false));
+        assert!(!jianling_live_llm_enabled_from_values(
+            Some("0"),
+            Some("on"),
+            true
+        ));
+    }
+
+    #[test]
     fn index_feedback_freshness_rejects_missing_and_stale_rows() {
         let db = temp_db_path("freshness-stale");
         let conn = Connection::open(&db).unwrap();
@@ -4618,5 +5457,269 @@ mod tests {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
         assert!(names.iter().all(|name| !name.contains("secret-value")));
+    }
+
+    // ---- Jianling intelligence loop (v0.1.29) unit tests ----
+
+    fn content_source(path: &str, excerpt: &str) -> EvidenceSource {
+        EvidenceSource {
+            path: path.to_string(),
+            hash: format!("sha256:{}", sha256_hex(excerpt.as_bytes())),
+            chars: excerpt.chars().count(),
+            excerpt: excerpt.to_string(),
+            theme_excerpt: None,
+        }
+    }
+
+    fn content_anchor(path: &str) -> JianlingSourceAnchor {
+        JianlingSourceAnchor {
+            id: format!("S{}", path.len()),
+            path: path.to_string(),
+            quote_hash: format!("q:{path}"),
+            source_file_hash: format!("h:{path}"),
+            source_tier: "raw_truth".to_string(),
+        }
+    }
+
+    fn empty_ledger() -> JianlingTopicLedger {
+        JianlingTopicLedger {
+            schema_version: "orderk.jianling.topic_ledger.v1".to_string(),
+            profile: "default".to_string(),
+            updated_at: String::new(),
+            topics: BTreeMap::new(),
+        }
+    }
+
+    // Stage 1: content topics escape the closed 5-title echo chamber.
+    #[test]
+    fn content_topics_are_extracted_from_raw_transcript_without_frontmatter() {
+        // A plain transcript (no frontmatter, no wikilinks) that keeps hitting
+        // the same real topic must still yield a non-hardcoded content topic.
+        let excerpt = "今天又在调 orderk 的剑灵反思。orderk 的晋升管道是关键。\
+            orderk orderk 反复出现。subagent review matters too.";
+        let sources = vec![content_source("raw/transcripts/t1.md", excerpt)];
+        let obs = derive_content_topic_observations(&sources, "[S1]");
+        let keys: Vec<&str> = obs.iter().filter_map(|o| o.topic_key.as_deref()).collect();
+        assert!(
+            keys.contains(&"orderk"),
+            "expected an `orderk` content topic from plain text, got {keys:?}"
+        );
+        // Content topics must NOT be one of the 5 hardcoded process keys.
+        for o in &obs {
+            assert!(
+                o.topic_key.is_some(),
+                "content topic must carry an explicit key"
+            );
+            assert_eq!(o.confidence, "low", "content topics start conservative");
+        }
+    }
+
+    #[test]
+    fn structured_signals_extract_tags_and_wikilinks() {
+        let excerpt = "---\ntags: orderk, second-brain\n---\n\nSee [[Hermes]] and [[剑灵]].";
+        let terms = extract_structured_theme_terms(excerpt);
+        assert!(terms.iter().any(|t| t.eq_ignore_ascii_case("orderk")));
+        assert!(terms.iter().any(|t| t == "Hermes"));
+        assert!(terms.iter().any(|t| t == "剑灵"));
+    }
+
+    // Regression guard: wikilink byte-slicing must not panic on multi-byte UTF-8
+    // (CJK + 4-byte emoji) sitting between the ASCII `[[` / `]]` anchors.
+    #[test]
+    fn structured_signal_wikilink_slicing_is_utf8_safe() {
+        let excerpt = "prefix 🚀 [[剑灵🗡️管道]] middle [[orderk]] 尾巴🌟 tail";
+        let terms = extract_structured_theme_terms(excerpt);
+        assert!(terms.iter().any(|t| t == "剑灵🗡️管道"));
+        assert!(terms.iter().any(|t| t == "orderk"));
+        // An unterminated `[[` after multi-byte content must also not panic.
+        let _ = extract_structured_theme_terms("🚀🌟 [[未闭合的链接 🗡️");
+        let _ = extract_structured_theme_terms("[[");
+    }
+
+    #[test]
+    fn synonym_table_collapses_aliases_to_one_key() {
+        assert_eq!(
+            normalize_content_theme("jianling").map(|(k, _)| k),
+            Some("orderk".to_string())
+        );
+        assert_eq!(
+            normalize_content_theme("剑灵").map(|(k, _)| k),
+            Some("orderk".to_string())
+        );
+        assert_eq!(
+            normalize_content_theme("二脑").map(|(k, _)| k),
+            Some("second-brain".to_string())
+        );
+        // Unknown but meaningful term gets a stable content- prefixed key.
+        assert_eq!(
+            normalize_content_theme("kanban").map(|(k, _)| k),
+            Some("content-kanban".to_string())
+        );
+        // Noise normalizes to None (no topic).
+        assert_eq!(normalize_content_theme("!").map(|(k, _)| k), None);
+    }
+
+    // Stage 1.5: confidence ladder is driven by cross-day recurrence.
+    #[test]
+    fn confidence_ladder_tracks_distinct_days() {
+        assert_eq!(confidence_for_distinct_dates(1), "low");
+        assert_eq!(confidence_for_distinct_dates(2), "medium");
+        assert_eq!(confidence_for_distinct_dates(3), "high");
+        assert_eq!(confidence_for_distinct_dates(9), "high");
+    }
+
+    // Stage 2: distinct_dates ignores same-day re-runs, counts cross-day.
+    #[test]
+    fn distinct_dates_ignores_same_day_reruns_and_upgrades_confidence_across_days() {
+        let mut ledger = empty_ledger();
+        let excerpt = "orderk orderk orderk 剑灵 reflection pipeline work";
+        let sources = vec![content_source("raw/transcripts/a.md", excerpt)];
+        let anchors = vec![content_anchor("raw/transcripts/a.md")];
+        let obs = derive_content_topic_observations(&sources, "[S1]");
+        assert!(
+            !obs.is_empty(),
+            "need a content topic to exercise the ledger"
+        );
+
+        // Day 1, run twice — distinct_dates stays at 1, confidence low.
+        for _ in 0..2 {
+            update_topic_ledger_after_success(
+                &mut ledger,
+                "run-d1",
+                &JianlingRunMode::Daily,
+                "2026-06-12",
+                &obs,
+                &anchors,
+                &sources,
+            );
+        }
+        let entry = ledger.topics.get("orderk").expect("orderk topic present");
+        assert_eq!(
+            entry.distinct_dates.len(),
+            1,
+            "same-day reruns must not inflate days"
+        );
+        assert_eq!(entry.confidence, "low");
+
+        // Day 2 -> medium.
+        update_topic_ledger_after_success(
+            &mut ledger,
+            "run-d2",
+            &JianlingRunMode::Daily,
+            "2026-06-13",
+            &obs,
+            &anchors,
+            &sources,
+        );
+        assert_eq!(ledger.topics["orderk"].distinct_dates.len(), 2);
+        assert_eq!(ledger.topics["orderk"].confidence, "medium");
+
+        // Day 3 -> high.
+        update_topic_ledger_after_success(
+            &mut ledger,
+            "run-d3",
+            &JianlingRunMode::Daily,
+            "2026-06-14",
+            &obs,
+            &anchors,
+            &sources,
+        );
+        assert_eq!(ledger.topics["orderk"].distinct_dates.len(), 3);
+        assert_eq!(ledger.topics["orderk"].confidence, "high");
+    }
+
+    // Stage 3: Daily promotion fires only after >=3 distinct days at high.
+    #[test]
+    fn daily_promotion_requires_three_distinct_days() {
+        let mut high_2days = empty_ledger();
+        high_2days.topics.insert(
+            "orderk".to_string(),
+            JianlingTopicEntry {
+                topic_key: "orderk".to_string(),
+                title: "Recurring focus: orderk".to_string(),
+                first_seen: "2026-06-12".to_string(),
+                last_seen: "2026-06-13".to_string(),
+                repeat_count: 2,
+                confidence: "high".to_string(),
+                seen_occurrences: vec!["o1".to_string(), "o2".to_string()],
+                durable_evidence_refs: Vec::new(),
+                source_paths: Vec::new(),
+                source_file_hashes: Vec::new(),
+                modes_seen: vec!["daily".to_string()],
+                latest_next_action: "watch".to_string(),
+                promotion_status: "none".to_string(),
+                distinct_dates: vec!["2026-06-12".to_string(), "2026-06-13".to_string()],
+            },
+        );
+        // 2 distinct days: not eligible for Daily promotion.
+        assert!(
+            promotion_candidates_for_mode(&JianlingRunMode::Daily, &high_2days).is_empty(),
+            "2 distinct days must not promote on Daily"
+        );
+
+        // Add a 3rd day: now eligible.
+        high_2days
+            .topics
+            .get_mut("orderk")
+            .unwrap()
+            .distinct_dates
+            .push("2026-06-14".to_string());
+        let candidates = promotion_candidates_for_mode(&JianlingRunMode::Daily, &high_2days);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "3 distinct days at high should promote on Daily"
+        );
+        assert_eq!(candidates[0].topic_key, "orderk");
+    }
+
+    // Stage 3 churn guard: unchanged proposal ignoring run_id/date compares equal.
+    #[test]
+    fn lesson_proposal_semantic_body_ignores_run_id_and_date() {
+        let day1 = "---\ngenerated_by: orderk-jianling\nrun_id: run-aaa\nstatus: proposed\ndate: 2026-06-12\ntopic_key: orderk\n---\nbody";
+        let day2 = "---\ngenerated_by: orderk-jianling\nrun_id: run-bbb\nstatus: proposed\ndate: 2026-06-14\ntopic_key: orderk\n---\nbody";
+        assert_eq!(
+            lesson_proposal_semantic_body(day1),
+            lesson_proposal_semantic_body(day2),
+            "only run_id/date changed -> semantically identical"
+        );
+        let day3_changed = day2.replace("topic_key: orderk", "topic_key: hermes");
+        assert_ne!(
+            lesson_proposal_semantic_body(day1),
+            lesson_proposal_semantic_body(&day3_changed)
+        );
+    }
+
+    // Back-compat: old ledger JSON without distinct_dates deserializes (default empty).
+    #[test]
+    fn old_ledger_without_distinct_dates_deserializes() {
+        let json = r#"{
+            "schema_version": "orderk.jianling.topic_ledger.v1",
+            "profile": "default",
+            "updated_at": "2026-06-01T00:00:00Z",
+            "topics": {
+                "legacy-topic": {
+                    "topic_key": "legacy-topic",
+                    "title": "Historical topic",
+                    "first_seen": "2026-06-01",
+                    "last_seen": "2026-06-01",
+                    "repeat_count": 1,
+                    "confidence": "high",
+                    "seen_occurrences": ["occurrence:abc"],
+                    "durable_evidence_refs": [],
+                    "source_paths": [],
+                    "source_file_hashes": [],
+                    "modes_seen": ["daily"],
+                    "latest_next_action": "verify",
+                    "promotion_status": "none"
+                }
+            }
+        }"#;
+        let ledger: JianlingTopicLedger = serde_json::from_str(json).unwrap();
+        let entry = &ledger.topics["legacy-topic"];
+        assert!(
+            entry.distinct_dates.is_empty(),
+            "missing field defaults to empty"
+        );
     }
 }

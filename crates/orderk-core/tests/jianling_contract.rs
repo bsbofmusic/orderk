@@ -74,7 +74,7 @@ fn seed_quality_review_source(vault: &Path, date: &str, extra: &str) {
         vault,
         date,
         &format!(
-            "# Session {date}\n\n用户说：复杂任务要子代理 审计 复查 验收 gate，不能只靠单模型自证。{extra}\n",
+            "# Session {date}\n\n用户说：复杂任务要子代理 审计 复查 验收 gate，不能只靠单模型自证。audit audit audit。{extra}\n",
         ),
     );
 }
@@ -117,6 +117,9 @@ fn seed_mock_index_db_with_options(vault: &Path, db: &Path, options: &IndexOptio
 
 #[test]
 fn jianling_dry_run_reports_sources_without_writing_generated_memory() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("dry-run");
     seed_raw_dialogue(&vault);
 
@@ -218,12 +221,12 @@ fn jianling_apply_writes_daily_digest_receipt_evidence_and_watermark() {
     assert!(daily_text.contains("## Open risks"));
     assert!(daily_text.contains("## Next actions"));
     assert!(daily_text.contains("## Evidence appendix"));
-    assert!(daily_text.contains("Independent review preference"));
-    assert!(daily_text.contains("Preserve the factual ledger"));
-    assert!(daily_text.contains("Reflection must make a judgment"));
+    assert!(!daily_text.contains("Independent review preference"));
+    assert!(!daily_text.contains("Preserve the factual ledger"));
+    assert!(!daily_text.contains("Reflection must make a judgment"));
     assert!(!daily_text.contains("## 一句话结论"));
     assert!(!daily_text.contains("## 推断观察"));
-    assert!(daily_text.contains("confidence: high"));
+    assert!(daily_text.contains("confidence:"));
     assert!(daily_text.contains("next:"));
     assert!(daily_text.contains("promotion rule:"));
     assert!(daily_text.contains("session 入库要保留去噪后的完整原文"));
@@ -426,6 +429,9 @@ fn jianling_index_freshness_mismatch_fails_closed_without_success_label() {
 
 #[test]
 fn jianling_apply_degrades_when_index_db_is_missing() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("missing-index-db");
     seed_raw_dialogue(&vault);
     let db = vault.join(".obsidian/orderk/missing.sqlite");
@@ -465,6 +471,9 @@ fn jianling_apply_degrades_when_index_db_is_missing() {
 
 #[test]
 fn jianling_index_feedback_reuses_existing_db_chunk_profile() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("chunk-profile");
     seed_raw_dialogue(&vault);
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -503,6 +512,9 @@ fn jianling_index_feedback_reuses_existing_db_chunk_profile() {
 
 #[test]
 fn jianling_daily_updates_topic_ledger_for_reflective_observations() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("ledger-create");
     seed_quality_review_source(&vault, "2026-06-10", "第一次落账。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -526,7 +538,7 @@ fn jianling_daily_updates_topic_ledger_for_reflective_observations() {
     let ledger = read_topic_ledger(&vault);
     assert_eq!(ledger["schema_version"], "orderk.jianling.topic_ledger.v1");
     assert_eq!(ledger["profile"], "default");
-    let topic = &ledger["topics"]["quality-review-preference"];
+    let topic = &ledger["topics"]["audit"];
     assert_eq!(topic["repeat_count"], 1);
     assert_eq!(topic["seen_occurrences"].as_array().unwrap().len(), 1);
     let ref0 = &topic["durable_evidence_refs"][0];
@@ -547,6 +559,9 @@ fn jianling_daily_updates_topic_ledger_for_reflective_observations() {
 
 #[test]
 fn jianling_topic_ledger_dedupes_same_occurrence_rerun() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("ledger-dedupe");
     seed_quality_review_source(&vault, "2026-06-10", "重复同日。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -566,7 +581,7 @@ fn jianling_topic_ledger_dedupes_same_occurrence_rerun() {
 
     assert!(first.ok && second.ok);
     let ledger = read_topic_ledger(&vault);
-    let topic = &ledger["topics"]["quality-review-preference"];
+    let topic = &ledger["topics"]["audit"];
     assert_eq!(topic["repeat_count"], 1);
     assert_eq!(topic["seen_occurrences"].as_array().unwrap().len(), 1);
 
@@ -575,6 +590,9 @@ fn jianling_topic_ledger_dedupes_same_occurrence_rerun() {
 
 #[test]
 fn jianling_topic_ledger_counts_distinct_daily_occurrences() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("ledger-distinct");
     seed_quality_review_source(&vault, "2026-06-10", "第一天。");
     seed_quality_review_source(&vault, "2026-06-11", "第二天。");
@@ -598,7 +616,7 @@ fn jianling_topic_ledger_counts_distinct_daily_occurrences() {
     }
 
     let ledger = read_topic_ledger(&vault);
-    let topic = &ledger["topics"]["quality-review-preference"];
+    let topic = &ledger["topics"]["audit"];
     assert_eq!(topic["repeat_count"], 2);
     assert_eq!(topic["seen_occurrences"].as_array().unwrap().len(), 2);
 
@@ -607,6 +625,9 @@ fn jianling_topic_ledger_counts_distinct_daily_occurrences() {
 
 #[test]
 fn jianling_run_refuses_to_overwrite_human_daily_note() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("human-daily-safe");
     seed_raw_dialogue(&vault);
     fs::create_dir_all(vault.join("brain/daily")).unwrap();
@@ -642,6 +663,9 @@ fn jianling_run_refuses_to_overwrite_human_daily_note() {
 #[cfg(unix)]
 #[test]
 fn jianling_run_rejects_symlinked_generated_output_root() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     use std::os::unix::fs as unix_fs;
 
     let vault = temp_vault("symlink-escape");
@@ -676,6 +700,9 @@ fn jianling_run_rejects_symlinked_generated_output_root() {
 
 #[test]
 fn jianling_validate_run_rejects_tampered_generated_markdown_and_evidence() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("tamper");
     seed_raw_dialogue(&vault);
 
@@ -840,6 +867,9 @@ fn seed_many_raw_dialogues(vault: &Path, count: usize) {
 
 #[test]
 fn jianling_daily_selects_only_requested_date_window() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("daily-date-window");
     let day10 = vault.join("raw/transcripts/hermes-sessions/2026/06/10");
     let day11 = vault.join("raw/transcripts/hermes-sessions/2026/06/11");
@@ -880,6 +910,9 @@ fn jianling_daily_selects_only_requested_date_window() {
 
 #[test]
 fn jianling_weekly_monthly_yearly_select_expected_date_windows() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("calendar-source-window");
     for (date, name) in [
         ("2025/12/31", "old-year"),
@@ -964,6 +997,9 @@ fn jianling_weekly_monthly_yearly_select_expected_date_windows() {
 
 #[test]
 fn jianling_rollups_include_lower_level_generated_reflections() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("hierarchical-rollup-sources");
     seed_raw_dialogue_on(&vault, "2026-06-01", "# day one\n\nRaw day one source.\n");
     seed_raw_dialogue_on(&vault, "2026-06-07", "# sunday\n\nRaw sunday source.\n");
@@ -1113,6 +1149,9 @@ fn jianling_worker_plans_calendar_modes_without_external_cron() {
 
 #[test]
 fn jianling_weekly_and_monthly_write_prd_paths_not_reflections_bucket() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("weekly-monthly-paths");
     seed_raw_dialogue(&vault);
 
@@ -1158,8 +1197,11 @@ fn jianling_weekly_and_monthly_write_prd_paths_not_reflections_bucket() {
 }
 
 #[test]
-fn jianling_weekly_promotes_repeated_high_confidence_topic_to_lesson_proposal() {
-    let vault = temp_vault("weekly-promote");
+fn jianling_weekly_does_not_promote_deleted_hardcoded_review_template() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
+    let vault = temp_vault("weekly-no-hardcoded-review-promote");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -1180,6 +1222,8 @@ fn jianling_weekly_promotes_repeated_high_confidence_topic_to_lesson_proposal() 
         )
         .unwrap();
         assert!(daily.ok, "daily seed should pass: {daily:#?}");
+        let daily_text = fs::read_to_string(vault.join(format!("brain/daily/{date}.md"))).unwrap();
+        assert!(!daily_text.contains("Independent review preference"));
     }
 
     let weekly = jianling_run(
@@ -1196,47 +1240,149 @@ fn jianling_weekly_promotes_repeated_high_confidence_topic_to_lesson_proposal() 
     )
     .unwrap();
 
-    assert!(weekly.ok, "weekly promotion should succeed: {weekly:#?}");
-    assert_eq!(weekly.promotion_status, "proposed");
-    assert!(weekly
+    assert!(
+        weekly.ok,
+        "weekly run should succeed without fake template: {weekly:#?}"
+    );
+    assert!(!weekly
         .promotion_paths
         .contains(&"brain/lessons/quality-review-preference.md".to_string()));
-    assert_eq!(weekly.promotion_file_ops.len(), 1);
-    assert_eq!(
-        weekly.promotion_file_ops[0].target_path,
-        "brain/lessons/quality-review-preference.md"
-    );
-    assert!(weekly.promotion_file_ops[0].byte_count > 0);
-    assert!(weekly.promotion_file_ops[0].index_update_required);
-    assert_eq!(weekly.promotion_index_summaries.len(), 1);
-    assert_eq!(
-        weekly.promotion_index_summaries[0].path,
-        "brain/lessons/quality-review-preference.md"
-    );
-
-    let lesson =
-        fs::read_to_string(vault.join("brain/lessons/quality-review-preference.md")).unwrap();
-    assert!(lesson.contains("promotion_schema_version: orderk.jianling.promotion.v1"));
-    assert!(lesson.contains("status: proposed"));
-    assert!(lesson.contains("topic_key: quality-review-preference"));
-    assert!(lesson.contains("repeat_count: 2"));
-    assert!(lesson.contains("confidence: high"));
-    assert!(lesson.contains("run_id:"));
-    assert!(lesson.contains("anchor_id:"));
-    assert!(lesson.contains("source_path:"));
-    assert!(lesson.contains("source_file_hash:"));
-    assert!(lesson.contains("quote_hash:"));
+    assert!(!vault.join("brain/lessons/audit.md").exists());
 
     let ledger = read_topic_ledger(&vault);
-    let topic = &ledger["topics"]["quality-review-preference"];
-    assert_eq!(topic["repeat_count"], 2);
-    assert_eq!(topic["promotion_status"], "proposed");
+    assert!(ledger["topics"].get("quality-review-preference").is_none());
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+/// End-to-end proof of the v0.1.29 intelligence loop: a CONTENT topic the user
+/// keeps engaging with (not one of the 5 hardcoded process invariants) recurs
+/// across 3 distinct days and, on day 3, compiles into a lesson proposal via
+/// the DAILY run — a path that was structurally impossible before (Daily used
+/// to return zero promotion candidates and content topics never entered the
+/// ledger at all).
+#[test]
+fn jianling_daily_promotes_content_topic_after_three_distinct_days() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
+    let vault = temp_vault("daily-content-promote");
+    // Each day's transcript repeats the real topic "orderk" enough times to be
+    // salient, with no frontmatter/wikilinks (pure raw transcript path).
+    let body = "# Session\n\n用户说：今天继续打磨 orderk 的剑灵反思管道。\
+        orderk 的晋升逻辑、orderk 的 ledger、orderk 的召回都要验证。\
+        orderk orderk orderk 是今天反复出现的核心主题。\n";
+    for date in ["2026-06-12", "2026-06-13", "2026-06-14"] {
+        seed_raw_dialogue_on(&vault, date, body);
+    }
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    let mut day3_promotions: Vec<String> = Vec::new();
+    for date in ["2026-06-12", "2026-06-13", "2026-06-14"] {
+        let daily = jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: "default".to_string(),
+                mode: JianlingRunMode::Daily,
+                dry_run: false,
+                scheduled: true,
+                db: Some(db.clone()),
+                date: Some(date.to_string()),
+                max_source_files: 20,
+            },
+        )
+        .unwrap();
+        assert!(daily.ok, "daily {date} should pass: {daily:#?}");
+        if date == "2026-06-12" || date == "2026-06-13" {
+            // Before 3 distinct days, Daily must NOT promote the content topic.
+            assert!(
+                daily.promotion_paths.is_empty(),
+                "day {date}: content topic must not promote before 3 distinct days, got {:?}",
+                daily.promotion_paths
+            );
+        }
+        if date == "2026-06-14" {
+            day3_promotions = daily.promotion_paths.clone();
+        }
+    }
+
+    // Day 3: the content topic must now compile into a lesson proposal.
+    let ledger = read_topic_ledger(&vault);
+    let orderk = &ledger["topics"]["orderk"];
+    assert_eq!(
+        orderk["distinct_dates"].as_array().unwrap().len(),
+        3,
+        "orderk should have recurred across 3 distinct days: {orderk:#?}"
+    );
+    assert_eq!(orderk["confidence"], "high", "3 distinct days -> high");
+
+    assert!(
+        day3_promotions.contains(&"brain/lessons/orderk.md".to_string()),
+        "day 3 daily run should promote the orderk content topic, got {day3_promotions:?}"
+    );
+    let lesson = fs::read_to_string(vault.join("brain/lessons/orderk.md")).unwrap();
+    assert!(lesson.contains("status: proposed"));
+    assert!(lesson.contains("topic_key: orderk"));
+    assert!(lesson.contains("confidence: high"));
+    // proposal-only: never an auto-approved memory write.
+    assert!(!lesson.contains("status: active_user_approved"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+/// Churn guard: once a content topic is proposed, a subsequent same-day-content
+/// Daily run on a later date must NOT rewrite the unchanged lesson file (only
+/// run_id/date would differ), so it produces no churn and no re-index.
+#[test]
+fn jianling_daily_promotion_does_not_rechurn_unchanged_lesson() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
+    let vault = temp_vault("daily-content-no-churn");
+    let body = "# Session\n\n用户说：orderk orderk orderk 剑灵 晋升 管道 是核心主题。\n";
+    for date in ["2026-06-12", "2026-06-13", "2026-06-14", "2026-06-15"] {
+        seed_raw_dialogue_on(&vault, date, body);
+    }
+    let db = vault.join(".obsidian/orderk/orderk.sqlite");
+    seed_mock_index_db(&vault, &db);
+
+    let mut day4_promotion_ops = 0usize;
+    for date in ["2026-06-12", "2026-06-13", "2026-06-14", "2026-06-15"] {
+        let daily = jianling_run(
+            &vault,
+            &JianlingRunOptions {
+                profile: "default".to_string(),
+                mode: JianlingRunMode::Daily,
+                dry_run: false,
+                scheduled: true,
+                db: Some(db.clone()),
+                date: Some(date.to_string()),
+                max_source_files: 20,
+            },
+        )
+        .unwrap();
+        assert!(daily.ok, "daily {date} should pass: {daily:#?}");
+        if date == "2026-06-15" {
+            day4_promotion_ops = daily.promotion_file_ops.len();
+        }
+    }
+    // Day 3 created the proposal; day 4's content is semantically identical, so
+    // the churn guard must skip the rewrite (no promotion file op recorded).
+    assert_eq!(
+        day4_promotion_ops, 0,
+        "unchanged lesson must not be rewritten on a later day"
+    );
+    assert!(vault.join("brain/lessons/orderk.md").is_file());
 
     let _ = fs::remove_dir_all(vault);
 }
 
 #[test]
 fn jianling_weekly_does_not_promote_single_occurrence() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("weekly-single-no-promote");
     seed_quality_review_source(&vault, "2026-06-10", "单次不能沉淀成长课题。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
@@ -1274,15 +1420,16 @@ fn jianling_weekly_does_not_promote_single_occurrence() {
     assert!(weekly.ok);
     assert_eq!(weekly.promotion_status, "no_candidates");
     assert!(weekly.promotion_paths.is_empty());
-    assert!(!vault
-        .join("brain/lessons/quality-review-preference.md")
-        .exists());
+    assert!(!vault.join("brain/lessons/audit.md").exists());
 
     let _ = fs::remove_dir_all(vault);
 }
 
 #[test]
 fn jianling_global_profile_lock_blocks_cross_mode_conflicts() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("global-lock");
     seed_raw_dialogue(&vault);
     let lock_dir = vault.join(".orderk/jianling/locks");
@@ -1316,10 +1463,14 @@ fn jianling_global_profile_lock_blocks_cross_mode_conflicts() {
 }
 
 #[test]
-fn jianling_weekly_promotion_index_failure_is_fail_closed() {
-    let vault = temp_vault("weekly-fail-closed");
+fn jianling_daily_promotion_index_failure_is_fail_closed() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
+    let vault = temp_vault("daily-fail-closed");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
+    seed_quality_review_source(&vault, "2026-06-12", "第三次。");
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
     seed_mock_index_db(&vault, &db);
 
@@ -1340,24 +1491,27 @@ fn jianling_weekly_promotion_index_failure_is_fail_closed() {
         assert!(daily.ok, "daily seed should pass: {daily:#?}");
     }
 
-    let weekly = jianling_run(
+    let daily = jianling_run(
         &vault,
         &JianlingRunOptions {
             profile: "default".to_string(),
-            mode: JianlingRunMode::Weekly,
+            mode: JianlingRunMode::Daily,
             dry_run: false,
             scheduled: true,
             db: None,
-            date: Some("2026-06-11".to_string()),
+            date: Some("2026-06-12".to_string()),
             max_source_files: 20,
         },
     )
     .unwrap();
 
-    assert!(!weekly.ok);
-    assert_eq!(weekly.status, "degraded_promotion_index_failed");
-    assert_eq!(weekly.promotion_status, "degraded_index_failed");
-    assert!(weekly
+    assert!(!daily.ok);
+    assert_eq!(daily.status, "degraded_promotion_index_failed");
+    assert_eq!(daily.promotion_status, "degraded_index_failed");
+    assert!(daily
+        .promotion_paths
+        .contains(&"brain/lessons/audit.md".to_string()));
+    assert!(daily
         .warnings
         .iter()
         .any(|warning| warning.contains("promotion index feedback failed")));
@@ -1367,17 +1521,21 @@ fn jianling_weekly_promotion_index_failure_is_fail_closed() {
 
 #[test]
 fn jianling_promotion_overwrite_rules_respect_existing_targets() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("promotion-overwrite");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
-    let target = vault.join("brain/lessons/quality-review-preference.md");
+    seed_quality_review_source(&vault, "2026-06-12", "第三次。");
+    let target = vault.join("brain/lessons/audit.md");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(&target, "# Human note\n\nDo not overwrite me.\n").unwrap();
 
     let db = vault.join(".obsidian/orderk/orderk.sqlite");
     seed_mock_index_db(&vault, &db);
 
-    for date in ["2026-06-10", "2026-06-11"] {
+    for date in ["2026-06-10", "2026-06-11", "2026-06-12"] {
         let daily = jianling_run(
             &vault,
             &JianlingRunOptions {
@@ -1402,7 +1560,7 @@ fn jianling_promotion_overwrite_rules_respect_existing_targets() {
             dry_run: false,
             scheduled: true,
             db: Some(db),
-            date: Some("2026-06-11".to_string()),
+            date: Some("2026-06-12".to_string()),
             max_source_files: 20,
         },
     )
@@ -1425,6 +1583,9 @@ fn jianling_promotion_overwrite_rules_respect_existing_targets() {
 
 #[test]
 fn jianling_empty_source_does_not_update_topic_ledger() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("empty-source-ledger");
     fs::create_dir_all(vault.join("raw/system-snapshots/2026/06/10")).unwrap();
     fs::write(
@@ -1457,6 +1618,9 @@ fn jianling_empty_source_does_not_update_topic_ledger() {
 
 #[test]
 fn jianling_rollup_uses_existing_daily_reflections_after_raw_sources_are_removed() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("empty-rollup-ledger");
     seed_quality_review_source(&vault, "2026-06-10", "第一次。");
     seed_quality_review_source(&vault, "2026-06-11", "第二次。");
@@ -1517,13 +1681,16 @@ fn jianling_rollup_uses_existing_daily_reflections_after_raw_sources_are_removed
         .iter()
         .all(|anchor| anchor.path.starts_with("brain/daily/")
             && anchor.source_tier == "generated_memory"));
-    assert!(weekly.topic_ledger_path.is_some());
+    assert!(weekly.topic_ledger_path.is_none());
 
     let _ = fs::remove_dir_all(vault);
 }
 
 #[test]
 fn jianling_partial_large_run_writes_kanban_chunk_and_foreman_receipts() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("chunked");
     seed_many_raw_dialogues(&vault, 95);
 
@@ -1619,6 +1786,9 @@ fn jianling_partial_large_run_writes_kanban_chunk_and_foreman_receipts() {
 
 #[test]
 fn jianling_validate_run_rejects_tampered_kanban_auditor_card() {
+    // Pin LLM off (held under the shared env mutex) so a concurrent live-LLM test
+    // cannot leak a configured key into this default-on-aware run. See stage-3 flake RC.
+    let _llm_off_guard = ScopedEnv::set(&[("ORDERK_JIANLING_LLM_ENABLED", "0")]);
     let vault = temp_vault("kanban-tamper");
     seed_many_raw_dialogues(&vault, 45);
 
@@ -1701,20 +1871,18 @@ fn jianling_chat_smoke_receipts_unconfigured_llm_without_secret_leak() {
 }
 
 #[test]
-fn jianling_apply_configured_llm_without_hot_switch_does_not_call_provider() {
+fn jianling_apply_configured_llm_profile_switch_off_does_not_call_provider() {
     let vault = temp_vault("live-llm-switch-off");
     seed_raw_dialogue(&vault);
     let server = FakeAnthropicServer::start("- should not be called\n");
     let _guard = ScopedEnv::set_with_clear(
         &[
+            ("ORDERK_JIANLING_LLM_ENABLED_SWITCHOFF", "0"),
             ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
             ("ORDERK_TEST_LLM_KEY", "test-secret"),
             ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
         ],
-        &[
-            "ORDERK_JIANLING_LLM_ENABLED",
-            "ORDERK_JIANLING_LLM_ENABLED_SWITCHOFF",
-        ],
+        &["ORDERK_JIANLING_LLM_ENABLED"],
     );
 
     let report = jianling_run(
@@ -1738,6 +1906,47 @@ fn jianling_apply_configured_llm_without_hot_switch_does_not_call_provider() {
     assert_eq!(server.request_count(), 0);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
     assert!(!daily_text.contains("\n## LLM reflection (MiniMax M3)"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_apply_configured_llm_defaults_on_when_key_is_configured() {
+    let vault = temp_vault("live-llm-default-on");
+    seed_raw_dialogue(&vault);
+    let server = FakeAnthropicServer::start(
+        "### Observations\n- Default-on LLM reflection from fake MiniMax [S1] confidence: high; next: keep the key-configured path live.\n### Open risks\n- no extra risk beyond source evidence [S1] confidence: medium.\n### Next actions\n- verify default-on receipt [S1].\n",
+    );
+    let _guard = ScopedEnv::set_with_clear(
+        &[
+            ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+            ("ORDERK_TEST_LLM_KEY", "test-secret"),
+            ("ORDERK_SWORD_LLM_BASE_URL", server.base_url.as_str()),
+        ],
+        &[
+            "ORDERK_JIANLING_LLM_ENABLED",
+            "ORDERK_JIANLING_LLM_ENABLED_DEFAULTON",
+        ],
+    );
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "defaulton".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.provider_status, "called_live");
+    assert_eq!(server.request_count(), 1);
+    let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
+    assert!(daily_text.contains("Default-on LLM reflection from fake MiniMax [S1]"));
 
     let _ = fs::remove_dir_all(vault);
 }
@@ -1775,10 +1984,30 @@ fn jianling_apply_calls_configured_llm_and_writes_contract_valid_reflection() {
     assert!(report.ok);
     assert!(!report.fallback_used);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(daily_text.contains("### LLM reflection (MiniMax M3)"));
-    assert!(!daily_text.contains("\n## LLM reflection (MiniMax M3)"));
+    assert!(!daily_text.contains("LLM reflection (MiniMax M3)"));
+    assert!(daily_text.contains("## 证据附录（Evidence appendix）"));
     assert!(daily_text.contains("LLM reflection from fake MiniMax [S1] confidence: high"));
     assert!(daily_text.contains("next: keep independent audit before release"));
+    let frontmatter_end = daily_text.find("\n---\n\n").unwrap();
+    let reflection_pos = daily_text
+        .find("LLM reflection from fake MiniMax [S1]")
+        .unwrap();
+    let appendix_pos = daily_text.find("## 证据附录（Evidence appendix）").unwrap();
+    let deterministic_pos = daily_text.find("# Jianling Daily Digest").unwrap();
+    assert!(frontmatter_end < reflection_pos);
+    assert!(reflection_pos < appendix_pos);
+    assert!(appendix_pos < deterministic_pos);
+    let validation = jianling_validate_file(
+        &vault,
+        &JianlingValidateFileOptions {
+            path: PathBuf::from("brain/daily/2026-06-10.md"),
+        },
+    )
+    .unwrap();
+    assert!(
+        validation.ok,
+        "LLM-primary digest should still validate: {validation:#?}"
+    );
     assert_eq!(server.request_count(), 1);
 
     let _ = fs::remove_dir_all(vault);
@@ -1788,9 +2017,11 @@ fn jianling_apply_calls_configured_llm_and_writes_contract_valid_reflection() {
 fn jianling_apply_repairs_llm_reflection_missing_required_section_once() {
     let vault = temp_vault("live-llm-repair");
     seed_raw_dialogue(&vault);
+    // First response violates a HARD constraint (code fence); the soft historian
+    // contract rejects it, repair fires once, and the second response is clean.
     let server = FakeAnthropicServer::start_sequence(vec![
-        "### Observations\n- First draft is grounded but incomplete [S1] confidence: high; next: repair the missing section.\n### Next actions\n- validate the repaired response [S1].\n",
-        "### Observations\n- Repaired LLM reflection keeps exact headings [S1] confidence: high; next: keep contract repair before degrading.\n### Open risks\n- no extra risk beyond source evidence [S1] confidence: medium.\n### Next actions\n- verify receipt and index feedback [S1].\n",
+        "## 今日主线\n我今天陪老板做了点事 [S1]。\n```rust\nfn oops() {}\n```\n",
+        "## 今日主线\n我今天陪老板把剑灵的反思框架翻新了一遍 [S1]。\n## 我的看法\n这次是真把判断放前面了。",
     ]);
     let _guard = ScopedEnv::set(&[
         ("ORDERK_JIANLING_LLM_ENABLED_LLMREPAIR", "1"),
@@ -1822,11 +2053,11 @@ fn jianling_apply_repairs_llm_reflection_missing_required_section_once() {
         .iter()
         .any(|warning| warning.contains("repaired after initial contract rejection")));
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(daily_text.contains("### LLM reflection (MiniMax M3)"));
-    assert!(
-        daily_text.contains("Repaired LLM reflection keeps exact headings [S1] confidence: high")
-    );
-    assert!(!daily_text.contains("First draft is grounded but incomplete"));
+    assert!(!daily_text.contains("LLM reflection (MiniMax M3)"));
+    assert!(daily_text.contains("## 证据附录（Evidence appendix）"));
+    assert!(daily_text.contains("这次是真把判断放前面了"));
+    // The fenced first draft must not survive into the written note.
+    assert!(!daily_text.contains("fn oops()"));
     assert_eq!(server.request_count(), 2);
 
     let _ = fs::remove_dir_all(vault);
@@ -1836,7 +2067,9 @@ fn jianling_apply_repairs_llm_reflection_missing_required_section_once() {
 fn jianling_apply_rejects_contract_invalid_llm_reflection() {
     let vault = temp_vault("live-llm-invalid");
     seed_raw_dialogue(&vault);
-    let server = FakeAnthropicServer::start("- LLM reflection from fake MiniMax [S1]\n");
+    // Response cites no today-evidence [S#] anchor at all -> violates the hard
+    // "凡事有据" constraint. Repair (served the same text) fails again -> degraded.
+    let server = FakeAnthropicServer::start("## 今日主线\n我今天想了很多但一个证据都没引。\n");
     let _guard = ScopedEnv::set(&[
         ("ORDERK_JIANLING_LLM_ENABLED_LLMMODEINVALID", "1"),
         ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
@@ -1872,18 +2105,66 @@ fn jianling_apply_rejects_contract_invalid_llm_reflection() {
         .any(|warning| warning.contains("live LLM reflection rejected")));
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
     assert!(!daily_text.contains("### LLM reflection (MiniMax M3)"));
-    assert!(!daily_text.contains("LLM reflection from fake MiniMax"));
+    assert!(!daily_text.contains("一个证据都没引"));
     assert_eq!(server.request_count(), 2);
 
     let _ = fs::remove_dir_all(vault);
 }
 
 #[test]
-fn jianling_apply_rejects_llm_reflection_with_extra_top_level_heading() {
-    let vault = temp_vault("live-llm-extra-heading");
+fn jianling_apply_downgrades_llm_transport_error_to_deterministic_write() {
+    let vault = temp_vault("live-llm-transport-error");
+    seed_raw_dialogue(&vault);
+    let _guard = ScopedEnv::set(&[
+        ("ORDERK_JIANLING_LLM_ENABLED_LLMERR", "1"),
+        ("ORDERK_SWORD_LLM_API_KEY_ENV", "ORDERK_TEST_LLM_KEY"),
+        ("ORDERK_TEST_LLM_KEY", "test-secret"),
+        ("ORDERK_SWORD_LLM_BASE_URL", "http://127.0.0.1:9"),
+    ]);
+
+    let report = jianling_run(
+        &vault,
+        &JianlingRunOptions {
+            profile: "llmerr".to_string(),
+            mode: JianlingRunMode::Daily,
+            dry_run: false,
+            scheduled: false,
+            db: None,
+            date: Some("2026-06-10".to_string()),
+            max_source_files: 20,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        report.ok,
+        "LLM transport failure should not fail the deterministic run"
+    );
+    assert_eq!(report.status, "success");
+    assert_eq!(report.provider_status, "called_live_error");
+    assert!(report.fallback_used);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("live LLM reflection call failed")));
+    let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
+    assert!(daily_text.contains("digest_schema_version: orderk.jianling.digest.v2"));
+    assert!(daily_text.contains("## Executive summary"));
+    assert!(!daily_text.contains("LLM reflection (MiniMax M3)"));
+    assert!(!daily_text.contains("## 证据附录（Evidence appendix）"));
+
+    let _ = fs::remove_dir_all(vault);
+}
+
+#[test]
+fn jianling_apply_accepts_llm_reflection_with_chinese_h2_headings() {
+    // The soft historian contract intentionally ALLOWS `##` headings so K can
+    // write `## 今日主线 / ## 我的看法 ...`. This used to be rejected by the old
+    // rigid digest.v2 contract; the flip is the entire point of V4.1.
+    let vault = temp_vault("live-llm-h2-headings");
     seed_raw_dialogue(&vault);
     let server = FakeAnthropicServer::start(
-        "## Extra top-level heading\n### Observations\n- looks grounded [S1] confidence: high; next: do not publish invalid structure.\n### Open risks\n- top-level heading would break seven-section digest [S1] confidence: high.\n### Next actions\n- reject this response [S1].\n",
+        "## 今日主线\n我今天陪老板把剑灵从记账员改回史学家 [S1]。\n## 我的看法\n判断放前面,证据垫后面,这才像反思 [S1]。\n## 还没完的事\n发版还没拍板。",
     );
     let _guard = ScopedEnv::set(&[
         ("ORDERK_JIANLING_LLM_ENABLED_LLMHEADING", "1"),
@@ -1906,14 +2187,20 @@ fn jianling_apply_rejects_llm_reflection_with_extra_top_level_heading() {
     )
     .unwrap();
 
-    assert!(!report.ok);
-    assert_eq!(report.status, "degraded_llm_schema_invalid");
-    assert_eq!(report.provider_status, "called_live_schema_invalid");
-    assert!(report.fallback_used);
+    assert!(report.ok, "H2 headings are valid in the soft contract");
+    assert_eq!(report.provider_status, "called_live");
+    assert!(!report.fallback_used);
     let daily_text = fs::read_to_string(vault.join("brain/daily/2026-06-10.md")).unwrap();
-    assert!(!daily_text.contains("Extra top-level heading"));
-    assert!(!daily_text.contains("\n## Extra top-level heading"));
-    assert_eq!(server.request_count(), 2);
+    assert!(!daily_text.contains("LLM reflection (MiniMax M3)"));
+    assert!(daily_text.contains("## 证据附录（Evidence appendix）"));
+    assert!(daily_text.contains("把剑灵从记账员改回史学家"));
+    let reflection_pos = daily_text.find("## 今日主线").unwrap();
+    let appendix_pos = daily_text.find("## 证据附录（Evidence appendix）").unwrap();
+    let deterministic_pos = daily_text.find("# Jianling Daily Digest").unwrap();
+    assert!(reflection_pos < appendix_pos);
+    assert!(appendix_pos < deterministic_pos);
+    // No repair needed: a single valid call.
+    assert_eq!(server.request_count(), 1);
 
     let _ = fs::remove_dir_all(vault);
 }

@@ -9,6 +9,9 @@ const DEFAULT_RERANKER_PROVIDER: &str = "siliconflow";
 const DEFAULT_RERANKER_MODEL: &str = "Qwen/Qwen3-Reranker-4B";
 const DEFAULT_LLM_PROVIDER: &str = "anthropic";
 const DEFAULT_LLM_MODEL: &str = "MiniMax-M3";
+const DEFAULT_OPENAI_LLM_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_CODEX_LLM_MODEL: &str = "gpt-5.5";
+const DEFAULT_OPENAI_LLM_BASE_URL: &str = "https://api.openai.com";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,9 +166,13 @@ fn resolve_reranker_slot() -> Result<SwordModelSlot> {
 }
 
 fn resolve_llm_slot() -> Result<SwordModelSlot> {
-    let provider = normalize_provider(
-        env_string("ORDERK_SWORD_LLM_PROVIDER").unwrap_or_else(|| DEFAULT_LLM_PROVIDER.to_string()),
-    );
+    let provider =
+        env_string("ORDERK_SWORD_LLM_PROVIDER").unwrap_or_else(|| DEFAULT_LLM_PROVIDER.to_string());
+    resolve_llm_slot_for_provider(&provider)
+}
+
+fn resolve_llm_slot_for_provider(provider: &str) -> Result<SwordModelSlot> {
+    let provider = normalize_provider(provider.to_string());
     let (provider, model, api_key_env, base_url) = match provider.as_str() {
         "anthropic" | "minimax" => (
             "anthropic".to_string(),
@@ -184,6 +191,33 @@ fn resolve_llm_slot() -> Result<SwordModelSlot> {
                 .or_else(|| env_string("ORDERK_SWORD_LLM_MINIMAX_BASE_URL"))
                 .or_else(|| env_string("ORDERK_SWORD_LLM_BASE_URL")),
         ),
+        "openai" => (
+            "openai".to_string(),
+            env_string("ORDERK_SWORD_LLM_OPENAI_MODEL")
+                .or_else(|| env_string("ORDERK_SWORD_LLM_MODEL"))
+                .unwrap_or_else(|| DEFAULT_OPENAI_LLM_MODEL.to_string()),
+            first_configured_env(&[
+                "ORDERK_SWORD_LLM_OPENAI_API_KEY",
+                "ORDERK_SWORD_LLM_API_KEY",
+            ]),
+            Some(
+                env_string("ORDERK_SWORD_LLM_OPENAI_BASE_URL")
+                    .or_else(|| env_string("ORDERK_SWORD_LLM_BASE_URL"))
+                    .unwrap_or_else(|| DEFAULT_OPENAI_LLM_BASE_URL.to_string()),
+            ),
+        ),
+        "codex" => (
+            "codex".to_string(),
+            env_string("ORDERK_SWORD_LLM_CODEX_MODEL")
+                .or_else(|| env_string("ORDERK_SWORD_LLM_MODEL"))
+                .unwrap_or_else(|| DEFAULT_CODEX_LLM_MODEL.to_string()),
+            first_configured_env(&["ORDERK_SWORD_LLM_CODEX_API_KEY", "ORDERK_SWORD_LLM_API_KEY"]),
+            Some(
+                env_string("ORDERK_SWORD_LLM_CODEX_BASE_URL")
+                    .or_else(|| env_string("ORDERK_SWORD_LLM_BASE_URL"))
+                    .unwrap_or_else(|| DEFAULT_OPENAI_LLM_BASE_URL.to_string()),
+            ),
+        ),
         "none" | "disabled" => ("disabled".to_string(), "none".to_string(), None, None),
         other => return Err(anyhow!("unknown llm provider: {other}")),
     };
@@ -195,6 +229,32 @@ fn resolve_llm_slot() -> Result<SwordModelSlot> {
         api_key_env,
         base_url,
     ))
+}
+
+pub fn resolve_llm_chain() -> Result<Vec<SwordModelSlot>> {
+    let mut candidates = vec![resolve_llm_slot()?];
+    if let Some(fallbacks) = env_string("ORDERK_SWORD_LLM_FALLBACK") {
+        for provider in fallbacks.split(',') {
+            let provider = provider.trim();
+            if provider.is_empty() {
+                continue;
+            }
+            candidates.push(resolve_llm_slot_for_provider(provider)?);
+        }
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut chain = Vec::new();
+    for slot in candidates {
+        if slot.provider == "disabled" || !slot.api_key_configured {
+            continue;
+        }
+        let key = slot.profile_fingerprint.clone();
+        if seen.insert(key) {
+            chain.push(slot);
+        }
+    }
+    Ok(chain)
 }
 
 fn build_slot(
@@ -298,6 +358,13 @@ mod slot_tests {
         "ORDERK_SWORD_LLM_MINIMAX_API_KEY",
         "ORDERK_SWORD_LLM_MINIMAX_MODEL",
         "ORDERK_SWORD_LLM_MINIMAX_BASE_URL",
+        "ORDERK_SWORD_LLM_OPENAI_API_KEY",
+        "ORDERK_SWORD_LLM_OPENAI_MODEL",
+        "ORDERK_SWORD_LLM_OPENAI_BASE_URL",
+        "ORDERK_SWORD_LLM_CODEX_API_KEY",
+        "ORDERK_SWORD_LLM_CODEX_MODEL",
+        "ORDERK_SWORD_LLM_CODEX_BASE_URL",
+        "ORDERK_SWORD_LLM_FALLBACK",
         "ORDERK_SWORD_EMBEDDING_MODEL",
         "ORDERK_SWORD_EMBEDDING_DIM",
         "ORDERK_SWORD_RERANKER_MODEL",
@@ -561,6 +628,74 @@ mod slot_tests {
                 profile.reranker.profile_fingerprint,
                 profile.llm.profile_fingerprint
             );
+        });
+    }
+
+    #[test]
+    fn slot_provider_resolves_openai_llm_with_provider_specific_env() {
+        with_clean_slot_env(|| {
+            std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "openai");
+            std::env::set_var("ORDERK_SWORD_LLM_OPENAI_API_KEY", "openai-key");
+            std::env::set_var("ORDERK_SWORD_LLM_OPENAI_MODEL", "gpt-4.1-mini");
+            std::env::set_var("ORDERK_SWORD_LLM_OPENAI_BASE_URL", "https://openai.example");
+
+            let slot = resolve_sword_model_slot_from_env(SwordModelKind::Llm).unwrap();
+            assert_eq!(slot.provider, "openai");
+            assert_eq!(slot.model, "gpt-4.1-mini");
+            assert_eq!(
+                slot.api_key_env.as_deref(),
+                Some("ORDERK_SWORD_LLM_OPENAI_API_KEY")
+            );
+            assert_eq!(slot.base_url.as_deref(), Some("https://openai.example"));
+            assert!(slot.api_key_configured);
+        });
+    }
+
+    #[test]
+    fn slot_provider_resolves_codex_llm_with_defaults_and_generic_key() {
+        with_clean_slot_env(|| {
+            std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "codex");
+            std::env::set_var("ORDERK_SWORD_LLM_API_KEY", "shared-key");
+
+            let slot = resolve_sword_model_slot_from_env(SwordModelKind::Llm).unwrap();
+            assert_eq!(slot.provider, "codex");
+            assert_eq!(slot.model, "gpt-5.5");
+            assert_eq!(
+                slot.api_key_env.as_deref(),
+                Some("ORDERK_SWORD_LLM_API_KEY")
+            );
+            assert_eq!(slot.base_url.as_deref(), Some("https://api.openai.com"));
+            assert!(slot.api_key_configured);
+        });
+    }
+
+    #[test]
+    fn llm_chain_keeps_primary_then_fallbacks_and_skips_unconfigured_slots() {
+        with_clean_slot_env(|| {
+            std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "anthropic");
+            std::env::set_var("ORDERK_SWORD_LLM_ANTHROPIC_API_KEY", "anthropic-key");
+            std::env::set_var("ORDERK_SWORD_LLM_FALLBACK", "openai,codex");
+            std::env::set_var("ORDERK_SWORD_LLM_OPENAI_API_KEY", "openai-key");
+
+            let chain = resolve_llm_chain().unwrap();
+            let providers = chain
+                .iter()
+                .map(|slot| slot.provider.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(providers, vec!["anthropic", "openai"]);
+        });
+    }
+
+    #[test]
+    fn llm_chain_deduplicates_fallback_slots_by_fingerprint() {
+        with_clean_slot_env(|| {
+            std::env::set_var("ORDERK_SWORD_LLM_PROVIDER", "openai");
+            std::env::set_var("ORDERK_SWORD_LLM_OPENAI_API_KEY", "openai-key");
+            std::env::set_var("ORDERK_SWORD_LLM_FALLBACK", "openai,openai");
+
+            let chain = resolve_llm_chain().unwrap();
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].provider, "openai");
         });
     }
 }
